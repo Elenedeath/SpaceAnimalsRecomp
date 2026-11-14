@@ -304,6 +304,11 @@ def extraire(archive, dest, sans_racine):
                 os.makedirs(cible, exist_ok=True)
                 continue
             os.makedirs(os.path.dirname(cible), exist_ok=True)
+            if os.name != "nt" and ((m.external_attr >> 16) & 0o170000) == 0o120000:   # lien symbolique (Linux)
+                if os.path.lexists(cible):
+                    os.remove(cible)
+                os.symlink(z.read(m).decode(), cible)
+                continue
             with z.open(m) as s, open(cible, "wb") as d:
                 shutil.copyfileobj(s, d, 1 << 20)
             droits = (m.external_attr >> 16) & 0o777

@@ -74,7 +74,7 @@ def sdl3():
 
 def glslang():
     """glslang fourni (outils/glslang/bin), sinon None."""
-    for nom in ("glslangValidator" + EXE, "glslang" + EXE):
+    for nom in ("glslang" + EXE, "glslangValidator" + EXE):   # (Linux : glslangValidator est un lien vers glslang)
         p = outil("glslang", "bin", nom)
         if p:
             return p
