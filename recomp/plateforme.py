@@ -45,6 +45,11 @@ def zig_cxx():
         zig = shutil.which("zig")
         if not zig:
             return shutil.which("clang++") or "clang++"
+    return enveloppe_zig(zig) or os.path.join(os.path.dirname(zig), "c++")
+
+
+def enveloppe_zig(zig):
+    """Pose (si besoin) le script « c++ » à côté de zig ; rend son chemin, None s'il n'a pas pu être écrit."""
     enveloppe = os.path.join(os.path.dirname(zig), "c++")
     # (zig nomme les processeurs à sa façon : « x86_64_v3 » pour le « x86-64-v3 » de clang et de GCC)
     texte = ('#!/bin/sh\n'
@@ -55,8 +60,8 @@ def zig_cxx():
             with open(enveloppe, "w") as f:
                 f.write(texte)
             os.chmod(enveloppe, 0o755)
-    except OSError:   # dossier en lecture seule (paquet monté) : le script y est déjà
-        pass
+    except OSError:   # dossier en lecture seule (image montée) : le script y est déjà
+        return enveloppe if os.path.exists(enveloppe) else None
     return enveloppe
 
 
