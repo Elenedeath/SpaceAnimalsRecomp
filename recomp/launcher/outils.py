@@ -20,6 +20,7 @@ import hashlib
 import os
 import shutil
 import sys
+import tarfile
 import urllib.request
 import zipfile
 
@@ -91,6 +92,47 @@ OUTILS = [
      "sha256": "82bf434e69b9bb4829de7e2b4bc2c5e7a7861e53d66cf75e5cc70f5f694a8d9b", "dest": "glslang", "racine": False,
      "licence": "BSD-3-Clause, Apache-2.0 et autres licences libres (voir le dépôt KhronosGroup/glslang)"},
 ]
+
+
+# Linux (AppImage du Steam Deck, paquet_linux.py) : Python autonome (python-build-standalone : celui de python.org n'a
+# pas de version embarquable pour Linux), les mêmes modules en roues manylinux, zig (clang et la bibliothèque C++ de
+# LLVM, avec les en-têtes de la glibc : un seul compilateur pour le code généré, le runtime et l'édition de liens) et
+# glslang. SDL3 (en-têtes et libSDL3.so) vient de la racine système de construction (Steam Runtime « sniper ») et est
+# posée par paquet_linux.py. Pas de FSR, de DLSS ni de GCC.
+_PBS = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/"
+_PYPI = "https://files.pythonhosted.org/packages/"
+_SP = "python/lib/python3.13/site-packages"
+OUTILS_LINUX = [
+    {"nom": "python", "version": "3.13.18 (python-build-standalone 20261026)",
+     "url": _PBS + "cpython-3.13.18%2B20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+     "sha256": "df15fe60d3ff55bf9dcf25824b5572756bb8816ff93865a273d3301d7066a8b7", "dest": "python", "racine": True,
+     "licence": "Python Software Foundation License (et licences des bibliothèques incluses, voir python-build-standalone)"},
+    {"nom": "zstandard", "version": "0.25.0",
+     "url": _PYPI + "63/4b/e3678b4e776db00f9f7b2fe58e547e8928ef32727d7a1ff01dea010f3f13/"
+            "zstandard-0.25.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+     "sha256": "8e735494da3db08694d26480f1493ad2cf86e99bdd53e8e9771b2752a5c0246a", "dest": _SP, "racine": False,
+     "licence": "BSD"},
+    {"nom": "lz4", "version": "4.4.5",
+     "url": _PYPI + "d2/fb/ba9256c48266a09012ed1d9b0253b9aa4fe9cdff094f8febf5b26a4aa2a2/"
+            "lz4-4.4.5-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+     "sha256": "451039b609b9a88a934800b5fc6ee401c89ad9c175abf2f4d9f8b2e4ef1afc64", "dest": _SP, "racine": False,
+     "licence": "BSD"},
+    {"nom": "capstone", "version": "5.0.7",
+     "url": _PYPI + "15/3e/3a4f45dd4eda6fc8051f76bf3ed50ead6040d827000371211fbaaf057625/"
+            "capstone-5.0.7-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "sha256": "b809a9654844ce0d35099121a851ddd2ab2689df1ff6687037babcedcaae6391", "dest": _SP, "racine": False,
+     "licence": "BSD-3-Clause"},
+    {"nom": "zig", "version": "0.17.1",
+     "url": "https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz",
+     "sha256": "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a", "dest": "zig", "racine": True,
+     "licence": "MIT (zig) ; LLVM : Apache 2.0 avec exceptions LLVM ; glibc et musl : LGPL et MIT (en-têtes)"},
+    {"nom": "glslang", "version": "16.6.0",
+     "url": "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.zip",
+     "sha256": "a3fc4f083b1793eb53e55fa3577ac9649ffbe0340715e30d116290fb5382393f", "dest": "glslang", "racine": False,
+     "licence": "BSD-3-Clause, Apache-2.0 et autres licences libres (voir le dépôt KhronosGroup/glslang)"},
+]
+if sys.platform.startswith("linux"):
+    OUTILS = OUTILS_LINUX
 
 
 # ------------------------------------------------------------------------------------------ allègement
@@ -176,7 +218,7 @@ GARDER_GCC = {
     "dossiers": ("include/c++/", "x86_64-w64-mingw32/include/", "x86_64-w64-mingw32/lib/", _LIBGCC + "include/",
                  _LIBGCC + "include-fixed/", "lib/clang/23/include/"),   # en-têtes propres à Clang
 }
-GARDER_GLSLANG = {"fichiers": {"bin/glslang.exe"}, "dossiers": ()}
+GARDER_GLSLANG = {"fichiers": {"bin/glslang.exe", "bin/glslang", "bin/glslangValidator"}, "dossiers": ()}
 
 
 def garder(outil, rel):
@@ -234,6 +276,20 @@ def empreinte(chemin):
 def extraire(archive, dest, sans_racine):
     """Extraction protégée (aucun chemin absolu ni « .. ») ; `sans_racine` retire le dossier de tête de l'archive."""
     dest = os.path.abspath(dest)
+    if archive.endswith((".tar.gz", ".tar.xz", ".tgz")):   # Linux : droits (exécutables) et liens gardés
+        with tarfile.open(archive) as t:
+            for m in t.getmembers():
+                nom = m.name.replace("\\", "/")
+                if sans_racine:
+                    nom = nom.split("/", 1)[1] if "/" in nom else ""
+                if not nom:
+                    continue
+                cible = os.path.abspath(os.path.join(dest, nom))
+                if not cible.startswith(dest + os.sep) or os.path.isabs(nom) or ".." in nom.split("/"):
+                    raise RuntimeError(f"path refused in {os.path.basename(archive)}: {m.name}")
+                m.name = nom
+                t.extract(m, dest, filter="tar")
+        return
     with zipfile.ZipFile(archive) as z:
         for m in z.infolist():
             nom = m.filename.replace("\\", "/")
@@ -250,6 +306,9 @@ def extraire(archive, dest, sans_racine):
             os.makedirs(os.path.dirname(cible), exist_ok=True)
             with z.open(m) as s, open(cible, "wb") as d:
                 shutil.copyfileobj(s, d, 1 << 20)
+            droits = (m.external_attr >> 16) & 0o777
+            if droits and os.name != "nt":   # Linux : bit d'exécution (glslang)
+                os.chmod(cible, droits)
 
 
 def regler_python(dossier):
@@ -314,7 +373,7 @@ def main():
             sys.exit(f"  HASH DIFFERS for {o['nom']}: {h} (expected {o['sha256']}): archive deleted")
         print(f"  SHA-256 hash verified: {h}", flush=True)
         cible = os.path.join(dest, o["dest"])
-        if o["nom"] in ("python", "gcc", "glslang") and os.path.isdir(cible):
+        if o["nom"] in ("python", "gcc", "glslang", "zig") and os.path.isdir(cible):
             shutil.rmtree(cible)
         os.makedirs(cible, exist_ok=True)
         if o.get("fichier"):
@@ -324,8 +383,9 @@ def main():
         if o["nom"] in ("gcc", "glslang") and not a.complet:
             n, taille = alleger(cible, o["nom"])
             print(f"  slimmed down: {n} files not needed for the build removed ({taille / 1e6:.0f} MB)", flush=True)
-        if o["nom"] == "python":
+        if o["nom"] == "python" and os.name == "nt":
             regler_python(cible)
+        if o["nom"] == "python":
             for p in OUTILS:   # les modules seront réinstallés dans ce nouveau Python
                 if p["dest"].startswith("python/") and os.path.exists(os.path.join(marques, p["nom"])):
                     os.remove(os.path.join(marques, p["nom"]))

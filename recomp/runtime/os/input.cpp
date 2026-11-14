@@ -499,7 +499,9 @@ HostPad host_poll_input() {
     auto mix = [](int32_t a, int32_t b) { return a ? a : b; };   // le clavier prime
     if (g_sdl) {
         static int tour = 0;
+#ifdef _WIN32
         sdl::PumpEvents();
+#endif   // (Linux : les événements de SDL sont traités par le fil principal, present.cpp)
         if (++tour % 30 == 0) suivre_pads();
         sdl::UpdateGamepads();
         for (Pad& pd : g_pads) {
