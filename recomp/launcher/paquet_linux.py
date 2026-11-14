@@ -20,6 +20,7 @@ Contenu de l'AppImage :
   app/polices/           Barlow (licence OFL), à la place de Bahnschrift
   outils/                Python, zig, glslang (outils.py), SDL3 (racine système)
   lib/                   bibliothèques du launcher absentes d'un système de base (racine système)
+  lib-secours/           fontconfig, prise seulement si le système n'en a pas (AppRun)
 """
 import argparse
 import hashlib
@@ -61,6 +62,10 @@ POLICES = list(POLICES_SHA256)
 # tout bureau, et les pilotes de Mesa veulent la plus récente).
 SYSTEME = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "ld-linux-x86-64.so.2",
            "libvulkan.so.1", "libgcc_s.so.1", "libstdc++.so.6"}
+# Fournies à part (lib-secours/) : prises seulement si le système n'en a pas. fontconfig lit la configuration du
+# système (/etc/fonts) : celle de la racine système (2.13) avertissait sur les éléments récents (« reset-dirs »,
+# Ubuntu 24.04) ; celle du système la comprend toujours. Presque tout bureau l'a (SteamOS compris).
+SECOURS = {"libfontconfig.so.1"}
 
 APPRUN = """#!/bin/sh
 # Entrée de l'AppImage (recomp/launcher/paquet_linux.py) : le launcher tourne depuis une copie de app/ dans le dossier
@@ -75,8 +80,14 @@ if ! cmp -s "$here/app/.paquet" "$home/.paquet"; then
     cp -a "$here/app/." "$home/"
 fi
 ln -sfn "$here/outils" "$home/outils"
+# fontconfig : celle du système quand il en a une (elle comprend toujours sa propre configuration ; la copie de
+# l'AppImage, plus ancienne, avertissait sur les éléments récents), sinon la copie de secours
+libs="$here/lib"
+if ! { /sbin/ldconfig -p 2>/dev/null || ldconfig -p 2>/dev/null; } | grep -q "libfontconfig\.so\.1 "; then
+    libs="$libs:$here/lib-secours"
+fi
 export SA_LD_LIBRARY_PATH_SYSTEME="${LD_LIBRARY_PATH:-}"
-export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$home/lanceur" "$@"
 """
 
@@ -133,7 +144,14 @@ def fournir_libs(sr, exe, lib):
         src = trouver_lib(sr, n)
         shutil.copy2(src, os.path.join(lib, n))
         a_faire += [x for x in besoins(src) if x not in SYSTEME]
+    # bibliothèques de secours (AppRun ne les prend que si le système n'en a pas) : lib-secours/, à côté de lib/
+    secours = os.path.join(os.path.dirname(lib), "lib-secours")
+    os.makedirs(secours, exist_ok=True)
+    for n in SECOURS:
+        if os.path.exists(os.path.join(lib, n)):
+            shutil.move(os.path.join(lib, n), os.path.join(secours, n))
     dire("bibliothèques fournies : " + " ".join(sorted(os.listdir(lib))))
+    dire("de secours : " + " ".join(sorted(os.listdir(secours))))
 
 
 def icone_png(dest):
