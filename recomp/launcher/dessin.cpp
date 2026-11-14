@@ -1,14 +1,22 @@
 // Dessin du launcher : Direct2D 1.1 sur une chaîne d'échange DXGI, textes DirectWrite (Bahnschrift).
 // Direction artistique : noir et vert néon, extraits des cinématiques en fond (étalonnés en vert), grille en
 // perspective, globe holographique quand il n'y a pas encore d'extraits, bandeau défilant.
+// Linux : les mêmes appels Direct2D et DirectWrite, réalisés sur cairo et pango (d2d_cairo.h) ; l'image est copiée dans
+// la surface de la fenêtre SDL.
 #include "lanceur.h"
 
+#ifdef _WIN32
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
 #include <dwrite_1.h>
 #include <wincodec.h>
+#else
+#include "d2d_cairo.h"
+#include <SDL3/SDL.h>
+#include <fontconfig/fontconfig.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -25,11 +33,15 @@ const GUID CLSID_FLOU = {0x1feb6d69, 0x2fe6, 0x4ac9, {0x8c, 0x58, 0x1d, 0x7f, 0x
 
 template <class T> void rel(T*& p) { if (p) p->Release(), p = nullptr; }
 
+#ifdef _WIN32
 ID3D11Device* g_d3d = nullptr;
 ID3D11DeviceContext* g_d3dctx = nullptr;
 IDXGISwapChain1* g_chaine = nullptr;
+#endif
 ID2D1Factory1* g_fab = nullptr;
+#ifdef _WIN32
 ID2D1Device* g_dev = nullptr;
+#endif
 ID2D1DeviceContext* g_dc = nullptr;
 ID2D1Bitmap1* g_cible = nullptr;
 IDWriteFactory1* g_dw = nullptr;
@@ -211,6 +223,25 @@ void triangle(float x, float y, float t, uint32_t rgb, float a) {
 }
 
 // ---- appareil ----
+#ifndef _WIN32
+// Linux : image de la taille de la fenêtre (en pixels), copiée dans sa surface à chaque image (dessin_image)
+bool cible_creer() {
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels((SDL_Window*)g_hwnd, &w, &h);
+    rel(g_cible);
+    auto* b = new ID2D1Bitmap;
+    b->dpi = g.dpi;
+    b->s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, std::max(1, w), std::max(1, h));
+    if (cairo_surface_status(b->s) != CAIRO_STATUS_SUCCESS) {
+        b->Release();
+        return false;
+    }
+    g_cible = b;
+    g_dc->SetTarget(g_cible);
+    g_dc->SetDpi(g.dpi, g.dpi);
+    return true;
+}
+#else
 bool cible_creer() {
     IDXGISurface* surf = nullptr;
     if (FAILED(g_chaine->GetBuffer(0, IID_PPV_ARGS(&surf)))) return false;
@@ -224,6 +255,7 @@ bool cible_creer() {
     g_dc->SetDpi(g.dpi, g.dpi);
     return true;
 }
+#endif
 
 void trame_creer() {
     rel(g_trame);
@@ -1510,6 +1542,24 @@ bool dessin_init(HWND hwnd) {
         jlog(L"display: %ls failed (0x%08lx)", etape, (unsigned long)hr);
         return false;
     };
+#ifndef _WIN32
+    HRESULT hr = S_OK;
+    g_fab = new ID2D1Factory1;
+    g_dc = new ID2D1DeviceContext;
+    if (!cible_creer()) return echec(L"cairo image of the window", E_FAIL);
+    {
+        const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow((SDL_Window*)hwnd));
+        const wchar_t* e = _wgetenv(L"LANCEUR_HZ");
+        jlog(L"display: cairo %hs, pango %hs, SDL %hs video driver, screen %.0f Hz, 60 frames per second",
+             cairo_version_string(), pango_version_string(), SDL_GetCurrentVideoDriver(),
+             e ? _wtof(e) : m ? (double)m->refresh_rate : 0.0);
+    }
+    // polices fournies avec le paquet (Barlow, à la place de Bahnschrift) : <dossier du launcher>/polices
+    for (const std::wstring& d : {g.dossier_exe + L"/polices", g.recomp + L"/launcher/polices"})
+        if (GetFileAttributesW(d.c_str()) != INVALID_FILE_ATTRIBUTES)
+            FcConfigAppFontAddDir(nullptr, (const FcChar8*)plat_chemin(d).c_str());
+    g_dw = new IDWriteFactory1;
+#else
     const D3D_FEATURE_LEVEL niveaux[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL niveau = D3D_FEATURE_LEVEL_10_0;
     bool logiciel = false;
@@ -1562,6 +1612,7 @@ bool dessin_init(HWND hwnd) {
          logiciel ? L" (software)" : L"", (unsigned)niveau >> 12, ((unsigned)niveau >> 8) & 15, (unsigned long)hz, g_sync);
     if (FAILED(hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory1), (IUnknown**)&g_dw)))
         return echec(L"DWriteCreateFactory", hr);
+#endif
     const wchar_t* B = L"Bahnschrift";
     format(F_TITRE, B, 66, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STRETCH_NORMAL);
     format(F_SOUS, B, 22, DWRITE_FONT_WEIGHT_LIGHT, DWRITE_FONT_STRETCH_NORMAL);
@@ -1587,6 +1638,14 @@ bool dessin_init(HWND hwnd) {
 }
 
 void dessin_redim() {
+#ifndef _WIN32
+    if (!g_dc) return;
+    g_dc->SetTarget(nullptr);
+    if (!cible_creer()) jlog(L"display: window image not recreated, nothing will be drawn");
+    trame_creer();
+    vider_cache();
+    return;
+#else
     if (!g_chaine) return;
     g_dc->SetTarget(nullptr);
     rel(g_cible);
@@ -1598,6 +1657,7 @@ void dessin_redim() {
     if (!cible_creer()) jlog(L"display: swap chain target not recreated, nothing will be drawn");
     trame_creer();
     vider_cache();
+#endif
 }
 
 int zone_sous(float x, float y) {
@@ -1648,6 +1708,24 @@ void dessin_image() {
         sauver_png(capture);
         if (_wgetenv(L"LANCEUR_CAPTURE_QUITTER")) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
     }
+#ifndef _WIN32
+    // image copiée dans la surface de la fenêtre ; 60 images par seconde (pas de synchronisation verticale ici)
+    if (SDL_Surface* ws = SDL_GetWindowSurface((SDL_Window*)g_hwnd)) {
+        cairo_surface_t* s = g_cible->s;
+        SDL_Surface* src = SDL_CreateSurfaceFrom(cairo_image_surface_get_width(s), cairo_image_surface_get_height(s),
+                                                 SDL_PIXELFORMAT_XRGB8888, cairo_image_surface_get_data(s),
+                                                 cairo_image_surface_get_stride(s));
+        if (src) {
+            SDL_BlitSurface(src, nullptr, ws, nullptr);
+            SDL_DestroySurface(src);
+        }
+        SDL_UpdateWindowSurface((SDL_Window*)g_hwnd);
+    }
+    static uint64_t prochaine = 0;
+    const uint64_t periode = 1000000000ull / 60, maintenant = SDL_GetTicksNS();
+    if (prochaine > maintenant) SDL_DelayPrecise(prochaine - maintenant);
+    prochaine = std::max(prochaine + periode, maintenant);
+#else
     const HRESULT hp = g_chaine->Present(g_sync, 0);
     static HRESULT present_avant = S_OK;
     if (FAILED(hp)) {   // rien n'est arrivé à l'écran
@@ -1656,6 +1734,7 @@ void dessin_image() {
         Sleep(15);      // Present n'a pas attendu l'écran : pas de boucle à vide
     }
     present_avant = hp;
+#endif
 }
 
 void dessin_liberer() {
@@ -1664,12 +1743,19 @@ void dessin_liberer() {
     rel(g_trame), rel(g_bm_titre), rel(g_bm_video), rel(g_fx_flou), rel(g_fx_couleur), rel(g_br);
     for (auto& c : g_chemins) rel(c.second);   // dessins des manettes (onglet Manette)
     g_chemins.clear();
+#ifndef _WIN32
+    rel(g_dw), rel(g_cible), rel(g_dc), rel(g_fab);
+#else
     rel(g_dw), rel(g_cible), rel(g_dc), rel(g_dev), rel(g_fab), rel(g_chaine), rel(g_d3dctx), rel(g_d3d);
+#endif
 }
 
 namespace {
 // copie de l'image affichée en PNG (WIC) : vérification du rendu sans écran (LANCEUR_CAPTURE)
 bool sauver_png(const wchar_t* chemin) {
+#ifndef _WIN32
+    return g_cible && cairo_surface_write_to_png(g_cible->s, plat_chemin(chemin).c_str()) == CAIRO_STATUS_SUCCESS;
+#else
     ID3D11Texture2D* tampon = nullptr;
     if (FAILED(g_chaine->GetBuffer(0, IID_PPV_ARGS(&tampon)))) return false;
     D3D11_TEXTURE2D_DESC d;
@@ -1711,6 +1797,7 @@ bool sauver_png(const wchar_t* chemin) {
     }
     rel(tampon);
     return ok;
+#endif
 }
 }  // namespace
 

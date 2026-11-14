@@ -6,6 +6,10 @@
 #include "lanceur.h"
 
 #include <type_traits>
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <initializer_list>
+#endif
 
 namespace lz {
 namespace {
@@ -50,8 +54,17 @@ unsigned g_tour = 0;
 bool charger() {
     if (g_tente) return g_lib != nullptr;
     g_tente = true;
+#ifndef _WIN32
+    // Linux : SDL3 est déjà dans le launcher (fenêtre) ; SDL_Quit l'arrêterait toute : seul le sous-système des
+    // manettes est arrêté (sdl::Quit, plus bas)
+    g_lib = dlopen(nullptr, RTLD_NOW);   // le programme et ses bibliothèques (RTLD_DEFAULT vaut 0 : « absent »)
+    if (g_lib && !GetProcAddress(g_lib, "SDL_Init")) g_lib = nullptr;
+    if (g_lib) jlog(L"controllers: SDL3 of the launcher");
+    for (const std::wstring& c : std::initializer_list<std::wstring>{}) {
+#else
     for (const std::wstring& c : {g.jeu + L"\\SDL3.dll", g.dossier_exe + L"\\outils\\sdl3\\SDL3.dll",
                                   g.recomp + L"\\outils\\sdl3\\SDL3.dll"}) {
+#endif
         if (GetFileAttributesW(c.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         g_lib = LoadLibraryExW(c.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (g_lib) {
@@ -82,6 +95,11 @@ bool charger() {
     f(sdl::GetGamepadName, "SDL_GetGamepadName");
     f(sdl::GetGamepadType, "SDL_GetGamepadType");
     f(sdl::Free, "SDL_free");
+#ifndef _WIN32
+    static void (*quitter_sous_systeme)(uint32_t) = nullptr;
+    f(quitter_sous_systeme, "SDL_QuitSubSystem");
+    sdl::Quit = [] { quitter_sous_systeme(sdl::INIT_GAMEPAD); };
+#endif
     if (!ok || sdl::GetVersion() / 1000000 != 3) {
         jlog(L"controllers: SDL3.dll not usable (missing functions or not version 3)");
         FreeLibrary(g_lib);

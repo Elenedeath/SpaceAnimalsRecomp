@@ -6,12 +6,18 @@
 // recomp/build/full, les extraits vidéo dans recomp/launcher/extraits, les réglages du launcher dans lanceur.ini.
 #include "lanceur.h"
 
+#ifdef _WIN32
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <windowsx.h>
 #include <timeapi.h>
+#else
+#include <clocale>
+#include <csignal>
+#include <sys/stat.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -72,7 +78,11 @@ void jlog(const wchar_t* fmt, ...) {
     // l'anonymisait déjà). LANCEUR_LOG_PATHS=1 : chemins laissés tels quels.
     std::wstring ligne = b;
     static const std::wstring profil = [] {
+#ifdef _WIN32
         const wchar_t* e = _wgetenv(L"LANCEUR_LOG_PATHS") ? nullptr : _wgetenv(L"USERPROFILE");
+#else
+        const wchar_t* e = _wgetenv(L"LANCEUR_LOG_PATHS") ? nullptr : _wgetenv(L"HOME");   // (remplacé de même)
+#endif
         return e && wcslen(e) > 5 ? std::wstring(e) : std::wstring();
     }();
     if (!profil.empty())
@@ -138,6 +148,11 @@ void chemins() {
     if (g.recomp.empty()) g.recomp = g.dossier_exe;
     // paquet installé (lanceur.exe à la racine, recomp/ à côté) : il se met à jour depuis les releases GitHub
     g.paquet = existe(g.dossier_exe + L"\\recomp\\fullbuild.py") && existe(g.dossier_exe + L"\\recomp\\launcher\\maj.py");
+#ifndef _WIN32
+    // Linux : l'AppImage se met à jour en remplaçant le fichier ; pas de mise à jour, de déplacement ni de
+    // désinstallation par le launcher (maj.py, deplacer.py et desinstaller.py visent le paquet Windows)
+    g.paquet = false;
+#endif
     g.sources = existe(g.recomp + L"\\launcher\\lanceur.cpp");   // dossier de développement : jamais déplacé
     g.version = VERSION;
     if (FILE* f = _wfopen((g.recomp + L"\\VERSION").c_str(), L"rb")) {
@@ -158,7 +173,7 @@ void chemins() {
 }
 
 void detecter_jeu() {
-    g.jeu_pret = existe(g.jeu + L"\\recomp_main.exe") && existe(g.jeu + L"\\manifest.txt") &&
+    g.jeu_pret = existe(g.jeu + JEU_EXE) && existe(g.jeu + L"\\manifest.txt") &&
                  compter(g.jeu + L"\\shader_cache\\*.spv") > 1000;
     // version des sources qui a construit le jeu (notée par preparer.py) : autre que l'actuelle après une mise à jour
     std::string v;
@@ -711,6 +726,16 @@ void reglages_ecrire() {
 
 // ---------------------------------------------------------------- choix de la copie
 void choisir_copie() {
+#ifndef _WIN32
+    const std::wstring p = plat_choisir_fichier(g.hwnd, T("dialogue_titre"), T("filtre_nup"), "nup",
+                                                g.copie.empty() ? std::wstring() : parent(g.copie));
+    if (!p.empty()) {
+        g.copie = p;
+        g.copie_ok = verifier_copie(g.copie, g.copie_message);
+        config_ecrire();
+    }
+    return;
+#else
     IFileOpenDialog* d = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
     COMDLG_FILTERSPEC filtre[] = {{T("filtre_nup"), L"*.nup"}};
@@ -737,11 +762,22 @@ void choisir_copie() {
         }
     }
     d->Release();
+#endif
 }
 
 // ---------------------------------------------------------------- construction (preparer.py)
 std::wstring trouver_python(bool& lanceur_py) {
     lanceur_py = false;
+#ifndef _WIN32
+    // Linux : le Python fourni (python-build-standalone, outils/python/bin/python3), sinon celui du système
+    for (const std::wstring& base : {parent(g.recomp) + L"/outils", g.recomp + L"/outils"}) {
+        const std::wstring fourni = base + L"/python/bin/python3";
+        if (existe(fourni)) return fourni;
+    }
+    wchar_t b0[2048];
+    if (SearchPathW(nullptr, L"python3", nullptr, 2048, b0, nullptr)) return b0;
+    return {};
+#endif
     for (const std::wstring& base : {parent(g.recomp) + L"\\outils", g.recomp + L"\\outils"}) {   // paquet, puis développement
         const std::wstring fourni = base + L"\\python\\python.exe";
         if (existe(fourni)) return fourni;
@@ -1167,6 +1203,9 @@ void deplacer() {
     if (essai) {
         choix = essai;
     } else {
+#ifndef _WIN32
+        choix = plat_choisir_dossier(g.hwnd, T("dep_dialogue"));
+#else
         IFileOpenDialog* d = nullptr;
         if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
         DWORD options = 0;
@@ -1183,6 +1222,7 @@ void deplacer() {
             }
         }
         d->Release();
+#endif
     }
     if (choix.empty() || g.cons.active || g.jeu_lance) return;
     const std::wstring script = commande_python(g.recomp + L"\\launcher\\deplacer.py");
@@ -1219,7 +1259,11 @@ void deplacer() {
 // l'ancien, puis relance le launcher. Autre volume : c'est le Python du nouveau dossier qui le lance, pour que l'ancien
 // dossier puisse être supprimé en entier.
 void finir_deplacement() {
+#ifdef _WIN32
     const std::wstring python = g.dep_vers + L"\\outils\\python\\python.exe", script = g.dep_vers + L"\\recomp\\launcher\\deplacer.py";
+#else
+    const std::wstring python = g.dep_vers + L"/outils/python/bin/python3", script = g.dep_vers + L"/recomp/launcher/deplacer.py";
+#endif
     std::wstring cmd;
     if (g.dep_autre_volume && existe(python) && existe(script)) cmd = L"\"" + python + L"\" -u -X utf8 \"" + script + L"\"";
     else cmd = commande_python(g.recomp + L"\\launcher\\deplacer.py");
@@ -1271,12 +1315,12 @@ void jouer() {
         return;
     }
     averti = 0;
-    const std::wstring exe = g.jeu + L"\\recomp_main.exe";
+    const std::wstring exe = g.jeu + JEU_EXE;
     if (!lancer_tache(Tache::Shaders, L"\"" + exe + L"\" --precompile", g.jeu, L"", NORMAL_PRIORITY_CLASS)) lancer_jeu();
 }
 
 void lancer_jeu() {
-    const std::wstring exe = g.jeu + L"\\recomp_main.exe";
+    const std::wstring exe = g.jeu + JEU_EXE;
     std::wstring cmd = L"\"" + exe + L"\"";
     // le jeu réécrit recomp_run.log : le journal de la partie précédente est gardé à côté
     const std::wstring journal = g.jeu + L"\\recomp_run.log";
@@ -1323,7 +1367,7 @@ void lancer_jeu() {
 
 void fond_relancer() {
     video_arreter();
-    if (g.fond_video && compter(g.extraits + L"\\extrait_*.mp4") > 0) video_demarrer(g.extraits);
+    if (g.fond_video && compter(g.extraits + MOTIF_EXTRAITS) > 0) video_demarrer(g.extraits);
 }
 
 // ---------------------------------------------------------------- raccourci sur le bureau (issue GitHub n° 14)
@@ -1331,11 +1375,45 @@ void fond_relancer() {
 // retiré depuis la page Réglages. Au démarrage, un raccourci dont la cible n'existe plus (dossier déplacé) est refait
 // vers ce launcher. LANCEUR_BUREAU (vérification) : un autre dossier que le bureau.
 std::wstring chemin_exe() {
+#ifndef _WIN32
+    return plat_exe_lanceur();   // l'AppImage, s'il y en a une
+#endif
     wchar_t b[2048];
     GetModuleFileNameW(nullptr, b, 2048);
     return b;
 }
 
+#ifndef _WIN32
+// Linux : un lanceur de bureau « StarFox Remake [recompiled].desktop » (Exec=…), exécutable, sur le bureau
+std::wstring raccourci_chemin() {
+    std::wstring bureau;
+    if (const wchar_t* e = _wgetenv(L"LANCEUR_BUREAU")) bureau = e;
+    else bureau = plat_bureau();
+    return bureau.empty() ? bureau : bureau + L"/" + NOM + L".desktop";
+}
+std::wstring raccourci_cible(const std::wstring& lnk) {
+    for (const std::string& l : lignes_fichier(lnk))
+        if (l.rfind("Exec=", 0) == 0) {
+            std::string c = l.substr(5);
+            if (c.size() >= 2 && c.front() == '"') c = c.substr(1, c.find('"', 1) - 1);
+            return wide(c);
+        }
+    return {};
+}
+bool raccourci_creer() {
+    const std::wstring lnk = raccourci_chemin(), exe = chemin_exe();
+    if (lnk.empty() || exe.empty()) return false;
+    FILE* f = _wfopen(lnk.c_str(), L"wb");
+    if (!f) return false;
+    const std::wstring icone = g.dossier_exe + L"/lanceur.png";
+    fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\nExec=\"%s\"\nPath=%s\n%s%sCategories=Game;\nTerminal=false\n",
+            utf8(NOM).c_str(), utf8(exe).c_str(), utf8(parent(exe)).c_str(), existe(icone) ? "Icon=" : "",
+            existe(icone) ? (utf8(icone) + "\n").c_str() : "");
+    fclose(f);
+    chmod(plat_chemin(lnk).c_str(), 0755);   // (un bureau n'ouvre qu'un lanceur exécutable)
+    return true;
+}
+#else
 std::wstring raccourci_chemin() {
     std::wstring bureau;
     wchar_t b[MAX_PATH + 1] = L"";
@@ -1377,6 +1455,7 @@ bool raccourci_creer() {
     l->Release();
     return ok;
 }
+#endif
 
 int g_raccourci = -1;   // dernier état lu pour la page Réglages (-1 : à relire)
 ULONGLONG g_raccourci_t = 0;
@@ -1984,3 +2063,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CoUninitialize();
     return 0;
 }
+
+#ifndef _WIN32
+// Linux : même entrée que sous Windows ; les chaînes larges (swprintf %hs…) lisent l'UTF-8
+int main() {
+    if (!setlocale(LC_CTYPE, "C.UTF-8")) setlocale(LC_CTYPE, "");
+    signal(SIGPIPE, SIG_IGN);
+    return wWinMain(nullptr, nullptr, nullptr, 0);
+}
+#endif

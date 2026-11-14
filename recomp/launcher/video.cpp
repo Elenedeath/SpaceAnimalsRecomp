@@ -1,11 +1,17 @@
 // Fond vidéo du launcher : les extraits MP4 enregistrés par le jeu recompilé (launcher/extraits), lus en
 // boucle dans un ordre aléatoire par Media Foundation, sur un fil à part. Le dessin prend la dernière image.
+// Linux : extraits en MPEG-1 (.mpg, convertis depuis les MP4 à la construction du paquet), décodés par pl_mpeg.
 #include "lanceur.h"
 
+#ifdef _WIN32
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#else
+#define PL_MPEG_IMPLEMENTATION
+#include "third_party/pl_mpeg.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +30,7 @@ std::atomic<bool> g_marche{false};
 std::atomic<int> g_nombre{0};
 std::thread g_fil;
 
+#ifdef _WIN32
 template <class T> void liberer(T*& p) { if (p) p->Release(), p = nullptr; }
 
 void lire(const std::wstring& chemin, std::vector<uint8_t>& px) {
@@ -110,13 +117,46 @@ void lire(const std::wstring& chemin, std::vector<uint8_t>& px) {
     }
     liberer(rd);
 }
+#else
+void lire(const std::wstring& chemin, std::vector<uint8_t>& px) {
+    plm_t* plm = plm_create_with_filename(plat_chemin(chemin).c_str());
+    if (!plm) return;
+    plm_set_audio_enabled(plm, 0);
+    const int w = plm_get_width(plm), h = plm_get_height(plm);
+    if (w <= 0 || h <= 0 || !plm_get_video_enabled(plm)) {
+        plm_destroy(plm);
+        return;
+    }
+    const double duree = plm_get_duration(plm);
+    px.assign((size_t)w * h * 4, 255);   // (plm_frame_to_bgra laisse l'alpha : opaque)
+    const auto t0 = std::chrono::steady_clock::now();
+    while (g_marche) {
+        plm_frame_t* f = plm_decode_video(plm);
+        if (!f) break;
+        const double du = f->time;
+        while (g_marche) {   // attente de l'instant de l'image
+            const double maintenant = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (maintenant >= du) break;
+            Sleep((DWORD)std::clamp((du - maintenant) * 1000.0, 1.0, 20.0));
+        }
+        plm_frame_to_bgra(f, px.data(), w * 4);
+        std::lock_guard<std::mutex> l(g_lk);
+        g_px = px;
+        g_w = (uint32_t)w, g_h = (uint32_t)h, g_t = du, g_duree = duree;
+        g_numero++;
+    }
+    plm_destroy(plm);
+}
+#endif
 
 void boucle(std::wstring dossier) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#ifdef _WIN32
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
+#endif
     std::vector<std::wstring> extraits;
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dossier + L"\\extrait_*.mp4").c_str(), &fd);
+    HANDLE h = FindFirstFileW((dossier + MOTIF_EXTRAITS).c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do extraits.push_back(dossier + L"\\" + fd.cFileName);
         while (FindNextFileW(h, &fd));
@@ -127,7 +167,9 @@ void boucle(std::wstring dossier) {
     std::shuffle(extraits.begin(), extraits.end(), alea);
     std::vector<uint8_t> px;
     for (size_t k = 0; g_marche && !extraits.empty(); k++) lire(extraits[k % extraits.size()], px);
+#ifdef _WIN32
     MFShutdown();
+#endif
     CoUninitialize();
 }
 

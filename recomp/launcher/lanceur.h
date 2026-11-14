@@ -1,6 +1,7 @@
 // Launcher du portage natif : état partagé entre la fenêtre (lanceur.cpp), le dessin (dessin.cpp), la vidéo
 // de fond (video.cpp) et les textes (textes.cpp).
 #pragma once
+#ifdef _WIN32
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -16,6 +17,15 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#define JEU_EXE L"\\recomp_main.exe"          // exécutable du jeu, dans recomp\build\full
+#define MOTIF_EXTRAITS L"\\extrait_*.mp4"     // extraits du fond (video.cpp)
+#else
+// Linux : même launcher, l'API Win32 dont il se sert est réalisée sur POSIX et SDL3 (win32_linux.cpp), Direct2D sur
+// cairo (d2d_cairo.h). Les extraits du fond sont en MPEG-1 (lus par pl_mpeg, convertis à la construction du paquet).
+#include "win32_linux.h"
+#define JEU_EXE L"\\recomp_main"
+#define MOTIF_EXTRAITS L"\\extrait_*.mpg"
+#endif
 
 #include <atomic>
 #include <cstdint>
