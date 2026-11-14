@@ -46,7 +46,10 @@ def zig_cxx():
         if not zig:
             return shutil.which("clang++") or "clang++"
     enveloppe = os.path.join(os.path.dirname(zig), "c++")
-    texte = '#!/bin/sh\nexec "$(dirname "$0")/zig" c++ "$@"\n'
+    # (zig nomme les processeurs à sa façon : « x86_64_v3 » pour le « x86-64-v3 » de clang et de GCC)
+    texte = ('#!/bin/sh\n'
+             'for a do shift; case "$a" in -march=x86-64-v*) a="-march=x86_64_v${a#-march=x86-64-v}";; esac; set -- "$@" "$a"; done\n'
+             'exec "$(dirname "$0")/zig" c++ "$@"\n')
     try:
         if not os.path.exists(enveloppe) or open(enveloppe).read() != texte:
             with open(enveloppe, "w") as f:

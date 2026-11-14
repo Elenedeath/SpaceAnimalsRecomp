@@ -352,8 +352,47 @@ def version():
         return "?"
 
 
+def linux():
+    """Linux : distribution, processeur, mémoire (en tête des journaux de construction)."""
+    nom = platform.platform()
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            v = dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
+        nom = v.get("PRETTY_NAME", nom).strip('"') + f" (kernel {platform.release()})"
+    except OSError:
+        pass
+    cpu, avx2 = platform.processor() or "?", True
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+            for l in f:
+                if l.startswith("model name") and cpu in ("?", "x86_64", ""):
+                    cpu = l.split(":", 1)[1].strip()
+                elif l.startswith("flags"):
+                    avx2 = " avx2" in l
+                    break
+    except OSError:
+        pass
+    mem = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for l in f:
+                k, _, r = l.partition(":")
+                mem[k] = int(r.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    go = 1 << 30
+    return (f"{nom}; {cpu}, {os.cpu_count()} threads, AVX2 {'yes' if avx2 else 'NO (required)'}; "
+            f"RAM {mem.get('MemTotal', 0) / go:.1f} GB ({mem.get('MemAvailable', 0) / go:.1f} GB free), "
+            f"swap {mem.get('SwapTotal', 0) / go:.1f} GB")
+
+
 def ligne_systeme():
     """Résumé d'une ligne (en tête des journaux de construction) : version, Windows, processeur, mémoire, GPU."""
+    if sys.platform.startswith("linux"):
+        try:
+            return f"SpaceAnimalsRecomp {version()}; {linux()}"
+        except Exception as e:  # noqa: BLE001
+            return f"SpaceAnimalsRecomp {version()} (system: {type(e).__name__})"
     try:
         g = "; ".join(x.split(", driver")[0] + (" (" + x.split("(NVIDIA ")[1] if "(NVIDIA " in x else "")
                       for x in gpus() if "Microsoft" not in x and "Remote" not in x and "not present" not in x)
