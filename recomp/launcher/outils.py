@@ -98,7 +98,7 @@ OUTILS = [
 # pas de version embarquable pour Linux), les mêmes modules en roues manylinux, zig (clang et la bibliothèque C++ de
 # LLVM, avec les en-têtes de la glibc : un seul compilateur pour le code généré, le runtime et l'édition de liens) et
 # glslang. SDL3 (en-têtes et libSDL3.so) vient de la racine système de construction (Steam Runtime « sniper ») et est
-# posée par paquet_linux.py. Pas de FSR, de DLSS ni de GCC.
+# posée par paquet_linux.py. DLSS : libnvidia-ngx-dlss.so du même SDK. Pas de FSR ni de GCC.
 _PBS = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/"
 _PYPI = "https://files.pythonhosted.org/packages/"
 _SP = "python/lib/python3.13/site-packages"
@@ -130,6 +130,11 @@ OUTILS_LINUX = [
      "url": "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.zip",
      "sha256": "a3fc4f083b1793eb53e55fa3577ac9649ffbe0340715e30d116290fb5382393f", "dest": "glslang", "racine": False,
      "licence": "BSD-3-Clause, Apache-2.0 et autres licences libres (voir le dépôt KhronosGroup/glslang)"},
+    # DLSS (PC Linux avec carte NVIDIA RTX ; le pilote charge ce fichier, runtime/os/dlss.cpp) : même SDK que nvngx_dlss.dll
+    {"nom": "dlss", "version": "DLSS SDK 310.9.16 (libnvidia-ngx-dlss.so)", "fichier": True,
+     "url": "https://raw.githubusercontent.com/NVIDIA/DLSS/v310.9.16/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.9.16",
+     "sha256": "30982c937afed85c96b8d313323de9a650a2eec6de1bb0f714b21750f4ce98f6", "dest": "dlss", "racine": False,
+     "licence": "propriétaire (NVIDIA RTX SDKs License), voir LICENCES/NVIDIA-DLSS-SDK-LICENSE.txt"},
 ]
 if sys.platform.startswith("linux"):
     OUTILS = OUTILS_LINUX

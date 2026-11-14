@@ -18,7 +18,8 @@ dont seuls les numéros de ligne cités par les messages d'erreur Vulkan (`VKCHK
 | fenêtre Win32, `vkCreateWin32SurfaceKHR` | fenêtre SDL3, surface Vulkan de SDL (fil principal : `gfx_boucle_principale`) — `present.cpp` |
 | clavier Win32, XInput | clavier et manettes SDL3 (scancodes de `recomp.ini` inchangés : `scancodes.h`) — `input.cpp` |
 | WASAPI | flux audio SDL3 — `audio_out.cpp` |
-| DLSS, enregistrement Media Foundation | absents (FSR d'AMD gardé quand la bibliothèque existe) |
+| DLSS : `_nvngx.dll` du pilote, `nvngx_dlss.dll` | `libnvidia-ngx.so.1` du pilote NVIDIA, `libnvidia-ngx-dlss.so` du même SDK (outils/dlss) |
+| Enregistrement Media Foundation | absent |
 | GCC + Clang de WinLibs | zig 0.17 (clang, libc++, en-têtes de la glibc 2.31) — `plateforme.py` |
 | launcher : Win32, Direct2D, DirectWrite, Media Foundation | **même code** : Win32 réalisé sur POSIX/SDL3 (`win32_linux.cpp`), Direct2D/DirectWrite sur cairo/pango (`d2d_cairo.h`), vidéos de fond en MPEG-1 lues par pl_mpeg |
 | sauvegardes `%APPDATA%\SpaceAnimalsRecomp` | `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp` |
