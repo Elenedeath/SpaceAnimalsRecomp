@@ -83,7 +83,7 @@ ln -sfn "$here/outils" "$home/outils"
 # fontconfig : celle du système quand il en a une (elle comprend toujours sa propre configuration ; la copie de
 # l'AppImage, plus ancienne, avertissait sur les éléments récents), sinon la copie de secours
 libs="$here/lib"
-if ! { /sbin/ldconfig -p 2>/dev/null || ldconfig -p 2>/dev/null; } | grep -q "libfontconfig\.so\.1 "; then
+if ! { /sbin/ldconfig -p 2>/dev/null || ldconfig -p 2>/dev/null; } | grep -q "libfontconfig\\.so\\.1 "; then
     libs="$libs:$here/lib-secours"
 fi
 export SA_LD_LIBRARY_PATH_SYSTEME="${LD_LIBRARY_PATH:-}"
