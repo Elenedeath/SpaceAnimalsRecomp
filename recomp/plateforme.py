@@ -52,9 +52,18 @@ def enveloppe_zig(zig):
     """Pose (si besoin) le script « c++ » à côté de zig ; rend son chemin, None s'il n'a pas pu être écrit."""
     enveloppe = os.path.join(os.path.dirname(zig), "c++")
     # (zig nomme les processeurs à sa façon : « x86_64_v3 » pour le « x86-64-v3 » de clang et de GCC)
+    # Une compilation (-c) a son propre cache de zig, sur le disque du dossier personnel : plusieurs zig compilant en
+    # même temps dans le même cache échouaient au hasard (« unable to rename temporary … to output file », vu le
+    # 2026-11-14 sur un tiers des lots). L'édition de liens garde le cache commun (libc++ compilée une fois).
     texte = ('#!/bin/sh\n'
              'for a do shift; case "$a" in -march=x86-64-v*) a="-march=x86_64_v${a#-march=x86-64-v}";; esac; set -- "$@" "$a"; done\n'
-             'exec "$(dirname "$0")/zig" c++ "$@"\n')
+             'z="$(dirname "$0")/zig"\n'
+             'case " $* " in *" -c "*)\n'
+             '  b="${XDG_CACHE_HOME:-$HOME/.cache}/spaceanimalsrecomp-zig"; mkdir -p "$b"\n'
+             '  c=$(mktemp -d "$b/c.XXXXXX") || exit 1\n'
+             '  ZIG_GLOBAL_CACHE_DIR="$c" ZIG_LOCAL_CACHE_DIR="$c" "$z" c++ "$@"; r=$?; rm -rf "$c"; exit $r;;\n'
+             'esac\n'
+             'exec "$z" c++ "$@"\n')
     try:
         if not os.path.exists(enveloppe) or open(enveloppe).read() != texte:
             with open(enveloppe, "w") as f:

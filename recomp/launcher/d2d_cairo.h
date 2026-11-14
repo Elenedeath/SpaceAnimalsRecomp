@@ -474,7 +474,7 @@ inline PangoContext* d2d_pango() {
         pango_cairo_context_set_resolution(x, 96.0);
         cairo_font_options_t* o = cairo_font_options_create();
         cairo_font_options_set_hint_metrics(o, CAIRO_HINT_METRICS_OFF);   // mise en page indépendante de l'échelle
-        cairo_font_options_set_hint_style(o, CAIRO_HINT_STYLE_SLIGHT);
+        cairo_font_options_set_hint_style(o, CAIRO_HINT_STYLE_NONE);   // (pango 1.4x : approches régulières)
         cairo_font_options_set_antialias(o, CAIRO_ANTIALIAS_GRAY);
         pango_cairo_context_set_font_options(x, o);
         cairo_font_options_destroy(o);
