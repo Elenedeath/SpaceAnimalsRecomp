@@ -216,8 +216,9 @@ def sources(app):
     for f in os.listdir(os.path.join(RECOMP, "shaders")):
         if f.endswith(".py"):
             paquet.copier(os.path.join(RECOMP, "shaders", f), os.path.join(r, "shaders", f))
-    # (pas de maj.py, desinstaller.py ni deplacer.py : l'AppImage se remplace, se supprime et se déplace d'un bloc)
-    for f in ("preparer.py", "outils.py", "rapport.py", "sauvegardes.py"):
+    # (pas de maj.py ni deplacer.py : l'AppImage se remplace et se déplace d'un bloc ; désinstallation :
+    # desinstaller_linux.py, bouton DÉSINSTALLER du launcher)
+    for f in ("preparer.py", "outils.py", "rapport.py", "sauvegardes.py", "desinstaller_linux.py"):
         paquet.copier(os.path.join(LANCEUR, f), os.path.join(r, "launcher", f))
     for f in ("nup.py", "nso.py"):
         paquet.copier(os.path.join(PROJET, "tools", f), os.path.join(app, "tools", f))

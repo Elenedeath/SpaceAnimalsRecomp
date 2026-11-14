@@ -1045,7 +1045,41 @@ void verifier_reconstruction() {
 // fermeture du launcher et retire tout ce que le paquet a écrit sur le PC. La copie du jeu du joueur n'est jamais
 // supprimée ; ses sauvegardes seulement s'il le demande. Lancé depuis le dossier temporaire, pour ne pas tenir le
 // dossier d'installation.
+#ifndef _WIN32
+std::wstring entre_guillemets(const std::wstring& p);
+std::string sortie_commande(std::wstring cmd, DWORD delai_ms);
+std::string apres_marque(const std::string& sortie, const char* marque);
+void fond_relancer();
+#endif
 void desinstaller() {
+#ifndef _WIN32
+    // Linux (AppImage) : desinstaller_linux.py supprime tout pendant que le launcher tourne (un fichier ouvert peut
+    // être supprimé) ; le launcher attend sa fin, car ce Python est dans l'image montée, qui disparaît avec lui
+    if (!_wgetenv(L"APPIMAGE") || g.cons.active || g.jeu_lance) return;
+    if (MessageBoxW(g.hwnd, T("desinst_question"), NOM, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    const bool sauv =
+        MessageBoxW(g.hwnd, T("desinst_sauvegardes"), NOM, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    std::wstring c = commande_python(g.recomp + L"/launcher/desinstaller_linux.py");
+    if (c.empty()) {
+        g.statut_jeu = T("pas_de_python");
+        return;
+    }
+    c += L" --desinstaller --oui --racine " + entre_guillemets(g.dossier_exe) + L" --appimage " +
+         entre_guillemets(_wgetenv(L"APPIMAGE")) + (sauv ? L" --sauvegardes" : L"");
+    jlog(L"uninstall requested (saves %ls)", sauv ? L"deleted too" : L"kept");
+    video_arreter();
+    const std::string sortie = sortie_commande(c, 300000);
+    const std::string fini = apres_marque(sortie, "@fini ");
+    if (fini.empty()) {   // rien ou pas tout : le launcher reste ouvert, avec la raison
+        const std::string e = apres_marque(sortie, "@erreur ");
+        g.statut_jeu = std::wstring(T("desinst_echec")) + (e.empty() ? L"desinstaller_linux.py" : wide(e));
+        fond_relancer();
+        return;
+    }
+    g.quitter_sans_question = true;
+    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+    return;
+#endif
     if (!g.paquet || g.cons.active || g.jeu_lance) return;
     if (MessageBoxW(g.hwnd, T("desinst_question"), NOM, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     const bool sauvegardes =

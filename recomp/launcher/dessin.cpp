@@ -1525,7 +1525,11 @@ void page_construction(float t) {
     else bouton_contour(PX1 - 160, PY1 - 44, PX1 - 24, PY1 - 16, T("fermer"), Z_FERMER_PAGE);
     if (!c.etapes.empty()) bouton_contour(PX0 + 24, PY1 - 44, PX0 + 160, PY1 - 16, T("journal"), Z_JOURNAL);
     // paquet installé, rien en cours : tout retirer du PC (desinstaller.py, après deux questions)
+#ifdef _WIN32
     if (g.paquet && !c.active && !g.jeu_lance)
+#else
+    if (getenv("APPIMAGE") && !c.active && !g.jeu_lance)   // Linux : installation faite par l'AppImage
+#endif
         bouton_contour(PX0 + 172, PY1 - 44, PX1 - 172, PY1 - 16, T("desinstaller"), Z_DESINSTALLER);
 }
 

@@ -54,7 +54,8 @@ def enveloppe_zig(zig):
     # (zig nomme les processeurs à sa façon : « x86_64_v3 » pour le « x86-64-v3 » de clang et de GCC)
     # Une compilation (-c) a son propre cache de zig, sur le disque du dossier personnel : plusieurs zig compilant en
     # même temps dans le même cache échouaient au hasard (« unable to rename temporary … to output file », vu le
-    # 2026-11-14 sur un tiers des lots). L'édition de liens garde le cache commun (libc++ compilée une fois).
+    # 2026-11-14 sur un tiers des lots). L'édition de liens garde un cache commun (libc++ compilée une fois), le nôtre :
+    # celui de zig (~/.cache/zig) appartient à l'utilisateur qui se sert aussi de zig.
     texte = ('#!/bin/sh\n'
              'for a do shift; case "$a" in -march=x86-64-v*) a="-march=x86_64_v${a#-march=x86-64-v}";; esac; set -- "$@" "$a"; done\n'
              'z="$(dirname "$0")/zig"\n'
@@ -63,7 +64,9 @@ def enveloppe_zig(zig):
              '  c=$(mktemp -d "$b/c.XXXXXX") || exit 1\n'
              '  ZIG_GLOBAL_CACHE_DIR="$c" ZIG_LOCAL_CACHE_DIR="$c" "$z" c++ "$@"; r=$?; rm -rf "$c"; exit $r;;\n'
              'esac\n'
-             'exec "$z" c++ "$@"\n')
+             # édition de liens : un cache à nous aussi (pas celui de zig de l'utilisateur, ~/.cache/zig)
+             'b="${XDG_CACHE_HOME:-$HOME/.cache}/spaceanimalsrecomp-zig"; mkdir -p "$b/commun"\n'
+             'ZIG_GLOBAL_CACHE_DIR="$b/commun" exec "$z" c++ "$@"\n')
     try:
         if not os.path.exists(enveloppe) or open(enveloppe).read() != texte:
             with open(enveloppe, "w") as f:

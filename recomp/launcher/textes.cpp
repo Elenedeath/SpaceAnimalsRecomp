@@ -129,8 +129,13 @@ const Texte TEXTES[] = {
     {"fenetre", L"Fenêtré", L"Windowed"},
     {"reg_aff_aide", L"Alt+Entrée bascule en jeu", L"Alt+Enter toggles in game"},
     {"reg_langue", L"Langue du jeu", L"Game language"},
+#ifdef _WIN32
     {"reg_langue_aide", L"Auto : celle de Windows", L"Auto: Windows language"},
     {"auto_langue", L"Auto (Windows)", L"Auto (Windows)"},
+#else
+    {"reg_langue_aide", L"Auto : celle du système", L"Auto: system language"},
+    {"auto_langue", L"Auto (système)", L"Auto (system)"},
+#endif
     {"reg_vol", L"Volume", L"Volume"},
     {"reg_vib", L"Vibrations", L"Rumble"},
     {"reg_vib_aide", L"manettes Xbox, PS4, PS5, Pro", L"Xbox, PS4, PS5, Pro controllers"},
@@ -228,12 +233,21 @@ const Texte TEXTES[] = {
      L"The game stopped (code %d). “BUG REPORT” creates the file to attach to an issue."},
     // (pas de chiffre d'exigence : il sera donné à la sortie d'après les mesures ; le conseil du fichier d'échange vient
     // des arrêts du 2026-11-11 sur un PC de 32 Go au fichier d'échange fixe de 8 Go)
+#ifdef _WIN32
     {"memoire_faible", L"Mémoire libre : %.1f Go, c'est peu pour le jeu. Fermez les programmes lourds et laissez Windows gérer le fichier d'échange, ou recliquez pour lancer quand même.",
      L"Free memory: %.1f GB, that is low for the game. Close heavy programs and let Windows manage the page file, or click again to start anyway."},
     {"jeu_memoire", L"Mémoire insuffisante : fermez les programmes lourds (jeux, navigateur…), laissez Windows gérer le fichier d'échange, puis relancez.",
      L"Not enough memory: close heavy programs (games, browser…), let Windows manage the page file, then try again."},
     {"affichage_indisponible", L"Affichage impossible : Direct3D 11 ou Direct2D indisponible (détail dans lanceur.log). Mettez à jour le pilote de la carte graphique.",
      L"Cannot display: Direct3D 11 or Direct2D unavailable (details in lanceur.log). Update the graphics driver."},
+#else
+    {"memoire_faible", L"Mémoire libre : %.1f Go (RAM et espace d'échange), c'est peu pour le jeu. Fermez les programmes lourds ou agrandissez l'espace d'échange (swap), ou recliquez pour lancer quand même.",
+     L"Free memory: %.1f GB (RAM and swap), that is low for the game. Close heavy programs or enlarge the swap space, or click again to start anyway."},
+    {"jeu_memoire", L"Mémoire insuffisante : fermez les programmes lourds (jeux, navigateur…) ou agrandissez l'espace d'échange (swap), puis relancez.",
+     L"Not enough memory: close heavy programs (games, browser…) or enlarge the swap space, then try again."},
+    {"affichage_indisponible", L"Affichage impossible : fenêtre SDL indisponible (détail dans lanceur.log). Lancez le launcher depuis une session graphique.",
+     L"Cannot display: SDL window unavailable (details in lanceur.log). Start the launcher from a graphical session."},
+#endif
     {"desinstaller", L"DÉSINSTALLER", L"UNINSTALL"},
     // emplacement du jeu (issue GitHub n° 14). Pas de « % » dans dep_fini, dep_fini_copie ni dep_echec : affichés par
     // LANCEUR_STATUT, qui les passe à swprintf.
@@ -256,12 +270,22 @@ const Texte TEXTES[] = {
     {"dep_echec", L"Déplacement impossible : un fichier du dossier est sans doute ouvert dans un autre programme. Rien n'a changé.",
      L"The game was not moved: a file of the folder is probably open in another program. Nothing changed."},
     {"e_maj", L"Téléchargement et vérification", L"Download and check"},
+#ifdef _WIN32
     {"desinst_question", L"Désinstaller SpaceAnimalsRecomp ?\n\nSeront supprimés : le jeu construit, le launcher et ses outils (tout ce dossier) et la copie du compilateur.\n\nVotre copie du jeu n'est jamais supprimée.",
      L"Uninstall SpaceAnimalsRecomp?\n\nThis deletes the built game, the launcher and its tools (this whole folder) and the compiler copy.\n\nYour game copy is never deleted."},
     {"desinst_sauvegardes", L"Supprimer aussi vos sauvegardes ?\n\nNon : elles restent dans %APPDATA%\\SpaceAnimalsRecomp et seront reprises si vous réinstallez.",
      L"Delete your saves too?\n\nNo: they stay in %APPDATA%\\SpaceAnimalsRecomp and will be picked up if you reinstall."},
     {"pas_de_python", L"Python 3 introuvable : installez-le, ou placez-le dans outils\\python.",
      L"Python 3 not found: install it, or put it in outils\\python."},
+#else
+    {"desinst_question", L"Désinstaller SpaceAnimalsRecomp ?\n\nSeront supprimés : le jeu construit, le launcher (~/.local/share/SpaceAnimalsRecomp/app), l'AppImage, les caches du compilateur et le raccourci du bureau.\n\nVotre copie du jeu n'est jamais supprimée.",
+     L"Uninstall SpaceAnimalsRecomp?\n\nThis deletes the built game, the launcher (~/.local/share/SpaceAnimalsRecomp/app), the AppImage, the compiler caches and the desktop shortcut.\n\nYour game copy is never deleted."},
+    {"desinst_sauvegardes", L"Supprimer aussi vos sauvegardes ?\n\nNon : elles restent dans ~/.local/share/SpaceAnimalsRecomp et seront reprises si vous réinstallez.",
+     L"Delete your saves too?\n\nNo: they stay in ~/.local/share/SpaceAnimalsRecomp and will be picked up if you reinstall."},
+    {"pas_de_python", L"Python 3 introuvable : installez-le (python3), ou placez-le dans outils/python.",
+     L"Python 3 not found: install it (python3), or put it in outils/python."},
+    {"desinst_echec", L"Désinstallation incomplète : ", L"Uninstall incomplete: "},
+#endif
     {"pas_de_copie", L"Choisissez d'abord votre copie du jeu.", L"Choose your game copy first."},
     {"filtre_nup", L"Copie de Star Fox (*.nup)", L"Star Fox copy (*.nup)"},
     {"dialogue_titre", L"Choisir votre copie de Star Fox", L"Choose your Star Fox copy"},
