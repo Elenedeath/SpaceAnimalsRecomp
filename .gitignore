@@ -3,6 +3,7 @@
 extracted/
 work/
 recomp/build/
+recomp/out/
 recomp/launcher/extraits/
 recomp/launcher/build/
 # outils téléchargés (outils.py), launcher compilé, réglages et mises à jour locales
@@ -12,7 +13,7 @@ recomp/launcher/lanceur.exe
 lanceur.exe
 lanceur.ini
 maj/
-mise_a_jour.log
+*.log
 dist/
 __pycache__/
 *.pyc

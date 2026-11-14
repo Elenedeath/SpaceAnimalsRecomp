@@ -21,12 +21,19 @@
 #include "hos.h"   // avant <windows.h>, comme settings.cpp (GPTR)
 #include "settings.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 #include "fsr.h"
 
+#ifndef _WIN32
+#define __declspec(x)   // (ffx_api.h : FFX_API_ENTRY __declspec(dllexport), sans objet ici)
+#endif
 #include "ffx/upscalers/include/ffx_upscale.h"
 #include "ffx/api/include/vk/ffx_api_vk.h"
 
@@ -69,6 +76,22 @@ struct Etat {
 };
 Etat g;
 
+#ifndef _WIN32
+// Linux : les bibliothèques FidelityFX d'AMD n'existent que pour Windows ; le FSR reste coupé
+std::string utf8(const std::wstring& w) {
+    std::string s;
+    for (wchar_t c : w) s += c < 0x80 ? (char)c : '?';
+    return s;
+}
+const std::wstring& chercher() { return g.chemin; }   // (vide)
+bool charger() {
+    if (g.tente) return false;
+    g.tente = true;
+    HLOG("fsr", "AMD FSR not available on Linux (FidelityFX libraries for Windows only): FSR off, the game keeps its "
+                "anti-aliasing");
+    return false;
+}
+#else
 std::string utf8(const std::wstring& w) {
     if (w.empty()) return "";
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -132,6 +155,7 @@ bool charger() {
     g.dll = m;
     return true;
 }
+#endif
 
 void message_fsr(uint32_t type, const wchar_t* message) {
     static int n = 0;

@@ -8,6 +8,9 @@
 //
 // Réglages : RECOMP_NO_AUDIO=1 (pas de sortie), RECOMP_VOLUME=0..100 (gain de sortie, 100 par défaut),
 // RECOMP_AUDIO_WAV=fichier.wav (enregistre le mixage, avant le volume : vérification sans haut-parleurs).
+// Linux : flux SDL3 (SDL_OpenAudioDeviceStream) sur le périphérique par défaut, rempli par son rappel au rythme de la
+// carte son (même principe) ; SDL convertit vers le format du périphérique et suit un changement de périphérique.
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -17,6 +20,11 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <propidl.h>
+#else
+#include "plat_linux.h"
+#include <SDL3/SDL.h>
+#include <vector>
+#endif
 
 #include "audio_out.h"
 #include "hos.h"
@@ -29,10 +37,10 @@
 #include <string>
 #include <thread>
 
-#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#if defined(_WIN32) && !defined(AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM)
 #define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
 #endif
-#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#if defined(_WIN32) && !defined(AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY)
 #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
 #endif
 
@@ -40,15 +48,16 @@ namespace hos {
 namespace audio_out {
 namespace {
 
+std::atomic<bool> g_active{false};
+MixFn g_mix = nullptr;
+
+#ifdef _WIN32
 // identifiants COM (définis ici : pas de dépendance à uuid.lib)
 const GUID kCLSID_MMDeviceEnumerator = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
 const GUID kIID_IMMDeviceEnumerator = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
 const GUID kIID_IAudioClient = {0x1CB9AD4C, 0xDBFA, 0x4C32, {0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2}};
 const GUID kIID_IAudioRenderClient = {0xF294ACFC, 0x3146, 0x4483, {0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2}};
 const GUID kSUBTYPE_IEEE_FLOAT = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71}};
-
-std::atomic<bool> g_active{false};
-MixFn g_mix = nullptr;
 
 // Nom du périphérique (PKEY_Device_FriendlyName) pour le journal : on sait ainsi où sort le son.
 std::string device_name(IMMDevice* dev) {
@@ -69,6 +78,7 @@ std::string device_name(IMMDevice* dev) {
     ps->Release();
     return out;
 }
+#endif  // _WIN32
 
 // ---------------------------------------------------------------- enregistrement WAV (diagnostic)
 struct Wav {
@@ -113,6 +123,7 @@ struct Wav {
     }
 };
 
+#ifdef _WIN32
 // ---------------------------------------------------------------- périphérique
 struct Dev {
     IMMDeviceEnumerator* en = nullptr;
@@ -223,6 +234,52 @@ void render_thread() {
         d.render->ReleaseBuffer(n, 0);
     }
 }
+#else
+// ---------------------------------------------------------------- Linux : SDL3
+Wav g_wav;
+float g_vol = 1.0f;
+std::vector<float> g_tampon;
+
+void SDLCALL remplir(void*, SDL_AudioStream* s, int manque, int) {
+    if (manque <= 0) return;
+    const uint32_t n = (uint32_t)(manque / 8);   // trames stéréo flottantes
+    if (!n) return;
+    if (g_tampon.size() < 2 * (size_t)n) g_tampon.resize(2 * (size_t)n);
+    float* out = g_tampon.data();
+    g_mix(out, n);
+    g_wav.write(out, n);
+    if (g_vol != 1.0f)
+        for (uint32_t i = 0; i < 2 * n; i++) out[i] *= g_vol;
+    SDL_PutAudioStreamData(s, out, (int)(n * 8));
+}
+
+void ouvrir_sdl() {
+    static const char* vol_env = getenv("RECOMP_VOLUME");
+    g_vol = vol_env ? std::clamp(atoi(vol_env), 0, 100) / 100.0f : 1.0f;
+    if (const char* p = getenv("RECOMP_AUDIO_WAV")) g_wav.open(p);
+    for (int essai = 0;; essai++) {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            const SDL_AudioSpec spec{SDL_AUDIO_F32, 2, 48000};
+            // ≈ 10 ms par rappel (comme la période de WASAPI)
+            SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "480");
+            if (SDL_AudioStream* s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, remplir, nullptr)) {
+                SDL_AudioSpec dev{};
+                int frames = 0;
+                SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s), &dev, &frames);
+                const char* nom = SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(s));
+                g_active = true;
+                SDL_ResumeAudioStreamDevice(s);
+                HLOG("audio", "SDL audio output opened on '%s' (%s): 48 kHz stereo float → device %d Hz, %d channels "
+                              "(buffer of %d frames)", nom ? nom : "?", SDL_GetCurrentAudioDriver(), dev.freq, dev.channels,
+                     frames);
+                return;
+            }
+        }
+        if (!essai) HLOG("audio", "audio output: %s; retrying every second", SDL_GetError());
+        Sleep(1000);
+    }
+}
+#endif
 
 }  // namespace
 
@@ -232,7 +289,11 @@ void start(MixFn mix) {
         return;
     }
     g_mix = mix;
+#ifdef _WIN32
     std::thread(render_thread).detach();
+#else
+    std::thread(ouvrir_sdl).detach();
+#endif
 }
 bool active() { return g_active.load(std::memory_order_relaxed); }
 

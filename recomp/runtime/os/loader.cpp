@@ -2,9 +2,14 @@
 // relocations (RELA, JMPREL, RELR), résolution globale des symboles dans l'ordre des modules
 // (main d'abord : ses exports — malloc, free… — remplacent ceux du SDK, comme sur console),
 // symbolisation des adresses pour les journaux.
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#include <dirent.h>
+#endif
 
 #include "hos.h"
 
@@ -167,17 +172,21 @@ std::string racine_installation() {
         if (p == std::string::npos) return "";
         d.resize(p);
     }
-    return d + "\\";
+    return d + PSEP;
 }
 
+#ifdef _WIN32
 bool existe(const std::string& p) { return !p.empty() && GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+#else
+bool existe(const std::string& p) { return plat_existe(p.c_str()); }
+#endif
 
 // Le manifeste (fullbuild.py) contient des chemins absolus : après un déplacement ou un renommage du dossier
 // d'installation (issue GitHub n° 4), on reprend les images dans <racine>\work.
 std::string image_retrouvee(const std::string& chemin) {
     if (existe(chemin)) return chemin;
     const size_t p = chemin.find_last_of("\\/");
-    const std::string ici = racine_installation() + "work\\" + (p == std::string::npos ? chemin : chemin.substr(p + 1));
+    const std::string ici = racine_installation() + "work" PSEP + (p == std::string::npos ? chemin : chemin.substr(p + 1));
     if (existe(ici)) {
         HLOG("loader", "image found: %s (the manifest says %s: folder moved?)", ici.c_str(), chemin.c_str());
         return ici;
@@ -191,13 +200,26 @@ void copie_retrouvee() {
     std::string trouvee;
     if (const char* e = getenv("RECOMP_NUP"); e && existe(e)) trouvee = e;
     if (trouvee.empty()) {
-        WIN32_FIND_DATAA fd;
         const std::string r = racine_installation();
+#ifdef _WIN32
+        WIN32_FIND_DATAA fd;
         HANDLE h = FindFirstFileA((r + "*.nup").c_str(), &fd);
         if (h != INVALID_HANDLE_VALUE) {
             trouvee = r + fd.cFileName;
             FindClose(h);
         }
+#else
+        if (DIR* d = opendir(r.c_str())) {
+            while (dirent* e = readdir(d)) {
+                const size_t n = strlen(e->d_name);
+                if (n > 4 && !strcasecmp(e->d_name + n - 4, ".nup")) {
+                    trouvee = r + e->d_name;
+                    break;
+                }
+            }
+            closedir(d);
+        }
+#endif
     }
     if (trouvee.empty()) {
         HLOG("loader", "game copy not found: %s (choose the game copy in the launcher)", g_nup_path.c_str());

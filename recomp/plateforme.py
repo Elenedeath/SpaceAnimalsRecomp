@@ -1,0 +1,153 @@
+"""Différences entre Windows et Linux pour les scripts de construction (build.py, link.py, launcher/preparer.py…).
+
+Sous Windows, rien ne change : ces fonctions rendent ce que les scripts utilisaient déjà. Sous Linux (portage Linux,
+AppImage pour le Steam Deck), la chaîne de construction est zig (clang et la bibliothèque C++ de LLVM, avec les
+en-têtes de la glibc) : un seul compilateur, fourni avec le paquet, compile le code généré, le runtime et fait
+l'édition de liens. SDL3 (fenêtre, son, manettes) et glslang sont fournis aussi, dans outils/.
+"""
+import os
+import sys
+
+LINUX = sys.platform.startswith("linux")
+EXE = "" if LINUX else ".exe"            # suffixe des exécutables (recomp_main, lanceur)
+ICI = os.path.dirname(os.path.abspath(__file__))   # recomp/
+RACINE = os.path.dirname(ICI)
+# glibc visée par zig : celle du Steam Runtime « sniper » (Debian 11). Le jeu est construit sur le PC du joueur, mais
+# une cible fixe rend la construction identique d'un PC à l'autre (mêmes empreintes d'objets) et l'exécutable
+# démarre sur toute distribution au moins aussi récente.
+CIBLE_LINUX = "x86_64-linux-gnu.2.31"
+
+
+def dossiers_outils():
+    """outils/ du paquet (à côté de recomp/), puis recomp/outils (arbre de développement)."""
+    return [d for d in (os.path.join(RACINE, "outils"), os.path.join(ICI, "outils")) if os.path.isdir(d)]
+
+
+def outil(*chemin):
+    """Premier fichier outils/<chemin> trouvé, sinon None."""
+    for d in dossiers_outils():
+        p = os.path.join(d, *chemin)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def zig_cxx():
+    """Compilateur C++ sous Linux : RECOMP_CXX, sinon le zig fourni (outils/zig), appelé par un petit script « c++ »
+    (zig se lance en « zig c++ » : deux mots, alors que les scripts passent un seul chemin de compilateur), sinon zig
+    ou clang++ du PATH."""
+    choix = os.environ.get("RECOMP_CXX")
+    if choix:
+        return choix
+    zig = outil("zig", "zig")
+    if not zig:
+        import shutil
+        zig = shutil.which("zig")
+        if not zig:
+            return shutil.which("clang++") or "clang++"
+    enveloppe = os.path.join(os.path.dirname(zig), "c++")
+    texte = '#!/bin/sh\nexec "$(dirname "$0")/zig" c++ "$@"\n'
+    try:
+        if not os.path.exists(enveloppe) or open(enveloppe).read() != texte:
+            with open(enveloppe, "w") as f:
+                f.write(texte)
+            os.chmod(enveloppe, 0o755)
+    except OSError:   # dossier en lecture seule (paquet monté) : le script y est déjà
+        pass
+    return enveloppe
+
+
+def est_zig(cxx):
+    return os.path.basename(str(cxx)) == "c++" and os.path.exists(os.path.join(os.path.dirname(str(cxx)), "zig"))
+
+
+def cible_linux(cxx):
+    """Drapeaux de cible du compilateur Linux (zig : glibc 2.31 ; clang du système : sa glibc)."""
+    return ["-target", CIBLE_LINUX] if est_zig(cxx) else ["--target=x86_64-linux-gnu"]
+
+
+def sdl3():
+    """(dossier des en-têtes, dossier de libSDL3.so) fournis avec le paquet, ou (None, None)."""
+    inc, lib = outil("sdl3", "include"), outil("sdl3", "lib")
+    return (inc, lib) if inc and lib else (None, None)
+
+
+def glslang():
+    """glslang fourni (outils/glslang/bin), sinon None."""
+    for nom in ("glslangValidator" + EXE, "glslang" + EXE):
+        p = outil("glslang", "bin", nom)
+        if p:
+            return p
+    return None
+
+
+def _meminfo():
+    v = {}
+    with open("/proc/meminfo") as f:
+        for ligne in f:
+            k, _, reste = ligne.partition(":")
+            try:
+                v[k] = int(reste.split()[0]) * 1024
+            except (ValueError, IndexError):
+                pass
+    return v
+
+
+def memoire_libre():
+    """(Go de RAM disponibles, Go « validables » disponibles). Linux : MemAvailable, et MemAvailable + SwapFree (Linux
+    surengage : la mémoire validable de Windows n'a pas d'équivalent strict). Lève OSError si illisible."""
+    if os.environ.get("RECOMP_MEM_LIBRE_GO"):
+        v = float(os.environ["RECOMP_MEM_LIBRE_GO"])
+        return v, v
+    if LINUX:
+        m = _meminfo()
+        ram = m.get("MemAvailable", 0)
+        return ram / 1e9, (ram + m.get("SwapFree", 0)) / 1e9
+    import ctypes
+
+    class Etat(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    e = Etat()
+    e.dwLength = ctypes.sizeof(Etat)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(e)):
+        raise OSError("GlobalMemoryStatusEx")
+    return e.ullAvailPhys / 1e9, e.ullAvailPageFile / 1e9
+
+
+def memoire_processus_linux(pid):
+    """Mémoire (Go) d'un processus Linux : le plus grand de VmHWM (pic) et VmRSS ; 0 si illisible."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            v = [int(l.split()[1]) * 1024 for l in f if l.startswith(("VmHWM:", "VmRSS:"))]
+        return max(v) / 1e9 if v else 0.0
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def avx2():
+    """Le processeur a-t-il l'AVX2 ? (Linux : /proc/cpuinfo ; Windows : IsProcessorFeaturePresent)"""
+    if LINUX:
+        try:
+            with open("/proc/cpuinfo") as f:
+                for ligne in f:
+                    if ligne.startswith("flags"):
+                        return " avx2" in ligne
+        except OSError:
+            return True
+        return True
+    import ctypes
+    return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))   # PF_AVX2_INSTRUCTIONS_AVAILABLE
+
+
+def dossier_donnees():
+    """Dossier des données du joueur hors de l'installation : %APPDATA%\\SpaceAnimalsRecomp sous Windows,
+    $XDG_DATA_HOME/SpaceAnimalsRecomp (~/.local/share/…) sous Linux, comme runtime/os/svc_fs.cpp. None si inconnu."""
+    if LINUX:
+        base = os.environ.get("XDG_DATA_HOME") or (os.path.join(os.environ["HOME"], ".local", "share")
+                                                   if os.environ.get("HOME") else None)
+    else:
+        base = os.environ.get("APPDATA")
+    return os.path.join(base, "SpaceAnimalsRecomp") if base else None

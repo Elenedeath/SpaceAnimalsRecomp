@@ -9,7 +9,15 @@ namespace hos {
 void gfx_open_window(int width, int height);           // crée la fenêtre hôte (une fois)
 void gfx_present(const float rgba[4], uint64_t frame);  // présente une image (cadencée à 60 Hz)
 bool gfx_window_focused();                              // la fenêtre hôte a le focus clavier
-void* gfx_window_handle();                             // HWND (moteur Vulkan)
+void* gfx_window_handle();                             // HWND (moteur Vulkan) ; Linux : SDL_Window*
+#ifndef _WIN32
+// Linux (present.cpp, SDL3) : boucle d'événements du fil principal tant que fini(arg) est faux (run_main_thread) ;
+// extensions d'instance Vulkan et surface de la fenêtre ; taille de la fenêtre en pixels
+void gfx_boucle_principale(bool (*fini)(void*), void* arg);
+bool gfx_vk_extensions(std::vector<const char*>& ext);
+bool gfx_vk_surface(void* instance, void* gipa, uint64_t* surface);
+void gfx_window_pixels(int* w, int* h);
+#endif
 void gfx_status(const char* text);                     // état affiché dans le titre de la fenêtre (avant la 1re image)
 void gfx_count_frame(uint64_t frame);
 // écran virtuel (hle_gfx.cpp) : période de vblank en ticks du compteur invité (31,25 MHz), image affichée à un vblank

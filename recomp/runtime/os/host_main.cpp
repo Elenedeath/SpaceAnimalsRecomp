@@ -8,11 +8,21 @@
 #include "settings.h"
 #include "vk_render.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
 #include <tlhelp32.h>
+#else
+#include "plat_linux.h"
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <ucontext.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +30,7 @@
 #include <exception>
 #include <new>
 #include <malloc.h>
+#include <vector>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -48,12 +59,22 @@ void masquer_profil(char* msg, size_t taille) {
     static char profil[520];
     static size_t n = (size_t)-1;
     if (n == (size_t)-1) {
+#ifdef _WIN32
         const wchar_t* w = getenv("RECOMP_LOG_PATHS") ? nullptr : _wgetenv(L"USERPROFILE");
         const int k = w ? WideCharToMultiByte(CP_UTF8, 0, w, -1, profil, (int)sizeof profil, nullptr, nullptr) : 0;
         n = k > 5 ? (size_t)k - 1 : 0;   // au moins « C:\xy »
+#else
+        const char* h = getenv("RECOMP_LOG_PATHS") ? nullptr : getenv("HOME");   // Linux : /home/<nom>
+        const int k = h ? snprintf(profil, sizeof profil, "%s", h) : 0;
+        n = k > 3 && (size_t)k < sizeof profil ? (size_t)k : 0;
+#endif
     }
     if (!n) return;
+#ifdef _WIN32
     static const char remplacement[] = "%USERPROFILE%";
+#else
+    static const char remplacement[] = "~";
+#endif
     const size_t r = sizeof remplacement - 1;
     for (char* p = msg; *p;) {
         if ((p[0] | 0x20) == (profil[0] | 0x20) && !_strnicmp(p, profil, n)) {
@@ -103,7 +124,7 @@ void build_host_map() {
 
 std::string host_frame(uint64_t rip) {
     char buf[96];
-    auto it = std::upper_bound(g_host2guest.begin(), g_host2guest.end(), std::make_pair(rip, ~0ull));
+    auto it = std::upper_bound(g_host2guest.begin(), g_host2guest.end(), std::make_pair(rip, ~(uint64_t)0));
     if (it != g_host2guest.begin() && rip < g_gen_end) {
         --it;
         if (rip - it->first < 0x200000) {
@@ -111,14 +132,44 @@ std::string host_frame(uint64_t rip) {
             return symbolize(it->second) + buf;
         }
     }
+#ifdef _WIN32
     HMODULE m = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)rip, &m);
+#else
+    Dl_info di{};
+    const void* m = dladdr((void*)rip, &di) ? di.dli_fbase : nullptr;
+#endif
     snprintf(buf, sizeof buf, "host 0x%llx (image+0x%llx)", (unsigned long long)rip,
              (unsigned long long)(rip - (uint64_t)m));
     return buf;
 }
 
+#ifndef _WIN32
+// Linux : pile d'appels de l'hôte par les tables de déroulement (backtrace de la glibc) ; depuis un gestionnaire de
+// signal, elle traverse le cadre du signal jusqu'à la fonction fautive. rip : instruction fautive (0 : appel direct).
+void print_backtrace_linux(uint64_t rip) {
+    HLOG("crash", "call stack (recompiled guest functions):");
+    void* pcs[64];
+    const int n = backtrace(pcs, 64);
+    int i = 0;
+    if (rip) HLOG("crash", "  #%-2d %s", i++, host_frame(rip).c_str());
+    bool vu = !rip;   // les cadres du gestionnaire sont sautés jusqu'à l'instruction fautive
+    for (int k = 0; k < n && i < 48; k++) {
+        const uint64_t pc = (uint64_t)pcs[k];
+        if (!vu) {
+            if (pc == rip) vu = true;
+            continue;
+        }
+        if (pc == rip) continue;
+        HLOG("crash", "  #%-2d %s", i++, host_frame(pc - 1).c_str());
+    }
+    if (!vu)   // cadre fautif introuvable : toute la pile
+        for (int k = 0; k < n && i < 48; k++) HLOG("crash", "  #%-2d %s", i++, host_frame((uint64_t)pcs[k] - 1).c_str());
+}
+#endif
+
+#ifdef _WIN32
 void print_backtrace(const CONTEXT* c0) {
     CONTEXT c;
     if (c0) c = *c0;
@@ -139,6 +190,9 @@ void print_backtrace(const CONTEXT* c0) {
         }
     }
 }
+#else
+void print_backtrace(const void*) { print_backtrace_linux(0); }
+#endif
 
 void print_guest_state() {
     CPUState* ctx = current_ctx();
@@ -171,6 +225,48 @@ void print_guest_state() {
 
 std::atomic<int> g_crashing{0};
 
+#ifndef _WIN32
+// Linux : SIGSEGV, SIGBUS, SIGILL, SIGFPE (équivalent du gestionnaire vectoriel de Windows). Le type d'accès vient du
+// code d'erreur de la faute de page (bit 1 : écriture).
+void sig_crash(int sig, siginfo_t* si, void* ucv) {
+    const ucontext_t* uc = (const ucontext_t*)ucv;
+    const uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    const uint64_t a = (uint64_t)si->si_addr;
+    const bool ecriture = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+    if (sig == SIGSEGV && mem_fault(a, ecriture)) return;   // (rien à engager sous Linux : toujours 0)
+    if (g_crashing++) {
+        for (;;) pause();
+    }
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        MemInfo mi = mem_query(a);
+        HLOG("crash", "access violation (%s) at 0x%llx [guest state 0x%x, perm %u] from %s (thread %llu, signal %d)",
+             ecriture ? "write" : "read", (unsigned long long)a, mi.state, mi.perm, host_frame(rip).c_str(),
+             (unsigned long long)current_thread_id(), sig);
+    } else {
+        HLOG("crash", "signal %d (%s) from %s", sig, strsignal(sig), host_frame(rip).c_str());
+    }
+    print_guest_state();
+    print_backtrace_linux(rip);
+    fflush(nullptr);
+    _exit(3);
+}
+
+void installer_signaux() {
+    // pile de secours du fil principal : un débordement de pile y est encore rapporté
+    static std::vector<uint8_t> secours(256 << 10);
+    stack_t ss{};
+    ss.ss_sp = secours.data();
+    ss.ss_size = secours.size();
+    sigaltstack(&ss, nullptr);
+    struct sigaction sa{};
+    sa.sa_sigaction = sig_crash;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(s, &sa, nullptr);
+}
+#endif
+
+#ifdef _WIN32
 LONG WINAPI veh(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     switch (code) {
@@ -238,6 +334,11 @@ void dump_host_thread(void* h, uint64_t id) {
     }
     ResumeThread(th);
 }
+#else
+void dump_host_thread(void*, uint64_t id) {
+    HLOG("dump", "stack of thread %llu: not available on Linux", (unsigned long long)id);
+}
+#endif
 
 
 // --profile T : profil par échantillonnage (1 ms) de tous les threads invités pendant 10 s à
@@ -245,6 +346,11 @@ void dump_host_thread(void* h, uint64_t id) {
 // s'exécute, ou dans « runtime » / « système » (DLL Windows : attentes, synchronisation).
 void run_profile(double start, double dur) {
     std::this_thread::sleep_for(std::chrono::duration<double>(start));
+#ifndef _WIN32
+    (void)dur;
+    HLOG("prof", "profile: not available on Linux (use perf)");
+    return;
+#else
     HLOG("prof", "profile: %.0f s of sampling", dur);
     std::map<uint64_t, std::map<uint64_t, uint64_t>> per;   // thread → clé → n
     std::map<uint64_t, uint64_t> rt_rips;                    // RIP du runtime → n
@@ -262,7 +368,7 @@ void run_profile(double start, double dur) {
             ResumeThread(th);
             if (!ok) continue;
             uint64_t rip = c.Rip, key;
-            auto it = std::upper_bound(g_host2guest.begin(), g_host2guest.end(), std::make_pair(rip, ~0ull));
+            auto it = std::upper_bound(g_host2guest.begin(), g_host2guest.end(), std::make_pair(rip, ~(uint64_t)0));
             if (it != g_host2guest.begin() && rip < g_gen_end && rip - std::prev(it)->first < 0x200000) {
                 key = std::prev(it)->second;
             } else {
@@ -303,6 +409,7 @@ void run_profile(double start, double dur) {
     std::sort(r.begin(), r.end(), [](auto& a, auto& b) { return a.second > b.second; });
     for (size_t i = 0; i < r.size() && i < 25; i++)
         HLOG("prof", "  runtime image+0x%llx: %llu", (unsigned long long)r[i].first, (unsigned long long)r[i].second);
+#endif
 }
 
 // --trace-api : appels de main vers le SDK (via PLT), par thread, premières occurrences
@@ -372,7 +479,11 @@ void panic(const char* fmt, ...) {
         HLOG("PANIC", "cause: the PC is low on memory (%.1f GB available commit, about 8 are needed): close other "
                       "programs (other games, browser...) then restart", memoire_validable_libre_go());
     fflush(nullptr);
+#ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), g_manque_memoire ? 4 : 2);
+#else
+    _exit(g_manque_memoire ? 4 : 2);
+#endif
     for (;;) {}
 }
 
@@ -424,6 +535,7 @@ namespace hos {
 // contexte et de remonter sa pile (RtlVirtualUnwind), puis repris ; les noms sont cherchés après coup (export le plus
 // proche du module : exact pour ntdll, approximatif ailleurs). Seuls les fils passés par une fonction du tas sont
 // écrits, 12 au plus.
+#ifdef _WIN32
 namespace {
 std::string nom_adresse(uint64_t pc) {
     HMODULE m = nullptr;
@@ -525,6 +637,9 @@ void dump_thread_stacks(const char* why) {
     }
     HLOG("mem", "  stacks (%s): %d threads, %d inside a heap function", why, np, dans_tas);
 }
+#else
+void dump_thread_stacks(const char* why) { HLOG("mem", "  stacks (%s): not available on Linux", why); }
+#endif
 
 // (octets vivants alloués par new ; pour chaque classe de taille 2^c : nombre et octets alloués depuis le lancement)
 void cpp_heap_stats(int64_t* vivants, uint64_t nombre[40], uint64_t octets[40]) {
@@ -535,6 +650,7 @@ void cpp_heap_stats(int64_t* vivants, uint64_t nombre[40], uint64_t octets[40]) 
 
 // Première ligne du journal : version (recomp/VERSION, deux dossiers au-dessus de l'exécutable), Windows, processeur,
 // mémoire. Le GPU et son pilote suivent à l'initialisation de Vulkan.
+#ifdef _WIN32
 std::string lire_registre(HKEY racine, const char* cle, const char* valeur) {
     char b[256] = {};
     DWORD n = sizeof b - 1;
@@ -553,6 +669,9 @@ void dpi_compatible() {
     if (SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) g_dpi_mode = "per-monitor DPI aware";
     else if (SetProcessDPIAware()) g_dpi_mode = "DPI aware for the main screen";   // Windows 10 avant 1703
 }
+#else
+void dpi_compatible() {}
+#endif
 
 void journal_systeme() {
     char exe[MAX_PATH] = {};
@@ -560,12 +679,43 @@ void journal_systeme() {
     std::string d = exe;
     for (int i = 0; i < 3 && d.find_last_of("\\/") != std::string::npos; i++) d = d.substr(0, d.find_last_of("\\/"));
     std::string version = "?";
-    if (FILE* f = fopen((d + "\\VERSION").c_str(), "rb")) {
+    if (FILE* f = fopen((d + PSEP "VERSION").c_str(), "rb")) {
         char b[32] = {};
         if (fgets(b, sizeof b, f)) version = b;
         fclose(f);
         while (!version.empty() && (version.back() == '\n' || version.back() == '\r' || version.back() == ' ')) version.pop_back();
     }
+#ifndef _WIN32
+    // Linux : distribution (/etc/os-release), noyau, processeur (/proc/cpuinfo), mémoire (sysinfo)
+    std::string os = "Linux", cpu = "?";
+    if (FILE* f = fopen("/etc/os-release", "r")) {
+        char l[256];
+        while (fgets(l, sizeof l, f))
+            if (!strncmp(l, "PRETTY_NAME=", 12)) {
+                os = l + 12;
+                os.erase(std::remove_if(os.begin(), os.end(), [](char c) { return c == '"' || c == '\n'; }), os.end());
+            }
+        fclose(f);
+    }
+    if (FILE* f = fopen("/proc/cpuinfo", "r")) {
+        char l[512];
+        while (fgets(l, sizeof l, f))
+            if (!strncmp(l, "model name", 10) && strchr(l, ':')) {
+                cpu = strchr(l, ':') + 2;
+                while (!cpu.empty() && (cpu.back() == '\n' || cpu.back() == ' ')) cpu.pop_back();
+                break;
+            }
+        fclose(f);
+    }
+    utsname un{};
+    uname(&un);
+    struct sysinfo si{};
+    sysinfo(&si);
+    HLOG("main", "SpaceAnimalsRecomp %s; %s (kernel %s); %s, %ld threads, AVX2 %s; RAM %.1f GB (%.1f available)",
+         version.c_str(), os.c_str(), un.release, cpu.c_str(), sysconf(_SC_NPROCESSORS_ONLN),
+         __builtin_cpu_supports("avx2") ? "yes" : "NO", (double)si.totalram * si.mem_unit / 1073741824.0,
+         memoire_validable_libre_go());
+#else
     const char* nt = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
     std::string os = lire_registre(HKEY_LOCAL_MACHINE, nt, "ProductName");
     const std::string build = lire_registre(HKEY_LOCAL_MACHINE, nt, "CurrentBuild");
@@ -579,6 +729,7 @@ void journal_systeme() {
          lire_registre(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString").c_str(),
          si.dwNumberOfProcessors, IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) ? "yes" : "NO",
          ms.ullTotalPhys / 1073741824.0, ms.ullAvailPhys / 1073741824.0);
+#endif
 }
 
 // Arrêts sans exception Windows : allocation refusée (operator new), std::terminate, abort(). Jusqu'à la 1.0.2, le jeu
@@ -591,7 +742,11 @@ void journal_systeme() {
     HLOG("PANIC", "%s; %.1f GB of available commit%s", quoi, libre,
          memoire ? ": the PC is out of memory (close other programs, other games, browser...)" : "");
     fflush(nullptr);
+#ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), memoire ? 4 : 3);
+#else
+    _exit(memoire ? 4 : 3);
+#endif
     for (;;) Sleep(INFINITE);
 }
 void plus_de_memoire() {
@@ -624,7 +779,7 @@ bool version_du_jeu_a_jour() {
         return !v->empty();
     };
     std::string construit, installe;
-    if (!ligne(dossier + ".preparation\\version.ok", &construit) || !ligne(dossier + "..\\..\\VERSION", &installe)) return true;
+    if (!ligne(dossier + ".preparation" PSEP "version.ok", &construit) || !ligne(dossier + ".." PSEP ".." PSEP "VERSION", &installe)) return true;
     if (construit == installe) return true;
     HLOG("main", "the game was built by version %s and version %s is installed: some improvements require rebuilding the "
                  "game (launcher, REBUILD NOW)", construit.c_str(), installe.c_str());
@@ -633,7 +788,9 @@ bool version_du_jeu_a_jour() {
 
 int main(int argc, char** argv) {
     dpi_compatible();   // avant toute fenêtre (et avant SDL)
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
     std::string manifest, logpath = "recomp_run.log";
     double dump_after = 0;
     bool trace_api = false;
@@ -674,11 +831,13 @@ int main(int argc, char** argv) {
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
         std::string d = exe;
         d = d.substr(0, d.find_last_of("\\/"));
-        manifest = d + "\\manifest.txt";
+        manifest = d + PSEP "manifest.txt";
     }
     g_logfile = fopen(logpath.c_str(), "w");
     journal_systeme();           // version, Windows, processeur, mémoire : en tête de chaque journal (rapport de bug)
+#ifdef _WIN32
     HLOG("main", "Windows display scaling of the main screen: %u %% (%s)", GetDpiForSystem() * 100 / 96, g_dpi_mode);
+#endif
     settings_init(argc, argv);   // recomp.ini, RECOMP_*, --refresh / --resolution / --native-res / --config
     version_du_jeu_a_jour();   // note seulement dans le journal un jeu construit par une autre version
     mem_marge_init();            // marge de mémoire engagée d'avance (memory.cpp), rendue si Windows en refuse au jeu
@@ -690,6 +849,7 @@ int main(int argc, char** argv) {
     // masquée ou en arrière-plan (les attentes courtes durent alors 15,6 ms, et le jeu tombe à
     // ~42 images/s) ; on demande explicitement que la résolution soit respectée et que le
     // processus ne soit pas bridé (EcoQoS).
+#ifdef _WIN32
     {
         PROCESS_POWER_THROTTLING_STATE st{};
         st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
@@ -698,8 +858,13 @@ int main(int argc, char** argv) {
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
     }
     timeBeginPeriod(1);
+#endif
     mem_init();   // en premier : réserve l'espace invité avant toute autre allocation
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, veh);
+#else
+    installer_signaux();
+#endif
     std::set_new_handler(plus_de_memoire);   // allocation refusée dans le runtime : message clair, code 4
     std::set_terminate(arret_imprevu);
     signal(SIGABRT, [](int) { arret_imprevu(); });

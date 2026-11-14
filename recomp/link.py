@@ -17,6 +17,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import build  # noqa: E402
+import plateforme  # noqa: E402
 
 FULL = os.path.join(HERE, "build", "full")
 ALL = ["main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "sdk"]
@@ -28,7 +29,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--modules", default=",".join(ALL))
     p.add_argument("-O", default="2")
-    p.add_argument("--out", default=os.path.join(FULL, "recomp_main.exe"))
+    p.add_argument("--out", default=os.path.join(FULL, "recomp_main" + plateforme.EXE))
     a = p.parse_args()
     t0 = time.time()
     objs = []
@@ -60,10 +61,19 @@ def main():
                                 # GCC suppose la pile alignée sur 32 octets pour l'AVX, Windows ne l'aligne que sur 16 :
                                 # les écritures vectorielles alignées (vmovdqa) deviennent non alignées (même vitesse)
                                 "-Wa,-muse-unaligned-vector-move"]
+    cxx = "g++"
+    if plateforme.LINUX:
+        # Linux : zig (clang) pour le runtime comme pour le code généré ; en-têtes de SDL3 fournis (fenêtre, son, clavier)
+        cxx = build.compilateur_genere()[0]
+        inc, _ = plateforme.sdl3()
+        flags = build.BASE_FLAGS + ["-O" + a.O, "-g1", "-Wall", "-Wno-unused-function",
+                                    "-I" + os.path.join(build.RUNTIME, "third_party"), *plateforme.cible_linux(cxx)]
+        if inc:
+            flags.append("-I" + inc)
     errs = []
     for s in rt:
         o = os.path.join(rtobj, os.path.splitext(os.path.basename(s))[0] + ".o")
-        _, err = build.compile_one("g++", s, o, flags)
+        _, err = build.compile_one(cxx, s, o, flags)
         if err:
             errs.append((s, err))
         elif _ and os.path.exists(o):
@@ -85,9 +95,12 @@ def main():
         version = "0.0.0"
     chiffres = ([int(x) for x in version.split(".") if x.isdigit()] + [0, 0, 0, 0])[:4]
     rc = ""
-    if os.path.exists(os.path.join(FULL, "icone.ico")):
+    if plateforme.LINUX:   # pas de ressources sous Linux (icône et description : fichier .desktop du paquet)
+        version = None
+    elif os.path.exists(os.path.join(FULL, "icone.ico")):
         rc += '1 ICON "../icone.ico"\n'
-    rc += ("1 VERSIONINFO\nFILEVERSION {v}\nPRODUCTVERSION {v}\nFILEOS 0x40004\nFILETYPE 0x1\nBEGIN\n"
+    if version is not None:
+        rc += ("1 VERSIONINFO\nFILEVERSION {v}\nPRODUCTVERSION {v}\nFILEOS 0x40004\nFILETYPE 0x1\nBEGIN\n"
            '    BLOCK "StringFileInfo"\n    BEGIN\n        BLOCK "040904B0"\n        BEGIN\n'
            '            VALUE "FileDescription", "StarFox Remake"\n'
            '            VALUE "ProductName", "StarFox Remake [recompiled]"\n'
@@ -96,7 +109,7 @@ def main():
            '        END\n    END\n'
            '    BLOCK "VarFileInfo"\n    BEGIN\n        VALUE "Translation", 0x0409, 1200\n    END\nEND\n'
            ).format(v=",".join(str(c) for c in chiffres), t=version)
-    if rc:
+    if rc and not plateforme.LINUX:
         with open(os.path.join(rtobj, "icone.rc"), "w", encoding="utf-8") as fp:
             fp.write(rc)
         try:
@@ -126,6 +139,13 @@ def main():
            "-latomic", "-lwinmm", "-lgdi32", "-luser32", "-lole32",
            "-lmfplat", "-lmfreadwrite", "-lmfuuid",   # extraits vidéo (record.cpp)
            "-Wl,--disable-high-entropy-va"]
+    if plateforme.LINUX:
+        # SDL3 : libSDL3.so.0 fournie dans outils/sdl3/lib, trouvée par le chemin relatif à l'exécutable
+        # (<racine>/recomp/build/full/recomp_main : outils/ du paquet ou recomp/outils des sources), sinon celle du système
+        _, lib = plateforme.sdl3()
+        cmd = [cxx, *plateforme.cible_linux(cxx), "-o", part, "@" + rsp, "-lpthread", "-ldl",
+               "-Wl,-rpath,$ORIGIN/../../../outils/sdl3/lib:$ORIGIN/../../outils/sdl3/lib"]
+        cmd += (["-L" + lib] if lib else []) + ["-lSDL3"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stderr[:8000])

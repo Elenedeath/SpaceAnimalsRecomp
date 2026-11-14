@@ -12,6 +12,17 @@
 // fois le dernier extrait écrit).
 //
 // Les extraits sont tirés de la copie du joueur et restent sur son PC (jamais distribués).
+#ifndef _WIN32
+// Linux : pas d'enregistrement d'extraits (Media Foundation n'existe que sous Windows ; le launcher utilise ceux du
+// paquet)
+#include "record.h"
+namespace hos {
+namespace rec {
+bool wanted(uint64_t) { return false; }
+void frame(const uint8_t*, uint32_t, uint32_t, uint64_t) {}
+}  // namespace rec
+}  // namespace hos
+#else
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -332,3 +343,4 @@ void frame(const uint8_t* px, uint32_t w, uint32_t h, uint64_t) {
 
 }  // namespace rec
 }  // namespace hos
+#endif  // _WIN32

@@ -25,11 +25,22 @@
 #include "gfx.h"
 #include "settings.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include <xinput.h>
+#else
+// Linux : SDL3 est liée au jeu (fenêtre, son) : ses fonctions sont prises dans le processus ; clavier lu par SDL, en
+// scancodes (scancodes.h fait la correspondance avec ceux de recomp.ini) ; pas de XInput
+#include "plat_linux.h"
+#include "scancodes.h"
+#include <SDL3/SDL_keyboard.h>
+#include <dlfcn.h>
+#define XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE 7849
+#define XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE 8689
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -56,10 +67,14 @@ constexpr int32_t STICK_MAX = 0x7FFF;
 const uint64_t kBoutons[16] = {BTN_A, BTN_B, BTN_X, BTN_Y, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
                                BTN_LSTICK, BTN_RSTICK, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT};
 
+#ifdef _WIN32
 typedef DWORD(WINAPI* XInputGetStateFn)(DWORD, XINPUT_STATE*);
 typedef DWORD(WINAPI* XInputSetStateFn)(DWORD, XINPUT_VIBRATION*);
 XInputGetStateFn g_xget = nullptr;
 XInputSetStateFn g_xset = nullptr;
+#else
+void* g_xget = nullptr;   // (pas de XInput sous Linux)
+#endif
 std::once_flag g_once;
 
 // ---------------------------------------------------------------- SDL3 (prototypes de l'ABI stable de SDL 3)
@@ -104,6 +119,7 @@ struct Pad {
 bool g_sdl = false;
 std::vector<Pad> g_pads;
 
+#ifdef _WIN32
 std::string utf8(const std::wstring& w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -128,7 +144,13 @@ std::wstring chercher_sdl() {
     return L"";
 }
 
+#else
+std::string utf8(const std::string& s) { return s; }
+#define GetProcAddress dlsym
+#endif
+
 bool charger_sdl() {
+#ifdef _WIN32
     if (getenv("RECOMP_NO_SDL")) {
         HLOG("input", "SDL3 disabled (RECOMP_NO_SDL): XInput controller only");
         return false;
@@ -140,6 +162,15 @@ bool charger_sdl() {
              chemin.empty() ? "not found (neither next to the game nor in outils\\sdl3)" : "refused at load time");
         return false;
     }
+#else
+    if (getenv("RECOMP_NO_SDL")) {
+        HLOG("input", "controllers disabled (RECOMP_NO_SDL): keyboard only");
+        return false;
+    }
+    Dl_info di{};
+    const std::string chemin = dladdr((void*)&SDL_GetKeyboardState, &di) && di.dli_fname ? di.dli_fname : "libSDL3.so.0";
+    void* m = RTLD_DEFAULT;
+#endif
     bool ok = true;
     auto f = [&](auto& ptr, const char* nom) {
         ptr = reinterpret_cast<std::remove_reference_t<decltype(ptr)>>((void*)GetProcAddress(m, nom));
@@ -196,6 +227,7 @@ bool entree_sdl(sdl::Gamepad* g, int e) {
     return false;
 }
 
+#ifdef _WIN32
 // Entrées appuyées d'une manette XInput (sans SDL3.dll), une par bit Settings::P_*
 uint32_t entrees_xinput(const XINPUT_GAMEPAD& x) {
     static const struct { WORD x; int e; } map[] = {
@@ -214,6 +246,7 @@ uint32_t entrees_xinput(const XINPUT_GAMEPAD& x) {
     if (x.bRightTrigger > 30) m |= 1u << Settings::P_GACHETTE_D;
     return m;
 }
+#endif
 
 // Manettes branchées ou débranchées (toutes les 0,5 s) : chaque changement est noté dans le journal.
 void suivre_pads() {
@@ -256,6 +289,7 @@ void suivre_pads() {
 
 void init() {
     g_sdl = charger_sdl();
+#ifdef _WIN32
     if (!g_sdl) {
         HMODULE m = LoadLibraryW(L"xinput1_4.dll");
         if (!m) m = LoadLibraryW(L"xinput9_1_0.dll");
@@ -266,6 +300,9 @@ void init() {
     } else {
         suivre_pads();
     }
+#else
+    if (g_sdl) suivre_pads();
+#endif
     HLOG("input", "inputs: keyboard%s, read when the window is active%s; rumble %d %%",
          g_sdl ? " + controllers (SDL3)" : g_xget ? " + XInput controller" : "",
          getenv("RECOMP_BACKGROUND_INPUT") ? " (controller also in the background: RECOMP_BACKGROUND_INPUT)" : "",
@@ -311,6 +348,7 @@ void appliquer_vibrations(bool actif) {
         }
         return;
     }
+#ifdef _WIN32
     static uint16_t avant[2] = {0, 0};
     if (g_xset) {
         XINPUT_VIBRATION x{amplitude(bas, false), amplitude(haut, false)};
@@ -319,8 +357,28 @@ void appliquer_vibrations(bool actif) {
             avant[0] = x.wLeftMotorSpeed, avant[1] = x.wRightMotorSpeed;
         }
     }
+#endif
 }
 
+#ifndef _WIN32
+// Linux : état du clavier tenu par SDL (fil principal, present.cpp), par scancode
+bool sdl_appuyee(int s) {
+    int n = 0;
+    const bool* k = SDL_GetKeyboardState(&n);
+    return k && s > 0 && s < n && k[s];
+}
+bool key_sc(unsigned sc) { return sc && sdl_appuyee(scancodes::vers_sdl(sc)); }
+enum { VK_RETURN, VK_BACK, VK_ESCAPE, VK_TAB };
+bool key_vk(int vk) {
+    switch (vk) {
+    case VK_RETURN: return sdl_appuyee(SDL_SCANCODE_RETURN) || sdl_appuyee(SDL_SCANCODE_KP_ENTER);
+    case VK_BACK: return sdl_appuyee(SDL_SCANCODE_BACKSPACE);
+    case VK_ESCAPE: return sdl_appuyee(SDL_SCANCODE_ESCAPE);
+    case VK_TAB: return sdl_appuyee(SDL_SCANCODE_TAB);
+    }
+    return false;
+}
+#else
 bool key_sc(UINT sc) {   // sc : scancode, 0xE0xx pour une touche étendue (flèches…) ; 0 : aucune touche
     if (!sc) return false;
     // pavé numérique (scancodes non étendus 0x47 à 0x53) : selon le verrouillage numérique, Windows rapporte la touche en
@@ -332,6 +390,7 @@ bool key_sc(UINT sc) {   // sc : scancode, 0xE0xx pour une touche étendue (flè
     return vk && (GetAsyncKeyState((int)vk) & 0x8000);
 }
 bool key_vk(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+#endif
 
 int32_t axis(bool neg, bool pos) { return (pos ? STICK_MAX : 0) - (neg ? STICK_MAX : 0); }
 
@@ -462,6 +521,7 @@ HostPad host_poll_input() {
         }
     }
     appliquer_vibrations(lire);
+#ifdef _WIN32
     XINPUT_STATE st{};
     if (!g_sdl && g_xget && lire && g_xget(0, &st) == ERROR_SUCCESS) {
         p.xinput = true;
@@ -473,6 +533,7 @@ HostPad host_poll_input() {
         p.rx = mix(p.rx, dead(st.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE));
         p.ry = mix(p.ry, dead(st.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE));
     }
+#endif
     // diagnostic : RECOMP_AUTOPRESS=1 appuie sur A 100 ms toutes les 2 s (tests sans écran) ;
     // RECOMP_AUTOPRESS_UNTIL=s : seulement pendant les s premières secondes (écran titre), le jeu se
     // déroule ensuite sans passer les cinématiques

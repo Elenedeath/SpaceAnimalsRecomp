@@ -175,7 +175,13 @@ void rt_tailcall(CPUState* ctx, uint64_t target) {
     RecompFn fn = rt_lookup(target);
     if (!fn) fatal(4, target, "saut indirect vers 0x%llx inconnu (lr=0x%llx)",
                    (unsigned long long)target, (unsigned long long)ctx->x[30]);
+#if defined(__clang__)
+    // runtime compilé par clang (Linux) : le code généré, compilé par clang lui aussi, passe par rt_tailjump
+    // (clang_compat.h) et n'appelle jamais rt_tailcall ; clang refuse l'appel terminal garanti de signature différente
+    return fn(ctx);
+#else
     MUSTTAIL return fn(ctx);
+#endif
 }
 
 // Saut indirect du code généré compilé par clang (clang_compat.h) : la cible est dans ctx->pad. Même corps que

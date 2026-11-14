@@ -9,6 +9,7 @@
 //  * listes de commandes rejouées dans un tampon de commandes par image, en rendu dynamique, avec un
 //    cache de pipelines ; présentation : copie de la texture de fenêtre vers la swapchain.
 // Activé par défaut ; RECOMP_NO_VULKAN=1 revient à la présentation GDI (couleur d'effacement).
+#ifdef _WIN32
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
@@ -20,6 +21,22 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
+#else
+// Linux : surface créée par SDL3 (present.cpp, gfx_vk_surface), libvulkan.so.1 chargée à l'exécution
+#include "plat_linux.h"
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/sysinfo.h>
+#include <sys/wait.h>
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+typedef void* HWND;
+inline HMODULE LoadLibraryW(const wchar_t*) {
+    void* l = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_GLOBAL);
+    return l ? l : dlopen("libvulkan.so", RTLD_NOW | RTLD_GLOBAL);
+}
+inline void* GetProcAddress(HMODULE m, const char* nom) { return dlsym(m, nom); }
+#endif
 
 #include "gfx.h"
 #include "nvn_exec.h"
@@ -57,11 +74,16 @@ void dlss_emplacement(int slot);        // jeux de descripteurs des passes du DL
 namespace {
 
 // ================================================================ fonctions Vulkan
+#ifdef _WIN32
+#define VK_SURFACE_WIN32(X) X(vkCreateWin32SurfaceKHR)
+#else
+#define VK_SURFACE_WIN32(X)
+#endif
 #define VK_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties)
 #define VK_INSTANCE(X)                                                                                       \
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures2) X(vkCreateDevice)                \
-    X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) X(vkCreateWin32SurfaceKHR)               \
+    X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) VK_SURFACE_WIN32(X)                     \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                    \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceSurfacePresentModesKHR)                          \
     X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties2)
@@ -566,8 +588,13 @@ bool create_swapchain(HWND hwnd, VkSwapchainKHR old = VK_NULL_HANDLE) {
     VkSurfaceFormatKHR sf = fmts.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR} : fmts[0];
     for (auto& f : fmts)
         if (f.format == VK_FORMAT_B8G8R8A8_SRGB) sf = f;
+#ifdef _WIN32
     RECT rc;
     GetClientRect(hwnd, &rc);
+#else
+    struct { int right, bottom; } rc{0, 0};
+    gfx_window_pixels(&rc.right, &rc.bottom);   // (Wayland : la surface prend la taille de la swapchain)
+#endif
     VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent
                                                              : VkExtent2D{(uint32_t)rc.right, (uint32_t)rc.bottom};
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -598,9 +625,14 @@ bool create_swapchain(HWND hwnd, VkSwapchainKHR old = VK_NULL_HANDLE) {
     g.scfmt = sf.format;
     g.scext = ext;
     {
+#ifdef _WIN32
         DEVMODEW dm{};
         dm.dmSize = sizeof dm;
         EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm);
+#else
+        struct { unsigned dmPelsWidth, dmPelsHeight, dmDisplayFrequency; } dm{0, 0, 0};
+        gfx_window_pixels((int*)&dm.dmPelsWidth, (int*)&dm.dmPelsHeight);   // (taille de la fenêtre)
+#endif
         uint32_t npm = 0;
         vkGetPhysicalDeviceSurfacePresentModesKHR(g.pd, g.surf, &npm, nullptr);
         std::vector<VkPresentModeKHR> pms(npm);
@@ -807,7 +839,15 @@ bool init(HWND hwnd) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "recomp_main";
     app.apiVersion = VK_API_VERSION_1_3;
+#ifdef _WIN32
     std::vector<const char*> iext = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#else
+    std::vector<const char*> iext;   // extensions de surface de la fenêtre SDL (X11 ou Wayland)
+    if (hwnd && !gfx_vk_extensions(iext)) {
+        HLOG("vk", "no Vulkan surface extensions from SDL");
+        return false;
+    }
+#endif
     // DLSS (dlss.cpp) : pas pour la précompilation des pipelines (sans fenêtre)
     const bool avec_dlss = hwnd && dlss::modele_demande();
     if (avec_dlss) {   // extensions d'instance demandées par NGX, s'il y en a
@@ -854,10 +894,19 @@ bool init(HWND hwnd) {
     HLOG("vk", "GPU: %s (Vulkan %u.%u, %s)", g.props.deviceName, VK_API_VERSION_MAJOR(g.props.apiVersion),
          VK_API_VERSION_MINOR(g.props.apiVersion), nommee ? "chosen in the settings" : "automatic choice");
     if (hwnd) {   // sans fenêtre : précompilation des pipelines (recomp_main --precompile)
+#ifdef _WIN32
         VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
         si.hinstance = GetModuleHandleW(nullptr);
         si.hwnd = hwnd;
         VKCHK(vkCreateWin32SurfaceKHR(g.inst, &si, nullptr, &g.surf));
+#else
+        uint64_t surf = 0;
+        if (!gfx_vk_surface((void*)g.inst, (void*)vkGetInstanceProcAddr, &surf)) {
+            HLOG("vk", "SDL_Vulkan_CreateSurface failed");
+            return false;
+        }
+        g.surf = (VkSurfaceKHR)surf;
+#endif
     }
     vkGetPhysicalDeviceQueueFamilyProperties(g.pd, &n, nullptr);
     std::vector<VkQueueFamilyProperties> qfs(n);
@@ -1127,10 +1176,16 @@ uint64_t import_budget() {
     static const uint64_t budget = [] {
         if (!settings().memory_saver) return (uint64_t)UINT64_MAX;   // recomp.ini : comme en 1.0.2, rien n'est rendu
         if (const char* e = getenv("RECOMP_IMPORT_MAX_MO")) return (uint64_t)strtoull(e, nullptr, 10) << 20;
+#ifdef _WIN32
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
         GlobalMemoryStatusEx(&ms);
         return (uint64_t)(ms.ullTotalPhys * 0.4);
+#else
+        struct sysinfo si{};
+        sysinfo(&si);
+        return (uint64_t)((double)si.totalram * si.mem_unit * 0.4);
+#endif
     }();
     return budget;
 }
@@ -1588,6 +1643,14 @@ void imports_init() {
 // de quelques blocs des classes les plus lourdes (texte, code SPIR-V, flottants… : de quoi reconnaître leur
 // propriétaire, notre code ou le pilote). Le tas est verrouillé pendant le parcours : le jeu se fige une à deux
 // secondes, d'où le déclenchement seulement quand le tas a grossi de 512 Mo depuis la carte précédente.
+#ifndef _WIN32
+// Linux : pas de tas parcourable ni de carte VirtualQuery ; la mémoire du processus est dans ram_text
+void tas_histogramme() {}
+uint64_t tas_defaut_engage() { return 0; }
+void mem_map_log(uint64_t frame) {
+    HLOG("mem", "frame %llu, committed memory map: not available on Linux", (unsigned long long)frame);
+}
+#else
 void tas_histogramme() {
     const HANDLE h = GetProcessHeap();
     if (!HeapLock(h)) return;
@@ -1788,6 +1851,8 @@ void mem_map_log(uint64_t frame) {
              src / 1048576.0, (unsigned long long)nsrc, pages / 1048576.0, rs.rendus / 1048576.0);
     }
 }
+
+#endif  // _WIN32
 
 std::string ram_text() {
     PROCESS_MEMORY_COUNTERS pmc{};
@@ -2742,6 +2807,9 @@ void tex_release(Image& im) {
 // Toute la plage est engagée et lisible : la lire ne fait ni faute ni engagement (pages à la demande pas encore
 // touchées, pages rendues à Windows ou rangées dans le fichier temporaire : non)
 bool plage_engagee(uint64_t a, uint64_t n) {
+#ifndef _WIN32
+    return mem_valid(a, n);   // Linux : pas d'engagement à la demande, les plages engagées sont tenues par memory.cpp
+#else
     uint64_t p = a & ~0xfffull;
     const uint64_t f = a + n;
     while (p < f) {
@@ -2751,6 +2819,7 @@ bool plage_engagee(uint64_t a, uint64_t n) {
         p = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return true;
+#endif
 }
 
 struct RenduDiffere { uint64_t addr, octets, serie; };
@@ -3759,7 +3828,7 @@ std::string exe_dir() {   // dossier de l'exécutable, avec la barre finale
     std::string d = exe;
     return d.substr(0, d.find_last_of("\\/") + 1);
 }
-std::string cache_dir() { return exe_dir() + "shader_cache\\"; }
+std::string cache_dir() { return exe_dir() + "shader_cache" PSEP; }
 
 // modèle d'exécution du premier OpEntryPoint (0 sommets, 4 fragments, 5 calcul), -1 si illisible
 int spirv_model(const std::vector<char>& code) {
@@ -4592,7 +4661,11 @@ size_t warm_up(const std::function<void(size_t, size_t)>& avance) {
         for (size_t i; (i = next++) < jobs.size();) {
             Job& j = jobs[i];
             suivre('+', j.sm->hash);
+#ifdef _WIN32
             if (plante && j.sm->hash == plante) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+#else
+            if (plante && j.sm->hash == plante) raise(SIGSEGV);
+#endif
             if (j.sm->model == 0) j.out = create_vs_library(j.sm->mod, VK_POLYGON_MODE_FILL, neg_one);
             else if (j.sm->model == 4) j.out = create_fs_library(j.sm->mod);
             else j.out = create_compute_pipeline(j.sm->mod);
@@ -4779,6 +4852,82 @@ int precompile_travail() {
 // Sa mémoire est surveillée dix fois par seconde : au-delà de `plafond` octets engagés, ou quand il reste moins de
 // 2 Go validables libres sur le PC, il est arrêté (*manque : 1 plafond dépassé, 2 mémoire du PC presque épuisée) avant
 // que le compilateur du pilote ne plante faute de mémoire, ou ne fasse tomber d'autres programmes.
+#ifndef _WIN32
+// Linux : même rôle, par fork/exec ; sortie de l'enfant lue par un tube, mémoire relevée dans /proc/<pid>/status.
+DWORD precompile_enfant(const std::vector<std::pair<std::string, std::string>>& envs, bool relayer, const std::string& journal,
+                        std::string& pilote, uint64_t plafond, int* manque) {
+    *manque = 0;
+    const std::string exe = plat_exe_path();
+    int tube[2];
+    if (pipe(tube)) {
+        printf("@erreur recomp_main --precompile not started (pipe %d)\n", errno);
+        fflush(stdout);
+        return 1;
+    }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        dup2(tube[1], 1);
+        dup2(tube[1], 2);
+        close(tube[0]);
+        close(tube[1]);
+        setenv("RECOMP_PRECOMPILE_ENFANT", "1", 1);
+        for (auto& [k, v] : envs) setenv(k.c_str(), v.c_str(), 1);
+        execl(exe.c_str(), exe.c_str(), "--log", journal.c_str(), "--precompile", (char*)nullptr);
+        _exit(127);
+    }
+    close(tube[1]);
+    if (pid < 0) {
+        close(tube[0]);
+        printf("@erreur recomp_main --precompile not started (%d)\n", errno);
+        fflush(stdout);
+        return 1;
+    }
+    std::atomic<bool> fini{false};
+    std::atomic<int> arret{0};
+    std::thread veille([&] {
+        while (!fini.load()) {
+            PROCESS_MEMORY_COUNTERS pmc{};
+            pmc.cb = sizeof pmc;
+            const bool lu = K32GetProcessMemoryInfo((HANDLE)(intptr_t)pid, &pmc, sizeof pmc) != 0;
+            const double libre = memoire_validable_libre_go();
+            if ((lu && pmc.PagefileUsage > plafond) || libre < 2.0) {
+                arret = lu && pmc.PagefileUsage > plafond ? 1 : 2;
+                HLOG("vk", "--precompile: compiler process stopped, %.1f GB committed, %.1f GB available memory on the PC",
+                     pmc.PagefileUsage / 1073741824.0, libre);
+                kill(pid, SIGKILL);
+                return;
+            }
+            Sleep(100);
+        }
+    });
+    std::string ligne;
+    auto traiter = [&](const std::string& l) {
+        if (l.rfind("@pilote ", 0) == 0) pilote = l.substr(1);
+        else if (relayer) printf("%s\n", l.c_str()), fflush(stdout);
+    };
+    char buf[4096];
+    for (ssize_t n; (n = read(tube[0], buf, sizeof buf)) != 0;) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == '\n') traiter(ligne), ligne.clear();
+            else if (buf[i] != '\r') ligne += buf[i];
+        }
+    }
+    if (!ligne.empty()) traiter(ligne);
+    close(tube[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    fini = true;
+    veille.join();
+    *manque = arret.load();
+    // code de sortie, ou 0xC0000005-like pour un signal : « plantage » pour le superviseur (ni 0 ni 1)
+    if (WIFEXITED(st)) return (DWORD)WEXITSTATUS(st);
+    return 0xC0000000ul | (DWORD)WTERMSIG(st);
+}
+#else
 DWORD precompile_enfant(const std::vector<std::pair<std::string, std::string>>& envs, bool relayer, const std::string& journal,
                         std::string& pilote, uint64_t plafond, int* manque) {
     *manque = 0;
@@ -4850,6 +4999,7 @@ DWORD precompile_enfant(const std::vector<std::pair<std::string, std::string>>& 
     CloseHandle(pi.hThread);
     return code;
 }
+#endif
 
 // Shaders commencés et pas finis au moment d'un plantage (precompile_en_cours.txt)
 std::vector<std::string> precompile_en_cours() {

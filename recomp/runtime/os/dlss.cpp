@@ -19,7 +19,11 @@
 #include "hos.h"   // avant <windows.h>, comme settings.cpp (GPTR)
 #include "settings.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -164,6 +168,16 @@ void journal_ngx(const char* message, int niveau, int fonction) {
     HLOG("dlss", "NGX [%d/%d] %s", niveau, fonction, s.c_str());
 }
 
+#ifndef _WIN32
+// Linux : le cœur NGX de NVIDIA (DLSS) n'est pas chargé par ce portage ; le FSR d'AMD prend la relève s'il est demandé
+bool charger_coeur() {
+    if (!g.tente) {
+        g.tente = true;
+        HLOG("dlss", "DLSS not available on Linux: off, the game's anti-aliasing stays");
+    }
+    return false;
+}
+#else
 std::wstring registre(const wchar_t* cle, const wchar_t* valeur) {
     wchar_t b[1024];
     DWORD t = sizeof b;
@@ -259,6 +273,7 @@ bool charger_coeur() {
     HLOG("dlss", "NVIDIA NGX core: %s; nvngx_dlss.dll in %s", utf8(dll).c_str(), utf8(g.chemins_s[0]).c_str());
     return true;
 }
+#endif
 
 const char* nom_modele(char m) {
     switch (m) {

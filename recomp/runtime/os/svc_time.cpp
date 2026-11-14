@@ -4,6 +4,9 @@
 
 #include <chrono>
 #include <ctime>
+#ifndef _WIN32
+#include "plat_linux.h"
+#endif
 
 namespace hos {
 namespace {

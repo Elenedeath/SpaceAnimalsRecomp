@@ -11,6 +11,13 @@
 #include <string>
 #include <vector>
 
+// séparateur des chemins que le runtime compose (dossier de l'exécutable + nom)
+#ifdef _WIN32
+#define PSEP "\\"
+#else
+#define PSEP "/"
+#endif
+
 // runtime.cpp (hors de cpu.h pour ne pas invalider les objets générés)
 extern void (*rt_svc_handler)(CPUState* ctx, uint32_t imm, uint64_t pc);
 extern void (*rt_fatal_hook)(const char* msg, uint64_t pc);

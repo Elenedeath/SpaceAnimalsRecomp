@@ -10,9 +10,13 @@
 // internes au SDK (nn::async) passent par le dispatch grâce à recomp/hooks.txt.
 #include "hos.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "plat_linux.h"   // fibres sur ucontext
+#endif
 
 #include <array>
 #include <atomic>

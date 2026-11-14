@@ -46,6 +46,9 @@ RACINE = os.path.dirname(RECOMP)                 # extracted/ et work/ (a64/modu
 OUTILS = os.path.join(RACINE, "tools")           # nup.py, nso.py
 FULL = os.path.join(RECOMP, "build", "full")
 MARQUES = os.path.join(FULL, ".preparation")
+sys.path.insert(0, RECOMP)
+import plateforme  # noqa: E402   (Windows / Linux)
+JEU = os.path.join(FULL, "recomp_main" + plateforme.EXE)
 
 TITRE = 0x0400E88025B1A000
 VERSION = 131072                                 # patch 2.0.0
@@ -66,10 +69,11 @@ ETAPES = ["verifier", "extraire", "images", "recompiler", "lier", "shaders", "pi
 DEPENDANCES = {
     "extraire": ([], ["tools/nup.py"]),
     "images": (["extraire"], ["tools/nso.py"]),
-    "recompiler": (["images"], ["recomp/recomp.py", "recomp/build.py", "recomp/fullbuild.py", "recomp/hooks.txt",
+    "recompiler": (["images"], ["recomp/recomp.py", "recomp/build.py", "recomp/plateforme.py", "recomp/fullbuild.py", "recomp/hooks.txt",
                                 "recomp/lots.txt",
                                 "recomp/a64/*.py", "recomp/runtime/*.h"]),
-    "lier": (["recompiler"], ["recomp/link.py", "recomp/runtime/*.cpp", "recomp/runtime/os/*.cpp", "recomp/runtime/os/*.h"]),
+    "lier": (["recompiler"], ["recomp/link.py", "recomp/plateforme.py", "recomp/runtime/*.cpp", "recomp/runtime/os/*.cpp",
+                              "recomp/runtime/os/*.h"]),
     "shaders": ([], ["recomp/shaders/*.py"]),
 }
 # étape refaite à chaque construction : recomp_main --precompile ne recompile que si le GPU, le pilote ou les shaders
@@ -145,6 +149,12 @@ def outils_env():
     env = dict(os.environ)
     chemins = []
     for base in dossiers_outils():
+        if plateforme.LINUX:   # Linux : zig (plateforme.zig_cxx) et glslang fournis ; pas de GCC ni de MSYS2
+            if os.path.isdir(os.path.join(base, "glslang", "bin")):
+                chemins.append(os.path.join(base, "glslang", "bin"))
+            if plateforme.glslang() and "RECOMP_GLSLANG" not in env:
+                env["RECOMP_GLSLANG"] = plateforme.glslang()
+            continue
         if os.path.isdir(os.path.join(base, "gcc", "bin")):
             if not GCC:
                 GCC.append(gcc_sans_espaces(base))
@@ -156,7 +166,7 @@ def outils_env():
             if os.path.exists(exe) and "RECOMP_GLSLANG" not in env:
                 env["RECOMP_GLSLANG"] = exe
     msys = r"C:\msys64\ucrt64\bin"
-    if not os.environ.get("RECOMP_SANS_MSYS2") and os.path.isdir(msys):
+    if not plateforme.LINUX and not os.environ.get("RECOMP_SANS_MSYS2") and os.path.isdir(msys):
         chemins.append(msys)
     env["PATH"] = os.pathsep.join(chemins + [env.get("PATH", "")])
     env["PYTHONUTF8"] = "1"
@@ -182,7 +192,7 @@ def lancer(cmd, cwd, analyse=None, env=None):
         if analyse:
             analyse(ligne)
     if p.wait():
-        nom = next((os.path.basename(c) for c in cmd if str(c).endswith((".py", ".exe"))), os.path.basename(cmd[0]))
+        nom = next((os.path.basename(c) for c in cmd if str(c).endswith((".py", ".exe"))), os.path.basename(str(cmd[0])))
         e = Echec(f"{nom} failed (code {p.returncode}): " + (queue[-1] if queue else ""))
         e.sortie = list(queue)   # dernières lignes (diagnostic : manque de mémoire…)
         raise e
@@ -236,6 +246,12 @@ def verifier_pc(construire):
         except UnicodeEncodeError:
             raise Echec("the folder path contains characters the compiler cannot handle: "
                         "move the game folder (for example to C:\\Jeux\\StarFox)")
+    elif plateforme.LINUX:
+        if not plateforme.avx2():
+            raise Echec("this processor lacks the AVX2 instructions: the recompiled game cannot run on it")
+        import ctypes.util
+        if not ctypes.util.find_library("vulkan"):
+            dire("warning: Vulkan not found (libvulkan.so.1): install the Vulkan driver of your graphics card")
     if construire:
         libre = shutil.disk_usage(RACINE).free
         if libre < 6e9:
@@ -391,7 +407,9 @@ _MESURE = {"go": 0.0, "faite": False}   # plus grand pic mesuré (Go) ; gardé d
 
 def memoire_processus(p):
     """Mémoire (Go) d'un processus lancé par subprocess : le plus grand de ses compteurs (jeu de travail et mémoire
-    privée, actuels et de pointe) ; 0 si elle n'est pas lisible (hors de Windows, processus disparu)."""
+    privée, actuels et de pointe) ; 0 si elle n'est pas lisible (processus disparu). Linux : /proc/<pid>/status."""
+    if plateforme.LINUX:
+        return plateforme.memoire_processus_linux(p.pid)
     try:
         import ctypes
         from ctypes import wintypes
@@ -491,6 +509,8 @@ def construction_surveillee(arguments):
     sys.path.insert(0, RECOMP)
     import fullbuild
     fullbuild.Compilations = compilations_surveillees(fullbuild)
+    if plateforme.LINUX:   # (fullbuild.go_libres ne lit que la mémoire de Windows)
+        fullbuild.go_libres = lambda: min(memoire_libre())
     sys.argv = [os.path.join(RECOMP, "fullbuild.py")] + list(arguments)
     return fullbuild.main()
 
@@ -498,6 +518,8 @@ def construction_surveillee(arguments):
 def avec_clang():
     """Le code généré sera-t-il compilé par clang ? Même règle que build.compilateur_genere : RECOMP_CXX, sinon
     clang++.exe à côté du g++ que la construction trouve (outils fournis, MSYS2, PATH)."""
+    if plateforme.LINUX:
+        return True   # zig (clang)
     choix = os.environ.get("RECOMP_CXX")
     if choix:
         return "clang" in os.path.basename(choix).lower()
@@ -510,7 +532,7 @@ def compilateur_a_niveau():
     construction complète est 3 fois plus rapide et demande 3 fois moins de mémoire par tâche avec Clang, donc
     l'archive actuelle du compilateur est installée d'abord (outils.py --niveau, une seule fois). Tant qu'il a ses
     objets compilés par g++, rien n'est fait : ils restent valables. Un échec (pas de réseau…) laisse g++ en place."""
-    if os.environ.get("RECOMP_CXX") or avec_clang():
+    if plateforme.LINUX or os.environ.get("RECOMP_CXX") or avec_clang():
         return
     objets = glob.glob(os.path.join(glob.escape(RECOMP), "build", "full", "main", "main_*.o"))
     if len(objets) >= 100:
@@ -536,6 +558,8 @@ def memoire_libre():
     if os.environ.get("RECOMP_MEM_LIBRE_GO"):
         v = float(os.environ["RECOMP_MEM_LIBRE_GO"])
         return v, v
+    if plateforme.LINUX:
+        return plateforme.memoire_libre()
     import ctypes
 
     class Etat(ctypes.Structure):
@@ -678,6 +702,10 @@ def extraire_icone(copie):
     chemin_jpg = os.path.join(FULL, "icone.jpg")
     with open(chemin_jpg, "wb") as f:
         f.write(jpg)
+    if plateforme.LINUX:   # pas d'icône dans l'exécutable sous Linux : le JPEG est gardé (launcher, raccourci)
+        os.replace(chemin_jpg, os.path.join(FULL, "icone_jeu.jpg"))
+        dire("game icon: icone_jeu.jpg")
+        return
     try:
         jpeg_vers_ico(chemin_jpg, ico)
         dire(f"game icon: {ico} ({os.path.getsize(ico)} bytes)")
@@ -692,7 +720,7 @@ def e_lier(copie, a):
     extraire_icone(copie)
     dire("@progres 0.2")
     lancer([sys.executable, "-X", "utf8", os.path.join(RECOMP, "link.py")], RECOMP)
-    if not os.path.exists(os.path.join(FULL, "recomp_main.exe")):
+    if not os.path.exists(JEU):
         raise Echec("the executable was not produced")
 
 
@@ -744,7 +772,7 @@ def e_shaders(copie, a):
 def e_pipelines(copie, a):
     """Tous les shaders compilés pour ce GPU (comme les jeux récents au premier lancement) : recomp_main --precompile
     écrit pipelines.cache, que le jeu charge au démarrage. Rien à refaire si GPU, pilote et shaders sont inchangés."""
-    exe = os.path.join(FULL, "recomp_main.exe")
+    exe = JEU
 
     def analyse(l):
         if l.startswith("@progres ") or l.startswith("@info "):
@@ -769,7 +797,7 @@ def e_pipelines(copie, a):
 def releve_cle():
     """Identité de l'exécutable construit (taille, date) : le relevé est refait après chaque nouvelle édition de liens."""
     try:
-        s = os.stat(os.path.join(FULL, "recomp_main.exe"))
+        s = os.stat(JEU)
     except OSError:
         return None
     return f"{s.st_size}:{int(s.st_mtime)}"
@@ -782,7 +810,7 @@ def releve_shaders(a):
     sans le son et avec une sauvegarde à part, jusqu'à sa 600e image, puis on traduit ces nouveaux shaders.
     Jusqu'à la 1.0.1, l'enregistrement des extraits faisait ce relevé au passage. Renvoie False si le jeu n'a pas
     atteint sa 600e image (le relevé sera retenté à la prochaine construction) ; ce n'est jamais bloquant."""
-    exe = os.path.join(FULL, "recomp_main.exe")
+    exe = JEU
     save = os.path.join(FULL, "essai_releve")
     journal = os.path.join(FULL, "releve_shaders.log")
     shutil.rmtree(save, ignore_errors=True)

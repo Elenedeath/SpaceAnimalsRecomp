@@ -4,10 +4,15 @@
 #include "hos.h"
 #include "settings.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
+#else
+#include "plat_linux.h"
+#include <shared_mutex>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -68,6 +73,7 @@ void for_range(uint64_t addr, uint64_t size, F f) {
 
 }  // namespace
 
+#ifdef _WIN32
 void mem_init() {
     void* p = VirtualAlloc((void*)AS_BASE, AS_END - AS_BASE, MEM_RESERVE, PAGE_NOACCESS);
     if (p != (void*)AS_BASE) {
@@ -100,10 +106,12 @@ bool mem_commit(uint64_t addr, uint64_t size) {
     }
     return true;
 }
+#endif  // _WIN32
 
 // génération des mappages : invalide les caches de mem_valid à chaque désengagement
 std::atomic<uint64_t> g_mem_gen{1};
 
+#ifdef _WIN32
 // ---------------------------------------------------------------- engagement à la demande
 // Le jeu réserve presque toute sa mémoire d'un coup (MapPhysicalMemory : 10,4 Go dans ses six premières secondes, dont
 // un pool de 3 Go et deux de 1 Go) et n'en remplit qu'une partie. Engagée d'un bloc (jusqu'à la 1.0.2), elle comptait
@@ -1455,6 +1463,148 @@ void mem_decommit(uint64_t addr, uint64_t size) {
     }
     g_mem_gen++;
 }
+#else  // !_WIN32
+// ---------------------------------------------------------------- Linux
+// L'espace invité est réservé par mmap (PROT_NONE, MAP_NORESERVE). « Engager » une plage la rend lisible et inscriptible
+// (mprotect) : le noyau Linux ne fournit la RAM d'une page qu'au premier accès (surallocation), ce que le code Windows
+// fait à la main (engagement à la demande, mem_fault). Le jeu n'a donc pas de limite de mémoire validable à respecter,
+// et les économies propres à Windows (données de textures rendues, pages vides ou oubliées rendues, marge, veille) n'ont
+// pas d'objet : leurs fonctions ne font rien. Les plages engagées sont tenues à jour ici pour mem_valid (pas de
+// VirtualQuery sous Linux).
+namespace {
+std::shared_mutex g_engage_lk;
+std::map<uint64_t, uint64_t> g_engage;   // début → fin des plages engagées (pages entières, disjointes, fusionnées)
+std::mutex g_epingle_mx;
+std::map<std::pair<uint64_t, uint64_t>, int> g_epingles;
+
+void engage_ajouter(uint64_t a, uint64_t b) {   // verrou exclusif tenu
+    auto it = g_engage.upper_bound(a);
+    if (it != g_engage.begin() && std::prev(it)->second >= a) {
+        --it;
+        a = it->first, b = std::max(b, it->second);
+        it = g_engage.erase(it);
+    }
+    while (it != g_engage.end() && it->first <= b) {
+        b = std::max(b, it->second);
+        it = g_engage.erase(it);
+    }
+    g_engage[a] = b;
+}
+
+void engage_retirer(uint64_t a, uint64_t b) {   // verrou exclusif tenu
+    auto it = g_engage.upper_bound(a);
+    if (it != g_engage.begin()) --it;
+    while (it != g_engage.end() && it->first < b) {
+        const uint64_t s = it->first, e = it->second;
+        if (e <= a) {
+            ++it;
+            continue;
+        }
+        it = g_engage.erase(it);
+        if (s < a) g_engage[s] = a;
+        if (e > b) it = g_engage.emplace(b, e).first, ++it;
+    }
+}
+}  // namespace
+
+void mem_init() {
+    void* p = mmap((void*)AS_BASE, AS_END - AS_BASE, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p != (void*)AS_BASE) {
+        const int err = errno;
+        if (p != MAP_FAILED) munmap(p, AS_END - AS_BASE);   // noyau trop ancien (sans MAP_FIXED_NOREPLACE) : ailleurs
+        panic("cannot reserve the guest address space [0x%llx, 0x%llx) (error %d: %s)", (unsigned long long)AS_BASE,
+              (unsigned long long)AS_END, err, strerror(err));
+    }
+    g_regs.clear();
+    g_regs[AS_BASE] = Reg{AS_END, MS_FREE, MP_NONE, 0};
+}
+
+bool mem_commit(uint64_t addr, uint64_t size) {
+    if (!size) return true;
+    const uint64_t a = addr & ~0xfffull, b = (addr + size + 0xfff) & ~0xfffull;
+    if (mprotect((void*)a, b - a, PROT_READ | PROT_WRITE)) {
+        HLOG("mem", "commit failed 0x%llx+0x%llx (error %d)", (unsigned long long)addr, (unsigned long long)size, errno);
+        return false;
+    }
+    std::unique_lock<std::shared_mutex> lk(g_engage_lk);
+    engage_ajouter(a, b);
+    return true;
+}
+
+bool mem_commit_lazy(uint64_t addr, uint64_t size) { return mem_commit(addr, size); }
+int mem_fault(uint64_t, bool) { return 0; }
+void mem_release_init() {}
+bool mem_release_actif() { return false; }
+uint64_t mem_release(uint64_t, uint64_t, uint64_t* id) {
+    *id = 0;
+    return 0;
+}
+bool mem_released_intact(uint64_t, uint64_t, uint64_t) { return false; }
+void mem_release_vivant(uint64_t, uint64_t, uint64_t, bool) {}
+void mem_restore(uint64_t, uint64_t) {}
+void mem_release_stats(RelStats* s) { memset(s, 0, sizeof *s); }
+bool mem_ensure(uint64_t, uint64_t) { return true; }
+void mem_marge_init() {}
+int mem_pression() { return 0; }
+void mem_veille_init() {}
+void mem_census_init() {}
+void mem_vides_init() {}
+void mem_noyau_debut() {}
+void mem_noyau_fin() {}
+void mem_epingler(uint64_t addr, uint64_t size) {
+    std::lock_guard<std::mutex> lk(g_epingle_mx);
+    g_epingles[{addr, addr + size}]++;
+}
+void mem_desepingler(uint64_t addr, uint64_t size) {
+    std::lock_guard<std::mutex> lk(g_epingle_mx);
+    auto it = g_epingles.find({addr, addr + size});
+    if (it != g_epingles.end() && --it->second <= 0) g_epingles.erase(it);
+}
+
+void mem_lazy_stats(uint64_t* blocs, uint64_t* octets, uint64_t* reserves) {
+    *blocs = 0;
+    *octets = 0;
+    uint64_t r = 0;
+    std::shared_lock<std::shared_mutex> lk(g_engage_lk);
+    for (auto& [s, e] : g_engage) r += e - s;
+    *reserves = r;
+}
+
+void mem_decommit(uint64_t addr, uint64_t size) {
+    if (size) {
+        const uint64_t a = addr & ~0xfffull, b = (addr + size + 0xfff) & ~0xfffull;
+        std::unique_lock<std::shared_mutex> lk(g_engage_lk);
+        // nouvelle projection anonyme sans accès à la même place : la RAM des pages est rendue, elles se reliront à zéro
+        mmap((void*)a, b - a, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        engage_retirer(a, b);
+    }
+    g_mem_gen++;
+}
+
+bool mem_valid(uint64_t addr, uint64_t size) {
+    const uint64_t end = addr + size;
+    if (end < addr) return false;
+    if (addr < AS_BASE || end > AS_END) {
+        // hors de l'espace invité (mémoire de l'hôte passée au jeu, p. ex. un tampon du runtime) : lisible si msync
+        // la connaît ; seulement pour les petites plages
+        const uint64_t a = addr & ~0xfffull;
+        for (uint64_t p = a; p < end; p += 0x1000)
+            if (msync((void*)p, 0x1000, MS_ASYNC) && errno == ENOMEM) return false;
+        return true;
+    }
+    std::shared_lock<std::shared_mutex> lk(g_engage_lk);
+    uint64_t a = addr;
+    while (a < end) {
+        auto it = g_engage.upper_bound(a);
+        if (it == g_engage.begin()) return false;
+        --it;
+        if (it->second <= a) return false;
+        a = it->second;
+    }
+    return true;
+}
+#endif  // _WIN32
 
 void mem_set(uint64_t addr, uint64_t size, uint32_t state, uint32_t perm, uint32_t attr) {
     std::lock_guard<std::recursive_mutex> lk(g_mlock);
@@ -1520,6 +1670,7 @@ uint64_t mem_find_free(uint64_t base, uint64_t end, uint64_t size, uint64_t alig
     return 0;
 }
 
+#ifdef _WIN32
 // VirtualQuery coûte ≈ 25 µs ici (grand espace réservé) : cache par thread des dernières zones
 // engagées trouvées, invalidé par g_mem_gen (l'engagement ne fait qu'ajouter des zones valides).
 bool mem_valid(uint64_t addr, uint64_t size) {
@@ -1552,6 +1703,7 @@ bool mem_valid(uint64_t addr, uint64_t size) {
     cache[next++ % 8] = Zone{gen, zs, a};
     return true;
 }
+#endif  // _WIN32
 
 uint64_t mem_used() {
     std::lock_guard<std::recursive_mutex> lk(g_mlock);

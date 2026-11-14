@@ -2,6 +2,7 @@
 // dernière image présentée par le jeu et le compteur d'images. Sert à vérifier que la boucle de
 // rendu tourne ; sera remplacée par le moteur de rendu (Vulkan) quand les commandes NVN seront
 // traduites. Fermer la fenêtre termine le processus.
+#ifdef _WIN32
 #include "gfx.h"
 #include "settings.h"
 
@@ -282,3 +283,251 @@ void gfx_present(const float rgba[4], uint64_t frame) {
 }
 
 }  // namespace hos
+#else  // !_WIN32
+// ---------------------------------------------------------------- Linux : fenêtre SDL3
+// La vidéo de SDL est initialisée et ses événements traités sur le fil principal du processus (gfx_boucle_principale,
+// appelée par run_main_thread pendant que le jeu tourne sur son propre fil) : c'est ce que SDL demande sous X11 et
+// Wayland. Les autres fils lui passent leurs demandes (ouverture de la fenêtre, titre, plein écran) par un événement
+// utilisateur. La surface Vulkan est créée par SDL (gfx_vk_surface), sur le fil du rendu.
+#include "gfx.h"
+#include "settings.h"
+#include "plat_linux.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace hos {
+namespace vkr {
+void save_caches();   // vk_render.cpp : écrit pipelines.cache
+}
+namespace {
+
+std::mutex g_lk;
+std::condition_variable g_cv;
+bool g_video = false, g_video_echec = false;   // SDL_INIT_VIDEO fait (ou refusé)
+std::atomic<SDL_Window*> g_win{nullptr};
+std::atomic<bool> g_vulkan{false}, g_focus{false};
+bool g_demande = false;   // ouverture de la fenêtre demandée
+std::string g_titre;      // titre à poser (fil principal)
+bool g_titre_neuf = false;
+uint32_t g_ev_reveil = 0;   // événement utilisateur : une demande attend le fil principal
+float g_color[4] = {0, 0, 0, 1};
+uint64_t g_frame = 0;
+int g_w = 1280, g_h = 720;
+std::chrono::steady_clock::time_point g_last, g_fps_t0;
+uint64_t g_fps_f0 = 0;
+double g_fps = 0;
+bool g_borderless = false;
+
+void reveiller() {
+    if (!g_ev_reveil) return;
+    SDL_Event e{};
+    e.type = g_ev_reveil;
+    SDL_PushEvent(&e);
+}
+
+void set_borderless(SDL_Window* w, bool on) {
+    if (on == g_borderless) return;
+    SDL_SetWindowFullscreenMode(w, nullptr);   // plein écran « bureau » : sans changement de mode de l'écran
+    SDL_SetWindowFullscreen(w, on);
+    g_borderless = on;
+    HLOG("gfx", "window: %s", on ? "borderless fullscreen" : "windowed");
+}
+
+void creer_fenetre() {   // fil principal
+    static const bool cachee = getenv("RECOMP_WINDOW_HIDDEN") != nullptr;
+    SDL_WindowFlags f = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (cachee) f |= SDL_WINDOW_HIDDEN;
+    SDL_Window* w = SDL_CreateWindow("StarFox Remake [recompiled]", g_w, g_h, f);
+    if (!w) {
+        HLOG("gfx", "SDL_CreateWindow failed: %s", SDL_GetError());
+        return;
+    }
+    HLOG("gfx", "host window %dx%d (SDL %s video driver)", g_w, g_h, SDL_GetCurrentVideoDriver());
+    if (cachee) HLOG("gfx", "window hidden (RECOMP_WINDOW_HIDDEN)");
+    else if (settings().borderless) set_borderless(w, true);
+    g_focus = (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    g_win = w;
+}
+
+}  // namespace
+
+// Fil principal : vidéo de SDL et boucle d'événements jusqu'à la fin du jeu (fini(arg) vrai)
+void gfx_boucle_principale(bool (*fini)(void*), void* arg) {
+    SDL_SetHint(SDL_HINT_APP_NAME, "StarFox Remake [recompiled]");
+    SDL_SetHint(SDL_HINT_APP_ID, "spaceanimalsrecomp");
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
+    const bool ok = SDL_InitSubSystem(SDL_INIT_VIDEO) && SDL_Vulkan_LoadLibrary(nullptr);
+    {
+        std::lock_guard<std::mutex> lk(g_lk);
+        g_video = ok;
+        g_video_echec = !ok;
+        if (ok) g_ev_reveil = SDL_RegisterEvents(1);
+    }
+    g_cv.notify_all();
+    if (!ok) {
+        HLOG("gfx", "SDL video unavailable (%s): no window", SDL_GetError());
+        while (!fini(arg)) Sleep(50);
+        return;
+    }
+    while (!fini(arg)) {
+        {
+            std::unique_lock<std::mutex> lk(g_lk);
+            if (g_demande && !g_win.load()) {
+                g_demande = false;
+                lk.unlock();
+                creer_fenetre();
+                g_cv.notify_all();
+                lk.lock();
+            }
+            if (g_titre_neuf && g_win.load()) {
+                g_titre_neuf = false;
+                SDL_SetWindowTitle(g_win.load(), g_titre.c_str());
+            }
+        }
+        SDL_Event e;
+        if (!SDL_WaitEventTimeout(&e, 50)) continue;
+        do {
+            SDL_Window* w = g_win.load();
+            switch (e.type) {
+            case SDL_EVENT_QUIT:
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                HLOG("gfx", "window closed: process exiting");
+                vkr::save_caches();   // pipelines créés pendant la partie
+                fflush(nullptr);
+                _exit(0);
+            case SDL_EVENT_WINDOW_FOCUS_GAINED: g_focus = true; break;
+            case SDL_EVENT_WINDOW_FOCUS_LOST: g_focus = false; break;
+            case SDL_EVENT_KEY_DOWN:   // Alt+Entrée, F11 : plein écran sans bordure ↔ fenêtré
+                if (w && !e.key.repeat &&
+                    (e.key.scancode == SDL_SCANCODE_F11 ||
+                     ((e.key.scancode == SDL_SCANCODE_RETURN || e.key.scancode == SDL_SCANCODE_KP_ENTER) &&
+                      (e.key.mod & SDL_KMOD_ALT))))
+                    set_borderless(w, !g_borderless);
+                break;
+            default: break;
+            }
+        } while (SDL_PollEvent(&e));
+    }
+}
+
+void gfx_open_window(int width, int height) {
+    std::unique_lock<std::mutex> lk(g_lk);
+    if (g_demande || g_win.load()) return;
+    // fenêtre à l'échelle 2/3 pour une sortie 1080p
+    g_w = width >= 1920 ? width * 2 / 3 : width;
+    g_h = width >= 1920 ? height * 2 / 3 : height;
+    g_last = g_fps_t0 = std::chrono::steady_clock::now();
+    g_cv.wait(lk, [] { return g_video || g_video_echec; });
+    if (!g_video) return;
+    g_demande = true;
+    lk.unlock();
+    reveiller();
+}
+
+void* gfx_window_handle() { return g_win.load(); }
+
+bool gfx_vk_extensions(std::vector<const char*>& ext) {
+    Uint32 n = 0;
+    const char* const* e = SDL_Vulkan_GetInstanceExtensions(&n);
+    if (!e) return false;
+    for (Uint32 i = 0; i < n; i++) ext.push_back(e[i]);
+    return n > 0;
+}
+
+bool gfx_vk_surface(void* instance, void*, uint64_t* surface) {
+    VkSurfaceKHR s = 0;
+    if (!g_win.load() || !SDL_Vulkan_CreateSurface(g_win.load(), (VkInstance)instance, nullptr, &s)) return false;
+    *surface = (uint64_t)s;
+    return true;
+}
+
+void gfx_window_pixels(int* w, int* h) {
+    *w = *h = 0;
+    if (SDL_Window* win = g_win.load()) SDL_GetWindowSizeInPixels(win, w, h);
+}
+
+void gfx_status(const char* text) {
+    char title[160];
+    snprintf(title, sizeof title, "StarFox Remake [recompiled]  -  %s", text);
+    {
+        std::lock_guard<std::mutex> lk(g_lk);
+        g_titre = title;
+        g_titre_neuf = true;
+    }
+    reveiller();
+}
+
+void gfx_screen_size(int* w, int* h) {
+    *w = 1920, *h = 1080;
+    {
+        std::unique_lock<std::mutex> lk(g_lk);
+        g_cv.wait(lk, [] { return g_video || g_video_echec; });
+        if (!g_video) return;
+    }
+    // en points (pixels ÷ mise à l'échelle de l'écran), comme sous Windows
+    const SDL_DisplayID d = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* m = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+    if (!m) return;
+    float k = SDL_GetDisplayContentScale(d);
+    if (!(k >= 0.5f)) k = 1.0f;
+    if (const char* e = getenv("RECOMP_DPI")) k = (float)atoi(e) / 96.0f;
+    *w = (int)lround(m->w * m->pixel_density / k);
+    *h = (int)lround(m->h * m->pixel_density / k);
+}
+
+void gfx_count_frame(uint64_t frame) {
+    using namespace std::chrono;
+    g_vulkan = true;
+    auto now = steady_clock::now();
+    bool titre = false;
+    {
+        std::lock_guard<std::mutex> lk(g_lk);
+        g_frame = frame;
+        double dt = duration<double>(now - g_fps_t0).count();
+        if (dt >= 1.0) {
+            g_fps = (frame - g_fps_f0) / dt;
+            g_fps_t0 = now;
+            g_fps_f0 = frame;
+            static int n = 0;
+            if (++n % 10 == 0) HLOG("gfx", "%.1f fps (frame %llu, Vulkan)", g_fps, (unsigned long long)frame);
+            char t[96];
+            snprintf(t, sizeof t, "StarFox Remake [recompiled]  -  %.0f fps", g_fps);
+            g_titre = t;
+            g_titre_neuf = titre = true;
+        }
+    }
+    if (titre) reveiller();
+}
+
+bool gfx_window_focused() { return g_win.load() && g_focus.load(); }
+
+void gfx_present(const float rgba[4], uint64_t frame) {   // sans Vulkan : cadence seule (rien n'est dessiné)
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(g_lk);
+        memcpy(g_color, rgba, sizeof g_color);
+        g_frame = frame;
+    }
+    static const bool novsync = getenv("RECOMP_NOVSYNC") != nullptr;   // diagnostic
+    auto next = g_last + microseconds(16667);
+    if (now < next && !novsync) plat_sleep_ns(duration_cast<nanoseconds>(next - now).count());
+    g_last = std::max(next, now);
+}
+
+}  // namespace hos
+#endif  // _WIN32

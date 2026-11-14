@@ -3,7 +3,11 @@
 
 #include "hos.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#endif
 
 #include <cctype>
 #include <cstdio>
@@ -419,6 +423,28 @@ const Settings& settings() { return g_settings; }
 
 std::string language_code() {
     if (g_settings.language != "auto") return g_settings.language;
+#ifndef _WIN32
+    // Linux : langue de la session (LC_ALL, LC_MESSAGES, LANG, p. ex. « fr_CA.UTF-8 ») → code de la console le plus proche
+    std::string l;
+    for (const char* v : {"LC_ALL", "LC_MESSAGES", "LANG"})
+        if (const char* e = getenv(v); e && *e && strcmp(e, "C") && strcmp(e, "POSIX")) {
+            l = e;
+            break;
+        }
+    const std::string lg = l.substr(0, 2), pays = l.size() >= 5 ? l.substr(3, 2) : "";
+    if (lg == "fr") return pays == "CA" ? "fr-CA" : "fr";
+    if (lg == "en") return pays == "GB" || pays == "AU" || pays == "NZ" || pays == "IE" ? "en-GB" : "en-US";
+    if (lg == "de") return "de";
+    if (lg == "it") return "it";
+    if (lg == "es") return pays.empty() || pays == "ES" ? "es" : "es-419";
+    if (lg == "nl") return "nl";
+    if (lg == "pt") return pays == "BR" ? "pt-BR" : "pt";
+    if (lg == "ru") return "ru";
+    if (lg == "ja") return "ja";
+    if (lg == "ko") return "ko";
+    if (lg == "zh") return pays == "CN" || pays == "SG" ? "zh-Hans" : "zh-Hant";
+    return "en-US";
+#else
     // langue de l'interface de Windows → code de la console le plus proche
     const LANGID id = GetUserDefaultUILanguage();
     const int sub = SUBLANGID(id);
@@ -437,6 +463,7 @@ std::string language_code() {
     case LANG_CHINESE: return sub == SUBLANG_CHINESE_SIMPLIFIED || sub == SUBLANG_CHINESE_SINGAPORE ? "zh-Hans" : "zh-Hant";
     default: return "en-US";
     }
+#endif
 }
 
 void settings_init(int argc, char** argv) {

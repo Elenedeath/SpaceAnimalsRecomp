@@ -6,7 +6,11 @@
 // Syncs NVN : un objet est « en attente » entre sa soumission dans un FenceSync et la fin, sur le GPU, du
 // travail Vulkan soumis avant ce FenceSync. Le thread GPU soumet sans attendre (vkr::flush_async) ; le fil
 // de complétion de vk_render.cpp signale le sync quand le sémaphore chronologique atteint la soumission.
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#endif
 
 #include "nvn_exec.h"
 #include "gfx.h"
@@ -64,17 +68,25 @@ int max_in_flight() {
 
 // Attente précise jusqu'à un tick (minuteur haute résolution, puis attente active < 0,3 ms).
 void wait_until_tick(uint64_t tick) {
+#ifdef _WIN32
     static thread_local HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
     const uint64_t f = rt_cntfrq();
     for (;;) {
         uint64_t now = rt_cntvct();
         if (now >= tick) return;
         int64_t ns = (int64_t)((tick - now) * 1000000000ull / f);
+#ifdef _WIN32
         if (ns > 300000 && tm) {
             LARGE_INTEGER due;
             due.QuadPart = -((ns - 250000) / 100);
             if (SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(tm, INFINITE);
         } else {
+#else
+        if (ns > 300000) {
+            plat_sleep_ns(ns - 250000);   // clock_nanosleep : précis à quelques dizaines de µs
+        } else {
+#endif
             YieldProcessor();
         }
     }

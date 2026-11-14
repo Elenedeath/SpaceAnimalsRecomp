@@ -14,7 +14,11 @@
 #include "settings.h"
 #include "vk_render.h"
 
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include "plat_linux.h"
+#endif
 
 #include <array>
 #include <atomic>
