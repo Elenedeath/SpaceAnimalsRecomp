@@ -11,6 +11,7 @@ recomp/outils/
 outils/
 recomp/launcher/lanceur.exe
 lanceur.exe
+/lanceur
 lanceur.ini
 maj/
 *.log
