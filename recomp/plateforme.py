@@ -134,14 +134,46 @@ def memoire_libre():
     return e.ullAvailPhys / 1e9, e.ullAvailPageFile / 1e9
 
 
-def memoire_processus_linux(pid):
-    """Mémoire (Go) d'un processus Linux : le plus grand de VmHWM (pic) et VmRSS ; 0 si illisible."""
+def _enfants_linux(pid):
+    """pids des enfants directs (/proc/<pid>/task/*/children ; sinon le ppid de chaque /proc/<n>/stat)."""
+    enfants = []
     try:
-        with open(f"/proc/{pid}/status") as f:
-            v = [int(l.split()[1]) * 1024 for l in f if l.startswith(("VmHWM:", "VmRSS:"))]
-        return max(v) / 1e9 if v else 0.0
-    except (OSError, ValueError, IndexError):
-        return 0.0
+        for t in os.listdir(f"/proc/{pid}/task"):
+            with open(f"/proc/{pid}/task/{t}/children") as f:
+                enfants += [int(x) for x in f.read().split()]
+        return enfants
+    except (OSError, ValueError):
+        pass
+    for n in os.listdir("/proc"):
+        if n.isdigit():
+            try:
+                with open(f"/proc/{n}/stat") as f:
+                    if int(f.read().rsplit(")", 1)[1].split()[1]) == pid:
+                        enfants.append(int(n))
+            except (OSError, ValueError, IndexError):
+                pass
+    return enfants
+
+
+def memoire_processus_linux(pid):
+    """Mémoire (Go) d'un processus Linux et de ses descendants : pour chacun, le plus grand de VmHWM (pic) et VmRSS,
+    additionnés ; 0 si illisible. Les descendants comptent : une compilation est lancée par le script c++ (zig), qui
+    passe la main à zig puis à clang, son enfant ; le seul processus lancé ne pèse que quelques Mo (« 0.00 GB each »
+    jusqu'au 2026-11-15, et le garde-fou mémoire ne freinait jamais rien)."""
+    total, vus, a_voir = 0, set(), [pid]
+    while a_voir:
+        p = a_voir.pop()
+        if p in vus:
+            continue
+        vus.add(p)
+        try:
+            with open(f"/proc/{p}/status") as f:
+                v = [int(l.split()[1]) * 1024 for l in f if l.startswith(("VmHWM:", "VmRSS:"))]
+            total += max(v) if v else 0
+        except (OSError, ValueError, IndexError):
+            continue
+        a_voir += _enfants_linux(p)
+    return total / 1e9
 
 
 def avx2():

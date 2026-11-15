@@ -581,7 +581,9 @@ def fils_selon_memoire(demandes):
         return demandes
     clang = avec_clang()
     n = max(1, min(demandes, int((min(ram, validable) - GO_RESERVE) / (GO_PAR_TACHE_CLANG if clang else GO_PAR_TACHE))))
-    dire(f"free memory: {ram:.0f} GB of RAM, {validable:.0f} GB of commit, compiler {'clang' if clang else 'g++'}"
+    # Windows : mémoire validable (RAM + fichier d'échange) ; Linux : RAM disponible + swap libre
+    reserve = "RAM + swap" if plateforme.LINUX else "commit"
+    dire(f"free memory: {ram:.0f} GB of RAM, {validable:.0f} GB of {reserve}, compiler {'clang' if clang else 'g++'}"
          f" → {n} parallel compilation(s)"
          + (f" instead of {demandes} (closing other programs speeds up the build)" if n < demandes else ""))
     return n

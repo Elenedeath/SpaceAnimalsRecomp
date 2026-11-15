@@ -397,11 +397,13 @@ def linux():
         nom = v.get("PRETTY_NAME", nom).strip('"') + f" (kernel {platform.release()})"
     except OSError:
         pass
-    cpu, avx2 = platform.processor() or "?", True
+    # nom du processeur : /proc/cpuinfo (platform.processor() lit « uname -p », qui rend « unknown », traduit selon la
+    # langue du système : « inconnu » sur un Ubuntu en français)
+    cpu, avx2 = "?", True
     try:
         with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
             for l in f:
-                if l.startswith("model name") and cpu in ("?", "x86_64", ""):
+                if l.startswith("model name") and cpu == "?":
                     cpu = l.split(":", 1)[1].strip()
                 elif l.startswith("flags"):
                     avx2 = " avx2" in l
