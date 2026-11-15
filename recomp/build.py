@@ -43,7 +43,10 @@ def compilateur_genere():
     """
     if plateforme.LINUX:   # Linux : zig (clang) fourni, glibc 2.31 (plateforme.py)
         choix = plateforme.zig_cxx()
-        return choix, "clang", [*plateforme.cible_linux(choix), "-include", os.path.join(RUNTIME, "clang_compat.h"), "-w"]
+        # -g0 : zig c++ émet des informations de débogage DWARF même sans -g (3,8 Go sur les 4,9 de recomp_main ;
+        # le code généré n'en a pas sous Windows)
+        return choix, "clang", [*plateforme.cible_linux(choix), "-g0", "-include", os.path.join(RUNTIME, "clang_compat.h"),
+                                "-w"]
     choix = os.environ.get("RECOMP_CXX")
     if not choix:
         gxx = shutil.which("g++")
