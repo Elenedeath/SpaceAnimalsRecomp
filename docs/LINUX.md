@@ -1,52 +1,55 @@
-# Portage Linux (branche `linux`)
+# Linux port (`linux` branch)
 
-Même jeu, même launcher que sous Windows, compilés pour Linux et livrés en **AppImage** (Steam Deck, PC Linux). Comme
-sous Windows, rien du jeu n'est distribué : l'AppImage contient le launcher, les sources du recompilateur et les outils
-de construction ; le jeu est recompilé sur la machine du joueur depuis sa propre copie (`.nup`).
+> English translation of [LINUX-fr.md](LINUX-fr.md). Both files are updated together; if they differ, the French text
+> is the reference.
 
-Windows ne change pas : tout le code propre à Linux est derrière `#ifdef _WIN32 … #else … #endif`. Vérifié en compilant
-les deux branches avec le GCC fourni : objets du launcher et du runtime identiques octet par octet, sauf `vk_render.o`
-dont seuls les numéros de ligne cités par les messages d'erreur Vulkan (`VKCHK`, `__LINE__`) diffèrent.
+Same game, same launcher as on Windows, built for Linux and shipped as an **AppImage** (Steam Deck, Linux PCs). As on
+Windows, nothing from the game is distributed: the AppImage contains the launcher, the recompiler sources and the build
+tools; the game is recompiled on the player's machine from their own copy (`.nup`).
 
-## Ce qui change sous Linux
+Windows does not change: all Linux-specific code is behind `#ifdef _WIN32 … #else … #endif`. Checked by compiling both
+branches with the bundled GCC: launcher and runtime objects are byte-for-byte identical, except `vk_render.o`, where only
+the line numbers quoted by Vulkan error messages (`VKCHK`, `__LINE__`) differ.
+
+## What changes on Linux
 
 | Windows | Linux |
 |---|---|
-| `VirtualAlloc` (engagement à la demande) | `mmap(PROT_NONE)` + `mprotect` (le noyau fournit la RAM au premier accès) — `memory.cpp` |
-| gestionnaire vectoriel d'exceptions | `sigaction(SIGSEGV…)` — `host_main.cpp` |
-| fils, événements, fibres | pthreads, futex, `ucontext` — `kernel.cpp`, `plat_linux.h` |
-| fenêtre Win32, `vkCreateWin32SurfaceKHR` | fenêtre SDL3, surface Vulkan de SDL (fil principal : `gfx_boucle_principale`) — `present.cpp` |
-| clavier Win32, XInput | clavier et manettes SDL3 (scancodes de `recomp.ini` inchangés : `scancodes.h`) — `input.cpp` |
-| WASAPI | flux audio SDL3 — `audio_out.cpp` |
-| DLSS : `_nvngx.dll` du pilote, `nvngx_dlss.dll` | `libnvidia-ngx.so.1` du pilote NVIDIA, `libnvidia-ngx-dlss.so` du même SDK (outils/dlss) |
-| Enregistrement Media Foundation | absent |
-| GCC + Clang de WinLibs | zig 0.17 (clang, libc++, en-têtes de la glibc 2.31) — `plateforme.py` |
-| launcher : Win32, Direct2D, DirectWrite, Media Foundation | **même code** : Win32 réalisé sur POSIX/SDL3 (`win32_linux.cpp`), Direct2D/DirectWrite sur cairo/pango (`d2d_cairo.h`), vidéos de fond en MPEG-1 lues par pl_mpeg |
-| sauvegardes `%APPDATA%\SpaceAnimalsRecomp` | `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp` |
+| `VirtualAlloc` (commit on demand) | `mmap(PROT_NONE)` + `mprotect` (the kernel provides RAM on first access) — `memory.cpp` |
+| vectored exception handler | `sigaction(SIGSEGV…)` — `host_main.cpp` |
+| threads, events, fibers | pthreads, futex, `ucontext` — `kernel.cpp`, `plat_linux.h` |
+| Win32 window, `vkCreateWin32SurfaceKHR` | SDL3 window, SDL Vulkan surface (main thread: `gfx_boucle_principale`) — `present.cpp` |
+| Win32 keyboard, XInput | SDL3 keyboard and controllers (`recomp.ini` scancodes unchanged: `scancodes.h`) — `input.cpp` |
+| WASAPI | SDL3 audio stream — `audio_out.cpp` |
+| DLSS: driver's `_nvngx.dll`, `nvngx_dlss.dll` | NVIDIA driver's `libnvidia-ngx.so.1`, `libnvidia-ngx-dlss.so` from the same SDK (outils/dlss) |
+| Media Foundation recording | not available |
+| WinLibs GCC + Clang | zig 0.17 (clang, libc++, glibc 2.31 headers) — `plateforme.py` |
+| launcher: Win32, Direct2D, DirectWrite, Media Foundation | **same code**: Win32 implemented on POSIX/SDL3 (`win32_linux.cpp`), Direct2D/DirectWrite on cairo/pango (`d2d_cairo.h`), MPEG-1 background videos played by pl_mpeg |
+| saves in `%APPDATA%\SpaceAnimalsRecomp` | `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp` |
 
-## Construire l'AppImage
+## Building the AppImage
 
-Sous Linux (ou WSL), avec clang/ld.lld, cmake, ninja, readelf et ffmpeg (extraits du fond), après avoir préparé la
-racine système (`sysroot_linux.py` : Steam Runtime « sniper », glibc 2.31, SDL3, cairo, pango) :
+On Linux (or WSL), with clang/ld.lld, cmake, ninja, readelf and ffmpeg (background clips), after preparing the system
+root (`sysroot_linux.py`: Steam Runtime "sniper", glibc 2.31, SDL3, cairo, pango):
 
 ```sh
-python3 recomp/launcher/sysroot_linux.py build/sysroot     # une fois : ~1,2 Go téléchargés
+python3 recomp/launcher/sysroot_linux.py build/sysroot     # once: ~1.2 GB download
 python3 recomp/launcher/paquet_linux.py build/release --sysroot build/sysroot \
-    --extraits SpaceAnimalsRecomp-1.1.0-update.zip     # ou un dossier d'extrait_*.mp4
+    --extraits SpaceAnimalsRecomp-1.1.0-update.zip     # or a folder of extrait_*.mp4
 ```
 
-Produit `SpaceAnimalsRecomp-<version>-x86_64.AppImage`. Au lancement, `AppRun` garde une copie de `app/` (launcher et
-sources) dans `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp/app` : le jeu construit, `recomp.ini` et les caches
-y restent ; les outils (Python, zig, glslang, SDL3) restent dans l'image montée.
+Produces `SpaceAnimalsRecomp-<version>-x86_64.AppImage`. On launch, `AppRun` keeps a copy of `app/` (launcher and
+sources) in `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp/app`: the built game, `recomp.ini` and the caches stay
+there; the tools (Python, zig, glslang, SDL3) stay in the mounted image.
 
-Pour le launcher seul : `python3 recomp/launcher/construire.py --sysroot <sysroot>` (écrit `lanceur` à la racine).
+Launcher only: `python3 recomp/launcher/construire.py --sysroot <sysroot>` (writes `lanceur` at the root).
 
-## Limites connues
+## Known limitations
 
-- Mise à jour et déplacement depuis le launcher : désactivés (l'AppImage se remplace d'un bloc). La désinstallation passe
-  par `desinstaller_linux.py` (bouton DÉSINSTALLER).
-- Steam Deck (RADV VANGOGH) : le jeu tourne, 60 img/s à l'écran titre. Dans la cinématique du prologue, le brouillard
-  volumétrique (`volumetric_fog_light.comp`) prend 25 ms par image, 82 % du GPU : le couper (page Graphismes,
-  `volumetric_fog = false`) fait passer de 13-22 à 45-60 img/s. Le reste dépend de la surface couverte par les
-  personnages (shaders de pixels) : rendu 3D à 75 % conseillé.
-- Polices : Barlow (OFL) remplace Bahnschrift, absente de Linux.
+- Updating and moving from the launcher: disabled (the AppImage is replaced as a whole). Uninstalling goes through
+  `desinstaller_linux.py` (UNINSTALL button).
+- Steam Deck (RADV VANGOGH): the game runs, 60 fps on the title screen. In the prologue cutscene, the volumetric fog
+  (`volumetric_fog_light.comp`) takes 25 ms per frame, 82 % of the GPU: turning it off (Graphics page,
+  `volumetric_fog = false`) raises it from 13-22 to 45-60 fps. The rest depends on the screen area covered by the
+  characters (pixel shaders): 3D rendering at 75 % recommended.
+- Fonts: Barlow (OFL) replaces Bahnschrift, which Linux lacks.
