@@ -194,7 +194,7 @@ int g_nstub = 0;
 void nvn_trace_impl(const char* name, CPUState* ctx, bool stub) {
     HLOG("nvn", "%s%s(0x%llx, 0x%llx, 0x%llx, 0x%llx) from %s [thread %u]", stub ? "[stub] " : "", name,
          (unsigned long long)A(0), (unsigned long long)A(1), (unsigned long long)A(2), (unsigned long long)A(3),
-         symbolize(ctx->x[30]).c_str(), current_thread_id());
+         symbolize(ctx->x[30]).c_str(), (unsigned)current_thread_id());
 }
 
 void stub_call(int i, CPUState* ctx) {

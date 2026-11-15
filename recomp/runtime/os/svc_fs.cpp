@@ -416,7 +416,7 @@ bool resolve(const fs::path& root, const std::string& gp, fs::path& out) {
     std::string s = gp;
     while (!s.empty() && s[0] == '/') s.erase(0, 1);
     fs::path rel = fs::u8path(s).lexically_normal();
-    for (auto& part : rel)
+    for (const auto& part : rel)   // (libc++ : l'itérateur de path rend une copie)
         if (part == "..") return false;
     out = root / rel;
     return true;
