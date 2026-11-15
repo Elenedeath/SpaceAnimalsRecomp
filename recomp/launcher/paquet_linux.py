@@ -136,6 +136,13 @@ if [ -n "${APPIMAGE:-}" ]; then
     {
         mkdir -p "${icone%/*}" "${entree%/*}"
         cmp -s "$here/spaceanimalsrecomp.png" "$icone" || cp "$here/spaceanimalsrecomp.png" "$icone"
+        # cache d'icônes laissé par une autre application (icon-theme.cache) : GTK s'y fie tant qu'il est plus récent
+        # que le dossier hicolor, que l'ajout d'une icône dans un sous-dossier ne date pas ; l'icône restait
+        # introuvable (engrenage dans le dock de GNOME). Plus ancien que notre icône : régénéré, sinon rendu périmé.
+        theme="$donnees/icons/hicolor"
+        if [ -f "$theme/icon-theme.cache" ] && [ "$icone" -nt "$theme/icon-theme.cache" ]; then
+            gtk-update-icon-cache -q -t -f "$theme" 2>/dev/null || touch "$theme"
+        fi
         { grep -v '^Exec=' "$here/spaceanimalsrecomp.desktop"; printf 'Exec="%s"\\n' "$exec_"; } > "$entree.new"
         if cmp -s "$entree.new" "$entree"; then rm -f "$entree.new"; else mv -f "$entree.new" "$entree"; fi
     } 2>/dev/null || true
