@@ -79,7 +79,16 @@ if ! cmp -s "$here/app/.paquet" "$home/.paquet"; then
     rm -f "$home/lanceur"
     cp -a "$here/app/." "$home/"
 fi
-ln -sfn "$here/outils" "$home/outils"
+# outils/ : lien vers l'image montée de cette instance. Une deuxième instance (lancée pendant qu'une première tourne,
+# un double clic par exemple) ne le touche pas : elle le pointait sur son propre montage, démonté dès sa fermeture,
+# et les compilations de la première ne trouvaient plus zig (2026-11-15). Le verrou (descripteur 9) passe au launcher,
+# au jeu et aux compilations : il est libéré quand tout est fermé.
+exec 9>"$home/.instance"
+if command -v flock >/dev/null 2>&1; then
+    if flock -n 9; then ln -sfn "$here/outils" "$home/outils"; fi
+else
+    ln -sfn "$here/outils" "$home/outils"
+fi
 # fontconfig : celle du système quand il en a une (elle comprend toujours sa propre configuration ; la copie de
 # l'AppImage, plus ancienne, avertissait sur les éléments récents), sinon la copie de secours
 libs="$here/lib"
