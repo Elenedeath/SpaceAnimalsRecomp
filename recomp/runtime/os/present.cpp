@@ -359,6 +359,14 @@ void creer_fenetre() {   // fil principal
     HLOG("gfx", "host window %dx%d (SDL %s video driver)", g_w, g_h, SDL_GetCurrentVideoDriver());
     if (cachee) HLOG("gfx", "window hidden (RECOMP_WINDOW_HIDDEN)");
     else if (settings().borderless) set_borderless(w, true);
+    // icône de la fenêtre : lanceur.png de l'installation (recomp_main est dans <installation>/recomp/build/full).
+    // X11 et KDE la montrent ; GNOME prend celle de l'entrée de menu spaceanimalsrecomp.desktop (posée par AppRun)
+    if (const char* base = SDL_GetBasePath()) {
+        if (SDL_Surface* icone = SDL_LoadPNG((std::string(base) + "../../../lanceur.png").c_str())) {
+            SDL_SetWindowIcon(w, icone);
+            SDL_DestroySurface(icone);
+        }
+    }
     g_focus = (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) != 0;
     g_win = w;
 }

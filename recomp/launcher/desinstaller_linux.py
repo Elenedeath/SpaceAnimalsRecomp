@@ -27,6 +27,8 @@ Ce que l'AppImage écrit sur une machine :
   <installation>                             le launcher et les sources (copiés depuis l'AppImage)
   l'AppImage                                 le fichier téléchargé
   Bureau/StarFox Remake [recompiled].desktop raccourci créé depuis le launcher, s'il mène à cette installation
+  ~/.local/share/applications/spaceanimalsrecomp.desktop, ~/.local/share/icons/hicolor/256x256/apps/spaceanimalsrecomp.png
+                                             entrée de menu et icône (AppRun, à chaque lancement)
   ~/.local/share/SpaceAnimalsRecomp          sauvegardes et copies de secours (à côté de l'installation)
 Journal : ${TMPDIR:-/tmp}/SpaceAnimalsRecomp-uninstall.log (en anglais).
 """
@@ -122,6 +124,13 @@ def raccourci_bureau(racine, appimage):
     return [p] if os.path.abspath(exec_) in cibles else []
 
 
+def integration():
+    """Entrée de menu et icône posées par AppRun (paquet_linux.py), au nom de l'identifiant des fenêtres."""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return [os.path.join(base, "applications", "spaceanimalsrecomp.desktop"),
+            os.path.join(base, "icons", "hicolor", "256x256", "apps", "spaceanimalsrecomp.png")]
+
+
 def elements(racine, appimage):
     """(clé, description en anglais, chemins) de tout ce que l'AppImage a écrit ; les chemins absents sont retirés."""
     r = os.path.join(racine, "recomp")
@@ -137,6 +146,7 @@ def elements(racine, appimage):
         ("paquet", "the launcher and the sources", [racine]),
         ("appimage", "the AppImage", [appimage] if appimage else []),
         ("raccourci", "desktop shortcut", raccourci_bureau(racine, appimage)),
+        ("integration", "menu entry and icon", integration()),
         ("sauvegardes", "your saves and their backups", sauv),
     ]
     return [(k, desc, [p for p in ch if os.path.lexists(p)]) for k, desc, ch in liste]
@@ -246,7 +256,7 @@ def main():
         dire("@erreur recomp_main is running: close the game first")
         return 2
     voulu = ("jeu", "code", "extraits", "compilateur", "temporaires") if a.nettoyer else \
-        ("jeu", "code", "extraits", "compilateur", "temporaires", "paquet", "appimage", "raccourci") + \
+        ("jeu", "code", "extraits", "compilateur", "temporaires", "paquet", "appimage", "raccourci", "integration") + \
         (("sauvegardes",) if a.sauvegardes else ())
     cibles = [(cle, desc, chemins) for cle, desc, chemins in el if cle in voulu and chemins]
     dire(("Cleaning" if a.nettoyer else "Uninstalling") + f" SpaceAnimalsRecomp ({racine})")

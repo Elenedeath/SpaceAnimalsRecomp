@@ -647,29 +647,16 @@ BOOL TerminateJobObject(HANDLE job, UINT) {
     return TRUE;
 }
 
-// programme du bureau (xdg-open), détaché, avec les bibliothèques du système (pas celles de l'AppImage)
+// programme du bureau (xdg-open), détaché (l'AppImage ne touche plus LD_LIBRARY_PATH : rien à rétablir)
 static void ouvrir(const std::string& cible) {
     if (fork() == 0) {
         setsid();
-        if (const char* v = getenv("SA_LD_LIBRARY_PATH_SYSTEME")) {
-            if (*v) setenv("LD_LIBRARY_PATH", v, 1);
-            else unsetenv("LD_LIBRARY_PATH");
-        }
         execlp("xdg-open", "xdg-open", cible.c_str(), (char*)nullptr);
         _exit(127);
     }
 }
-HANDLE ShellExecuteW(HWND, const wchar_t* verbe, const wchar_t* fichier, const wchar_t* params, const wchar_t*, int) {
-    const std::string f = u8(fichier);
-    if (f == "explorer.exe" && params) {   // « /select,"chemin" » : le dossier du fichier
-        std::string p = plat_chemin(params);
-        const size_t a = p.find('"'), b = p.rfind('"');
-        if (a != std::string::npos && b > a) p = p.substr(a + 1, b - a - 1);
-        ouvrir(p.substr(0, p.find_last_of('/')));
-    } else {
-        (void)verbe;
-        ouvrir(plat_chemin(fichier));
-    }
+HANDLE ShellExecuteW(HWND, const wchar_t*, const wchar_t* fichier, const wchar_t*, const wchar_t*, int) {
+    ouvrir(plat_chemin(fichier));   // fichier ou dossier, avec le programme du bureau
     return (HANDLE)(intptr_t)33;
 }
 
@@ -796,6 +783,14 @@ HWND CreateWindowExW(DWORD, const wchar_t*, const wchar_t* titre, DWORD, int x, 
     }
     SDL_SetWindowPosition(g_win, x, y);
     SDL_SetWindowHitTest(g_win, test_zone, nullptr);
+    // icône de la fenêtre (lanceur.png, à côté du launcher) : X11 et KDE la montrent ; GNOME prend celle de
+    // l'entrée de menu spaceanimalsrecomp.desktop (posée par AppRun)
+    if (const char* base = SDL_GetBasePath()) {
+        if (SDL_Surface* icone = SDL_LoadPNG((std::string(base) + "lanceur.png").c_str())) {
+            SDL_SetWindowIcon(g_win, icone);
+            SDL_DestroySurface(icone);
+        }
+    }
     return (HWND)g_win;
 }
 BOOL DestroyWindow(HWND h) {

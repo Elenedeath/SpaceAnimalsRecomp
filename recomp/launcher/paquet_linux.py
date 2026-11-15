@@ -18,9 +18,15 @@ Contenu de l'AppImage :
   app/recomp/…           recompilateur, runtime, shaders, scripts du launcher (mêmes fichiers que le paquet Windows)
   app/recomp/launcher/extraits/*.mpg   extraits du fond, en MPEG-1 (lu par pl_mpeg), convertis depuis les MP4
   app/polices/           Barlow (licence OFL), à la place de Bahnschrift
+  app/lib/               libSDL3.so.0 (racine système), trouvée par le launcher à côté de lui (RUNPATH $ORIGIN/lib)
   outils/                Python, zig, glslang (outils.py), SDL3 (racine système)
-  lib/                   bibliothèques du launcher absentes d'un système de base (racine système)
-  lib-secours/           fontconfig, prise seulement si le système n'en a pas (AppRun)
+
+Bibliothèques : seule SDL3 est fournie. cairo, pango, glib, fontconfig, freetype, harfbuzz, X11… sont celles du
+système (SteamOS et tout bureau les ont) : le launcher est compilé contre celles de la racine système, plus anciennes,
+et tourne avec les plus récentes. Jusqu'au 2026-11-15, toute cette pile venait de la racine système (lib/, par
+LD_LIBRARY_PATH) et se mêlait à celle du bureau : module GTK de libdecor refusé (libatspi, glib trop ancienne),
+pango 1.46 qui faisait planter le fontconfig 2.17 d'Ubuntu 26.04 (FcFontSetSort, config NULL), programmes du système
+(zenity, xdg-open) lancés avec nos bibliothèques. L'AppImage ne touche plus LD_LIBRARY_PATH.
 """
 import argparse
 import hashlib
@@ -57,19 +63,20 @@ POLICES_SHA256 = {
     "OFL.txt": "186d750eb496a4c17a76385f82be6aea2ac1cf2de074a811d63786cf374ea73f",
 }
 POLICES = list(POLICES_SHA256)
-# Bibliothèques que tout bureau Linux a et que l'AppImage doit prendre chez lui : la glibc, le chargeur Vulkan (il
-# trouve les pilotes du système), libgcc_s et libstdc++ (celle de la racine système est plus ancienne que celle de
-# tout bureau, et les pilotes de Mesa veulent la plus récente).
+# Seules bibliothèques fournies avec le launcher (app/lib/) : SDL3, qui ne demande que la glibc et charge elle-même
+# X11, Wayland et le son du bureau. Rien qui charge des modules du système
+# ou lise sa configuration : ces bibliothèques-là doivent être celles du système.
+FOURNIES = {"libSDL3.so.0"}
+# Prises chez le joueur : la glibc et libstdc++/libgcc_s (celles de tout bureau sont plus récentes que celles de la
+# racine système), et la pile graphique du launcher (SteamOS a GTK 3, donc toutes ; tout bureau aussi).
 SYSTEME = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "ld-linux-x86-64.so.2",
-           "libvulkan.so.1", "libgcc_s.so.1", "libstdc++.so.6"}
-# Fournies à part (lib-secours/) : prises seulement si le système n'en a pas. fontconfig lit la configuration du
-# système (/etc/fonts) : celle de la racine système (2.13) avertissait sur les éléments récents (« reset-dirs »,
-# Ubuntu 24.04) ; celle du système la comprend toujours. Presque tout bureau l'a (SteamOS compris).
-SECOURS = {"libfontconfig.so.1"}
+           "libgcc_s.so.1", "libstdc++.so.6",
+           "libcairo.so.2", "libpango-1.0.so.0", "libpangocairo-1.0.so.0", "libgobject-2.0.so.0", "libglib-2.0.so.0",
+           "libfontconfig.so.1"}
 
 APPRUN = """#!/bin/sh
 # Entrée de l'AppImage (recomp/launcher/paquet_linux.py) : le launcher tourne depuis une copie de app/ dans le dossier
-# de données du joueur, qui garde le jeu construit, ses réglages et ses caches ; outils/ et lib/ restent dans l'image.
+# de données du joueur, qui garde le jeu construit, ses réglages et ses caches ; outils/ reste dans l'image.
 set -eu
 here=$(dirname "$(readlink -f "$0")")
 home=${XDG_DATA_HOME:-$HOME/.local/share}/SpaceAnimalsRecomp/app
@@ -89,14 +96,25 @@ if command -v flock >/dev/null 2>&1; then
 else
     ln -sfn "$here/outils" "$home/outils"
 fi
-# fontconfig : celle du système quand il en a une (elle comprend toujours sa propre configuration ; la copie de
-# l'AppImage, plus ancienne, avertissait sur les éléments récents), sinon la copie de secours
-libs="$here/lib"
-if ! { /sbin/ldconfig -p 2>/dev/null || ldconfig -p 2>/dev/null; } | grep -q "libfontconfig\\.so\\.1 "; then
-    libs="$libs:$here/lib-secours"
+# intégration au bureau : entrée de menu et icône, au nom de l'identifiant des fenêtres du launcher et du jeu
+# (SDL_HINT_APP_ID « spaceanimalsrecomp »). GNOME (Wayland) ne prend l'icône d'une fenêtre que dans le .desktop de
+# même nom : sans lui, un engrenage dans le dock. Refaite quand l'AppImage a changé de place ou d'icône ; retirée par
+# DÉSINSTALLER (desinstaller_linux.py). Jamais bloquante : une erreur ici n'empêche pas le lancement.
+if [ -n "${APPIMAGE:-}" ]; then
+    donnees=${XDG_DATA_HOME:-$HOME/.local/share}
+    icone="$donnees/icons/hicolor/256x256/apps/spaceanimalsrecomp.png"
+    entree="$donnees/applications/spaceanimalsrecomp.desktop"
+    # Exec : chemin entre guillemets, échappé selon la spécification Desktop Entry (\\ → \\\\\\\\, " ` $ → \\\\x, % → %%)
+    exec_=$(printf '%s' "$APPIMAGE" | sed -e 's/\\\\/\\\\\\\\\\\\\\\\/g' -e 's/["`$]/\\\\\\\\&/g' -e 's/%/%%/g')
+    {
+        mkdir -p "${icone%/*}" "${entree%/*}"
+        cmp -s "$here/spaceanimalsrecomp.png" "$icone" || cp "$here/spaceanimalsrecomp.png" "$icone"
+        { grep -v '^Exec=' "$here/spaceanimalsrecomp.desktop"; printf 'Exec="%s"\\n' "$exec_"; } > "$entree.new"
+        if cmp -s "$entree.new" "$entree"; then rm -f "$entree.new"; else mv -f "$entree.new" "$entree"; fi
+    } 2>/dev/null || true
 fi
-export SA_LD_LIBRARY_PATH_SYSTEME="${LD_LIBRARY_PATH:-}"
-export LD_LIBRARY_PATH="$libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# bibliothèques : celles du système, sauf SDL3 (app/lib/, trouvée par le launcher à côté de lui) ; LD_LIBRARY_PATH
+# n'est pas touché, les programmes du système lancés par le launcher (xdg-open, zenity) gardent les leurs
 exec "$home/lanceur" "$@"
 """
 
@@ -106,6 +124,7 @@ Name=StarFox Remake [recompiled]
 Comment=Native port of Star Fox (Switch 2), built on your PC from your own copy
 Exec=AppRun
 Icon=spaceanimalsrecomp
+StartupWMClass=spaceanimalsrecomp
 Categories=Game;
 Terminal=false
 """
@@ -144,23 +163,20 @@ def trouver_lib(sr, nom):
 
 
 def fournir_libs(sr, exe, lib):
+    """FOURNIES dans lib/ (et leurs dépendances, qui doivent être dans SYSTEME) ; toute autre bibliothèque demandée par
+    le launcher doit être dans SYSTEME : une nouvelle dépendance est un choix à faire ici, pas une copie silencieuse."""
     os.makedirs(lib, exist_ok=True)
-    a_faire = [n for n in besoins(exe) if n not in SYSTEME]
+    a_faire = list(besoins(exe))
     while a_faire:
         n = a_faire.pop()
-        if os.path.exists(os.path.join(lib, n)):
+        if n in SYSTEME or os.path.exists(os.path.join(lib, n)):
             continue
+        if n not in FOURNIES:
+            sys.exit(f"{n} : ni fournie (FOURNIES) ni prise au système (SYSTEME), paquet_linux.py")
         src = trouver_lib(sr, n)
         shutil.copy2(src, os.path.join(lib, n))
-        a_faire += [x for x in besoins(src) if x not in SYSTEME]
-    # bibliothèques de secours (AppRun ne les prend que si le système n'en a pas) : lib-secours/, à côté de lib/
-    secours = os.path.join(os.path.dirname(lib), "lib-secours")
-    os.makedirs(secours, exist_ok=True)
-    for n in SECOURS:
-        if os.path.exists(os.path.join(lib, n)):
-            shutil.move(os.path.join(lib, n), os.path.join(secours, n))
+        a_faire += besoins(src)
     dire("bibliothèques fournies : " + " ".join(sorted(os.listdir(lib))))
-    dire("de secours : " + " ".join(sorted(os.listdir(secours))))
 
 
 def icone_png(dest):
@@ -310,6 +326,8 @@ def main():
     dire("polices")
     polices(os.path.join(app, "polices"), cache)
     icone_png(os.path.join(app, "lanceur.png"))
+    dire("bibliothèques")
+    fournir_libs(sr, os.path.join(app, "lanceur"), os.path.join(app, "lib"))   # dans app/ : avant l'empreinte
     # empreinte de tout app/ (chemins et contenus) : AppRun recopie app/ dès qu'un fichier change. Jusqu'au 2026-11-15,
     # celle du seul launcher : une AppImage qui ne changeait que des scripts Python (build.py, rapport.py) n'était pas
     # recopiée, et le joueur gardait les anciens.
@@ -325,8 +343,6 @@ def main():
         f.write(f"{a.version} {h.hexdigest()}\n")
     dire("outils")
     outils(os.path.join(appdir, "outils"), sr, cache)
-    dire("bibliothèques")
-    fournir_libs(sr, os.path.join(app, "lanceur"), os.path.join(appdir, "lib"))
     controle(app)
     with open(os.path.join(appdir, "AppRun"), "w") as f:
         f.write(APPRUN)
