@@ -34,6 +34,8 @@ RECOMP = os.path.dirname(LANCEUR)
 RACINE = os.path.dirname(RECOMP)
 FULL = os.path.join(RECOMP, "build", "full")
 NOM = "SpaceAnimalsRecomp-bug-report.zip"
+LINUX = sys.platform.startswith("linux")
+EXE = os.path.join(FULL, "recomp_main" if LINUX else "recomp_main.exe")
 TAILLE_MAX = 6 << 20          # par journal : au-delà, le début et la fin sont gardés
 
 # (chemin, nom dans le zip) : du plus utile au moins utile
@@ -136,14 +138,18 @@ def anonymiseur(chemins_copie=()):
     noms_copie = [re.compile(r"(?<![A-Za-z0-9])" + re.escape(os.path.basename(c)) + r"(?![A-Za-z0-9])", re.IGNORECASE)
                   for c in chemins_copie if len(os.path.basename(c)) >= 5]
     installation = []
-    for chemin, par in ((os.path.normpath(RACINE), "<install>"), (os.environ.get("USERPROFILE", ""), "%USERPROFILE%")):
+    profil_os = (os.path.expanduser("~"), "~") if LINUX else (os.environ.get("USERPROFILE", ""), "%USERPROFILE%")
+    for chemin, par in ((os.path.normpath(RACINE), "<install>"), profil_os):
         if chemin and len(chemin) >= 4:
             for c in {chemin, chemin.replace("\\", "/"), chemin.replace("/", "\\")}:
                 installation.append((re.compile(re.escape(c), re.IGNORECASE), par))
     profil = re.compile(r"([A-Za-z]:[\\/]+Users[\\/]+)(?!<user>)([^\\/:*?\"<>|\r\n]+)", re.IGNORECASE)
     noms = []
-    for var, par in (("USERNAME", "<user>"), ("COMPUTERNAME", "<pc>"), ("USERDOMAIN", "<pc>")):
-        v = os.environ.get(var, "")
+    valeurs = [(os.environ.get(v, ""), par) for v, par in (("USERNAME", "<user>"), ("COMPUTERNAME", "<pc>"), ("USERDOMAIN", "<pc>"))]
+    if LINUX:   # Linux : USER, nom de la machine
+        import socket
+        valeurs += [(os.environ.get("USER", ""), "<user>"), (socket.gethostname(), "<pc>")]
+    for v, par in valeurs:
         if len(v) >= 3:
             noms.append((re.compile(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])", re.IGNORECASE), par))
 
@@ -274,6 +280,36 @@ def gpus():
     return out or ["?"]
 
 
+def gpus_linux():
+    """Linux : cartes graphiques vues par le noyau (/sys/class/drm : fabricant, identifiant, pilote), version du pilote
+    NVIDIA s'il est chargé. Mesa et RADV : ligne Vulkan du dernier jeu (recomp_run.log)."""
+    fabricants = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
+    out = []
+    for carte in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+        if "-" in os.path.basename(carte):   # sorties (card0-eDP-1…)
+            continue
+        dev = os.path.join(carte, "device")
+        try:
+            ven = open(os.path.join(dev, "vendor")).read().strip()
+            pid = open(os.path.join(dev, "device")).read().strip()
+        except OSError:
+            continue
+        pilote = os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) if os.path.exists(os.path.join(dev, "driver")) else "?"
+        ligne = f"{fabricants.get(ven, ven)} {ven[2:]}:{pid[2:]}, driver {pilote}"
+        try:
+            vram = int(open(os.path.join(dev, "mem_info_vram_total")).read())   # amdgpu
+            ligne += f", {vram / (1 << 30):.1f} GB VRAM"
+        except (OSError, ValueError):
+            pass
+        out.append(ligne)
+    try:
+        with open("/proc/driver/nvidia/version", encoding="utf-8", errors="replace") as f:
+            out.append("NVIDIA driver: " + f.readline().strip())
+    except OSError:
+        pass
+    return out or ["?"]
+
+
 def lignes_journal(chemin, motifs, n=3):
     """Premières lignes d'un journal qui contiennent un des motifs (GPU vu par Vulkan, etc.)."""
     if not os.path.exists(chemin):
@@ -309,13 +345,13 @@ def dossier_installation():
 
 def etat_construction():
     out = []
-    exe = os.path.join(FULL, "recomp_main.exe")
-    if os.path.exists(exe):
-        st = os.stat(exe)
-        out.append(f"game built: recomp_main.exe {st.st_size / 1e6:.0f} MB, "
+    nom = os.path.basename(EXE)
+    if os.path.exists(EXE):
+        st = os.stat(EXE)
+        out.append(f"game built: {nom} {st.st_size / 1e6:.0f} MB, "
                    f"{datetime.datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M}")
     else:
-        out.append("game built: no (recomp_main.exe missing)")
+        out.append(f"game built: no ({nom} missing)")
     marques = os.path.join(FULL, ".preparation")
     if os.path.isdir(marques):
         faites = []
@@ -423,11 +459,11 @@ def main():
     joints = [(c, n) for c, n in JOURNAUX if os.path.exists(c)]
     run = os.path.join(FULL, "recomp_run.log")
     r = [f"SpaceAnimalsRecomp bug report, {maintenant:%Y-%m-%d %H:%M}", "",
-         f"Version: {version()}",
-         f"Windows: {windows()}",
-         f"CPU: {processeur()}",
-         f"Memory: {memoire()}"]
-    r += [f"GPU: {x}" for x in gpus()]
+         f"Version: {version()}"]
+    if LINUX:
+        r += [f"System: {linux()}"] + [f"GPU: {x}" for x in gpus_linux()]
+    else:
+        r += [f"Windows: {windows()}", f"CPU: {processeur()}", f"Memory: {memoire()}"] + [f"GPU: {x}" for x in gpus()]
     r += [f"Vulkan (last game): {x.split('] ', 2)[-1]}" for x in lignes_journal(run, ("[vk    ] GPU:", "[vk    ] display ", "[vk    ] pipelines:"))]
     r += [f"Install folder: {dossier_installation()}", f"Game copy: {description_copie(chemins_copie)}", ""]
     r += ["Build:"] + [f"  {x}" for x in etat_construction()]
