@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <setjmp.h>
 #include <ucontext.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -136,10 +137,19 @@ struct PlatFibre {
     void* arg = nullptr;
 };
 inline thread_local PlatFibre* t_plat_fibre = nullptr;
+// Fin d'un fil depuis n'importe quelle profondeur (svc ExitThread, fonction de fibre qui revient) : retour par longjmp
+// au point de départ du fil (kernel.cpp), comme _endthreadex sous Windows, qui ne déroule pas la pile non plus.
+// pthread_exit déroulerait la pile (exception de fin forcée de la glibc) à travers le code recompilé et les piles des
+// fibres, et sautait à une adresse de pile (2026-11-15, WSL : plantage au premier ExitThread d'un fil du jeu).
+inline thread_local jmp_buf* t_plat_sortie = nullptr;
+[[noreturn]] inline void plat_fin_fil() {
+    if (t_plat_sortie) longjmp(*t_plat_sortie, 1);
+    pthread_exit(nullptr);   // (fil qui n'a pas de point de sortie : ne devrait pas arriver)
+}
 inline void plat_fibre_depart(unsigned lo, unsigned hi) {
     PlatFibre* f = (PlatFibre*)(((uintptr_t)hi << 32) | lo);
     f->fn(f->arg);
-    pthread_exit(nullptr);   // (Windows : une fonction de fibre qui revient termine le fil)
+    plat_fin_fil();   // (Windows : une fonction de fibre qui revient termine le fil)
 }
 inline bool IsThreadAFiber() { return t_plat_fibre != nullptr; }
 inline void* GetCurrentFiber() { return t_plat_fibre; }

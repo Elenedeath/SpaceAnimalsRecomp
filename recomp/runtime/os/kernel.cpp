@@ -447,7 +447,10 @@ void start_host_thread(KThread* t) {
     pthread_attr_init(&at);
     pthread_attr_setstack(&at, pile, HOST_STACK);
     const int e = pthread_create(&t->host, &at, [](void* p) -> void* {
-        thread_proc(p);
+        jmp_buf sortie;   // svc ExitThread revient ici (plat_fin_fil), sans dérouler la pile
+        t_plat_sortie = &sortie;
+        if (!setjmp(sortie)) thread_proc(p);
+        t_plat_sortie = nullptr;
         return nullptr;
     }, t);
     pthread_attr_destroy(&at);
@@ -761,7 +764,7 @@ static void svc_dispatch_impl(CPUState* ctx, uint32_t imm, uint64_t pc) {
 #ifdef _WIN32
         _endthreadex(0);
 #else
-        pthread_exit(nullptr);
+        plat_fin_fil();
 #endif
         return;
     }

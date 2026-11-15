@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <signal.h>
+#include <cpuid.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <ucontext.h>
@@ -686,7 +687,12 @@ void journal_systeme() {
         while (!version.empty() && (version.back() == '\n' || version.back() == '\r' || version.back() == ' ')) version.pop_back();
     }
 #ifndef _WIN32
-    // Linux : distribution (/etc/os-release), noyau, processeur (/proc/cpuinfo), mémoire (sysinfo)
+    // Linux : distribution (/etc/os-release), noyau, processeur (/proc/cpuinfo), mémoire (sysinfo). AVX2 par CPUID
+    // (__builtin_cpu_supports lit une table que le compiler-rt de zig ne remplit pas : « NO » à tort)
+    const auto avx2 = [] {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        return __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & (1u << 5));
+    };
     std::string os = "Linux", cpu = "?";
     if (FILE* f = fopen("/etc/os-release", "r")) {
         char l[256];
@@ -713,7 +719,7 @@ void journal_systeme() {
     sysinfo(&si);
     HLOG("main", "SpaceAnimalsRecomp %s; %s (kernel %s); %s, %ld threads, AVX2 %s; RAM %.1f GB (%.1f available)",
          version.c_str(), os.c_str(), un.release, cpu.c_str(), sysconf(_SC_NPROCESSORS_ONLN),
-         __builtin_cpu_supports("avx2") ? "yes" : "NO", (double)si.totalram * si.mem_unit / 1073741824.0,
+         avx2() ? "yes" : "NO", (double)si.totalram * si.mem_unit / 1073741824.0,
          memoire_validable_libre_go());
 #else
     const char* nt = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
