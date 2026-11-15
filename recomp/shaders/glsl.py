@@ -1584,8 +1584,10 @@ def en_chaine(body, boucle):
             cur[1].append(l)
     etiquettes = [pc for pc, _ in blocs]
     garde = boucle   # (le compteur `guard` n'est déclaré que pour les shaders qui bouclent)
-    if etiquettes != sorted(etiquettes) or len(set(etiquettes)) != len(etiquettes):
+    ordonnes = etiquettes == sorted(etiquettes) and len(set(etiquettes)) == len(etiquettes)
+    if not ordonnes:
         boucle = True
+    regions, calcule = [], False   # sauts arrière constants (cible, bloc du saut) ; saut calculé
     for pc, corps in blocs:
         for l in corps:
             code = l.split("  //")[0]
@@ -1593,8 +1595,13 @@ def en_chaine(body, boucle):
                 raise Unsupported("break in a block")
             for cible in re.findall(r"\bpc = ([^;]+);", code):   # saut constant vers l'arrière, ou saut calculé
                 cible = cible.strip()
-                if not re.fullmatch(r"\d+u", cible) or int(cible[:-1]) <= pc:
+                if not re.fullmatch(r"\d+u", cible):
+                    boucle = calcule = True
+                elif int(cible[:-1]) <= pc:
                     boucle = True
+                    regions.append([int(cible[:-1]), pc])
+    if boucle and garde and ordonnes and not calcule and not os.environ.get("RECOMP_SHADER_UNE_BOUCLE"):
+        return boucles_structurees(blocs, regions)
     out, ind = [], "  "
     if boucle:
         out.append("  while (true) {")
@@ -1618,6 +1625,68 @@ def en_chaine(body, boucle):
     if boucle:
         out.append("    if (!passe) return;")
         out.append("  }")
+    return out
+
+
+def boucles_structurees(blocs, regions):
+    """Corps de main() quand le shader a des sauts arrière constants, sans saut calculé : seules les boucles bouclent.
+
+    Avant (en_chaine, forme « boucle ») : toute la chaîne des blocs dans un seul `while (true)`, reparcourue à chaque
+    tour d'une boucle du shader (boucle sur les lumières, par exemple) ; le compilateur du pilote voyait une seule
+    boucle couvrant tout le shader. Mesuré sur la vitre du cockpit de l'Arwing (d45f1d93e1b82a39, 6 boucles couvrant les
+    trois quarts du code) : RADV (Steam Deck) estime la latence et le débit à −46 % sous la forme structurée, Mesa Intel
+    −21 % de cycles et −45 % de débordements de registres ; NVIDIA, inchangé (son compilateur retrouvait les boucles).
+
+    Chaque région [cible .. bloc du saut arrière] devient un `while (true)` ; celles qui se chevauchent sans s'emboîter
+    sont réunies, celles de même cible aussi (la plus longue), les autres s'emboîtent. En fin de région, on ressort quand
+    pc n'est plus un bloc de la région : saut vers l'avant au-delà (ou fin du shader, 0xffffffff), ou saut arrière vers
+    une région englobante, qui le reprend à son propre tour. Tout saut arrière est dans une région qui contient sa
+    cible : il ne peut viser un bloc déjà passé hors de toute boucle. Un saut vers l'avant entre au milieu d'une région
+    comme avant (les blocs précédents ne correspondent pas à pc). RECOMP_SHADER_UNE_BOUCLE=1 : forme d'avant."""
+    regions = sorted({(a, b) for a, b in regions})
+    change = True
+    while change:   # chevauchement sans emboîtement, ou même cible : une seule région
+        change = False
+        for i, (a0, a1) in enumerate(regions):
+            for j, (b0, b1) in enumerate(regions):
+                if i != j and (a0 < b0 <= a1 < b1 or (a0 == b0 and a1 <= b1 and i < j)):
+                    regions[i] = (a0, max(a1, b1))
+                    del regions[j]
+                    change = True
+                    break
+            if change:
+                break
+    regions.sort(key=lambda r: (r[0], -r[1]))
+    out, ouvertes = [], []
+
+    def fermer():
+        a, b = ouvertes.pop()
+        ind = "  " + "  " * len(ouvertes)
+        out.append(f"{ind}  if (pc < {a}u || pc > {b}u) break;")
+        out.append(f"{ind}}}")
+
+    for k, (pc, corps) in enumerate(blocs):
+        while ouvertes and pc > ouvertes[-1][1]:
+            fermer()
+        for r in regions:
+            if r[0] == pc:
+                ind = "  " + "  " * len(ouvertes)
+                out.append(f"{ind}while (true) {{   // boucle {r[0]} .. {r[1]}")
+                out.append(f"{ind}  if (++guard > 1000000u) return;")
+                ouvertes.append(r)
+        ind = "  " + "  " * len(ouvertes)
+        out.append(f"{ind}if (pc == {pc}u) do {{")
+        dernier = ""
+        for l in corps:
+            out.append(ind[2:] + re.sub(r"\bcontinue;", "break;", l))
+            code = l.split("  //")[0].strip()
+            if code:
+                dernier = code
+        if not re.fullmatch(r"(pc = [^;]*; )?(continue|return);", dernier):   # le bloc tombait dans le suivant
+            out.append(f"{ind}  pc = {blocs[k + 1][0] if k + 1 < len(blocs) else 0xffffffff}u;")
+        out.append(f"{ind}}} while (false);")
+    while ouvertes:
+        fermer()
     return out
 
 
