@@ -23,8 +23,8 @@
 // Linux : même launcher, l'API Win32 dont il se sert est réalisée sur POSIX et SDL3 (win32_linux.cpp), Direct2D sur
 // cairo (d2d_cairo.h). Les extraits du fond sont en MPEG-1 (lus par pl_mpeg, convertis à la construction du paquet).
 #include "win32_linux.h"
-#define JEU_EXE L"\\recomp_main"
-#define MOTIF_EXTRAITS L"\\extrait_*.mpg"
+#define JEU_EXE L"/recomp_main"
+#define MOTIF_EXTRAITS L"/extrait_*.mpg"
 #endif
 
 #include <atomic>
@@ -34,6 +34,25 @@
 #include <vector>
 
 namespace lz {
+
+// Chemins : le code commun les écrit avec « / » (ch(L"/build/full")) ; ch() rend le séparateur de la plateforme,
+// « \ » sous Windows. Aucun chemin Windows sous Linux, aucun chemin Linux sous Windows (journaux, commandes, textes).
+#ifdef _WIN32
+#define SEP L"\\"
+#define SEP_C L'\\'
+#define SEPARATEURS L"\\/"
+#else
+#define SEP L"/"
+#define SEP_C L'/'
+#define SEPARATEURS L"/"
+#endif
+inline std::wstring ch(std::wstring s) {
+#ifdef _WIN32
+    for (wchar_t& c : s)
+        if (c == L'/') c = L'\\';
+#endif
+    return s;
+}
 
 constexpr float LARGEUR = 1000.f, HAUTEUR = 600.f;   // taille logique de la fenêtre (DIP)
 // Agrandissement de la fenêtre (demande de l'utilisateur, 2026-11-11) : 1200 × 720 sur un écran à 100 %. Le dessin et

@@ -563,7 +563,7 @@ void menu() {
 }
 
 std::wstring nom_fichier(const std::wstring& p) {
-    const size_t k = p.find_last_of(L"\\/");
+    const size_t k = p.find_last_of(SEPARATEURS);
     return k == std::wstring::npos ? p : p.substr(k + 1);
 }
 
@@ -708,12 +708,18 @@ void bouton_contour(float x0, float y0, float x1, float y1, const wchar_t* s, in
     if (actif) zone(D2D1::RectF(x0, y0, x1, y1), id);
 }
 
-// dossier affiché dans une case étroite : « D:\…\SpaceAnimalsRecomp » quand le chemin est long
+// dossier affiché dans une case étroite quand le chemin est long : « D:\…\SpaceAnimalsRecomp » sous Windows,
+// « /…/SpaceAnimalsRecomp » sous Linux
 std::wstring chemin_court(const std::wstring& p) {
     if (p.size() <= 26) return p;
-    const size_t k = p.find_last_of(L'\\');
-    if (k == std::wstring::npos || k < 3) return p;
-    return p.substr(0, 3) + L"…" + p.substr(k);
+#ifdef _WIN32
+    const size_t racine = 3;   // « D:\ »
+#else
+    const size_t racine = 1;   // « / »
+#endif
+    const size_t k = p.find_last_of(SEP_C);
+    if (k == std::wstring::npos || k < racine) return p;
+    return p.substr(0, racine) + L"…" + p.substr(k);
 }
 
 void page_reglages() {
@@ -822,8 +828,16 @@ void page_graphismes() {
     if (GetTickCount64() - dll_t > 1000) {
         dll_t = GetTickCount64();
         dll = false;
-        for (const std::wstring& dossier : {g.jeu, g.jeu + L"\\dlss", g.dossier_exe + L"\\outils\\dlss", g.recomp + L"\\outils\\dlss"})
+        for (const std::wstring& dossier : {g.jeu, g.jeu + ch(L"/dlss"), g.dossier_exe + ch(L"/outils/dlss"), g.recomp + ch(L"/outils/dlss")}) {
+#ifdef _WIN32
             dll = dll || GetFileAttributesW((dossier + L"\\nvngx_dlss.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+            // Linux : libnvidia-ngx-dlss.so.<version> (dlss.cpp, a_le_dlss)
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW((dossier + L"/libnvidia-ngx-dlss.so.*").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) FindClose(h), dll = true;
+#endif
+        }
     }
     if (!possible) {
         libelle(y, "reg_dlss", "reg_dlss_rtx");
@@ -849,9 +863,12 @@ void page_graphismes() {
     if (const ULONGLONG t = GetTickCount64(); !fsr_vu || t - fsr_vu > 1000) {
         fsr_vu = t;
         fsr_dll = false;
+#ifdef _WIN32
         for (const std::wstring& dossier : {g.jeu, g.jeu + L"\\fsr", g.dossier_exe + L"\\outils\\fsr", g.recomp + L"\\outils\\fsr"})
             fsr_dll = fsr_dll || (GetFileAttributesW((dossier + L"\\amd_fidelityfx_loader_vk.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
                                   GetFileAttributesW((dossier + L"\\amd_fidelityfx_upscaler_vk.dll").c_str()) != INVALID_FILE_ATTRIBUTES);
+#endif
+        // (Linux : les bibliothèques FidelityFX d'AMD n'existent que pour Windows, le jeu garde le FSR coupé, fsr.cpp)
     }
     const bool fsr_sert = mode_fsr && mode == 0 && fsr_dll;   // comme le jeu : sans les fichiers d'AMD, render_scale
     if (mode_fsr && mode) libelle(y, "reg_fsr", "reg_fsr_dlss", AMBRE);

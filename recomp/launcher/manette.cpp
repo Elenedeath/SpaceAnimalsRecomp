@@ -73,7 +73,11 @@ bool charger() {
         }
     }
     if (!g_lib) {
+#ifdef _WIN32
         jlog(L"controllers: SDL3.dll not found (outils\\sdl3): buttons changed with the arrows only");
+#else
+        jlog(L"controllers: SDL3 functions not found in the launcher: buttons changed with the arrows only");
+#endif
         return false;
     }
     bool ok = true;
@@ -101,7 +105,11 @@ bool charger() {
     sdl::Quit = [] { quitter_sous_systeme(sdl::INIT_GAMEPAD); };
 #endif
     if (!ok || sdl::GetVersion() / 1000000 != 3) {
+#ifdef _WIN32
         jlog(L"controllers: SDL3.dll not usable (missing functions or not version 3)");
+#else
+        jlog(L"controllers: SDL3 not usable (missing functions or not version 3)");
+#endif
         FreeLibrary(g_lib);
         g_lib = nullptr;
         return false;

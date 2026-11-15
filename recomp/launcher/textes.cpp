@@ -97,7 +97,11 @@ const Texte TEXTES[] = {
     {"reg_dlss_exp", L"mise à l'échelle expérimentale", L"experimental upscaling"},
     {"reg_dlss_rtx", L"cartes NVIDIA RTX seulement", L"NVIDIA RTX cards only"},
     {"dlss_indispo", L"Indisponible", L"Unavailable"},
+#ifdef _WIN32
     {"reg_dlss_manque", L"nvngx_dlss.dll manque à côté du jeu", L"nvngx_dlss.dll missing next to the game"},
+#else
+    {"reg_dlss_manque", L"libnvidia-ngx-dlss.so manque (outils/dlss)", L"libnvidia-ngx-dlss.so missing (outils/dlss)"},
+#endif
     {"dlss_non", L"Désactivé", L"Off"},
     {"dlss_dlaa", L"DLAA (natif)", L"DLAA (native)"},
     {"dlss_qualite", L"Qualité (67 %)", L"Quality (67%)"},
@@ -113,13 +117,18 @@ const Texte TEXTES[] = {
     {"reg_fsr", L"FSR (AMD)", L"FSR (AMD)"},
     {"reg_fsr_aide", L"toute carte, remplace l'anticrénelage", L"any card, replaces anti-aliasing"},
     {"reg_fsr_dlss", L"sans effet : le DLSS passe devant", L"no effect: DLSS takes priority"},
+#ifdef _WIN32
     {"reg_fsr_manque", L"fichiers d'AMD absents (outils\\fsr)", L"AMD's files missing (outils\\fsr)"},
+#else
+    {"reg_fsr_manque", L"indisponible sous Linux (AMD : Windows seulement)", L"unavailable on Linux (AMD: Windows only)"},
+#endif
     {"fsr_natif", L"Natif (100 %)", L"Native (100%)"},
     {"fsr_equilibre", L"Équilibré (59 %)", L"Balanced (59%)"},
     {"reg_fsr_version", L"Version FSR", L"FSR version"},
     {"reg_fsr_version_aide", L"auto : FSR 4 si la carte le propose", L"auto: FSR 4 if the card offers it"},
     {"rendu_fsr", L"%d %% (mode FSR)", L"%d%% (FSR mode)"},
     {"reg_natif_fsr", L"expérimental : agrandi par le FSR", L"experimental: enlarged by FSR"},
+#ifdef _WIN32
     {"gra_note", L"Le DLSS et le FSR remplacent l'anticrénelage du jeu. Le DLSS n'est proposé qu'avec une carte NVIDIA RTX "
                  L"(et nvngx_dlss.dll à côté du jeu) ; le FSR d'AMD marche sur toute carte : FSR 4 sur les cartes AMD qui "
                  L"le proposent, FSR 3.1 sur les autres. Les mises à l'échelle sont expérimentales (Qualité à Ultra perf., "
@@ -129,6 +138,17 @@ const Texte TEXTES[] = {
      L"next to the game); AMD FSR works on any card: FSR 4 on the AMD cards that offer it, FSR 3.1 on the others. "
      L"Upscaling options are experimental (Quality to Ultra Perf., 3D rendering below 100%): 3D is rendered smaller "
      L"then enlarged. Changing the graphics card redoes the shader preparation. Applies at the next game launch."},
+#else
+    {"gra_note", L"Le DLSS remplace l'anticrénelage du jeu. Il n'est proposé qu'avec une carte NVIDIA RTX "
+                 L"(et libnvidia-ngx-dlss.so dans outils/dlss) ; le FSR d'AMD n'existe que sous Windows. Les mises à "
+                 L"l'échelle sont expérimentales (Qualité à Ultra perf., Rendu 3D sous 100 %) : la 3D est rendue plus "
+                 L"petite puis agrandie. Changer de carte graphique refait la préparation des shaders. Valable au "
+                 L"prochain lancement du jeu.",
+     L"DLSS replaces the game's anti-aliasing. It is only offered with an NVIDIA RTX card (and libnvidia-ngx-dlss.so "
+     L"in outils/dlss); AMD FSR exists on Windows only. Upscaling options are experimental (Quality to Ultra Perf., "
+     L"3D rendering below 100%): 3D is rendered smaller then enlarged. Changing the graphics card redoes the shader "
+     L"preparation. Applies at the next game launch."},
+#endif
     {"reg_aff", L"Affichage", L"Display"},
     {"sans_bordure", L"Plein écran", L"Full screen"},
     {"fenetre", L"Fenêtré", L"Windowed"},
@@ -189,10 +209,17 @@ const Texte TEXTES[] = {
                    L"le faire ; s'il était pris, ils échangent. ‹ › : autres entrées. Valable au prochain lancement.",
      L"No controller connected: click a button (drawing or list), then the one on the drawing that should do it; if it "
      L"was in use, they swap. ‹ ›: other inputs. Applies at the next game launch."},
+#ifdef _WIN32
     {"pad_sans_sdl", L"SDL3 manque (outils\\sdl3) : manettes Xbox seulement. Cliquez sur un bouton (dessin ou liste), "
                      L"puis sur celui du dessin qui doit le faire. ‹ › : autres entrées.",
      L"SDL3 missing (outils\\sdl3): Xbox controllers only. Click a button (drawing or list), then the one on the "
      L"drawing that should do it. ‹ ›: other inputs."},
+#else
+    {"pad_sans_sdl", L"SDL3 indisponible : manettes Xbox seulement. Cliquez sur un bouton (dessin ou liste), "
+                     L"puis sur celui du dessin qui doit le faire. ‹ › : autres entrées.",
+     L"SDL3 unavailable: Xbox controllers only. Click a button (drawing or list), then the one on the "
+     L"drawing that should do it. ‹ ›: other inputs."},
+#endif
     {"pad_note", L"Cliquez sur un bouton (dessin ou liste), puis appuyez sur celui de la manette qui doit le faire, ou "
                  L"cliquez-le sur le dessin ; s'il était pris, ils échangent. ‹ › : autres entrées. Valable au prochain "
                  L"lancement.",

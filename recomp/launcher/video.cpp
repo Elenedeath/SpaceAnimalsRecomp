@@ -158,7 +158,7 @@ void boucle(std::wstring dossier) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((dossier + MOTIF_EXTRAITS).c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
-        do extraits.push_back(dossier + L"\\" + fd.cFileName);
+        do extraits.push_back(dossier + SEP + fd.cFileName);
         while (FindNextFileW(h, &fd));
         FindClose(h);
     }

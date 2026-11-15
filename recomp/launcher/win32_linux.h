@@ -3,8 +3,9 @@
 // SDL dont les événements deviennent les messages de la procédure de fenêtre (WM_MOUSEMOVE, WM_KEYDOWN…), les
 // processus sont lancés par fork/exec, lanceur.ini est lu et écrit comme par GetPrivateProfileString.
 //
-// Chemins : le launcher les compose avec « \ » (g.recomp + L"\\build\\full"…). Toute fonction de fichier ou de
-// processus d'ici change « \ » en « / » : un nom de fichier Linux peut contenir « \ », mais aucun de ceux du jeu.
+// Chemins : le launcher les compose avec le séparateur de la plateforme (ch(), SEP : lanceur.h), donc « / » ici.
+// Par sécurité, toute fonction de fichier ou de processus d'ici change encore un « \ » égaré en « / » : un nom de
+// fichier Linux peut contenir « \ », mais aucun de ceux du jeu.
 #pragma once
 #ifdef _WIN32
 #error "win32_linux.h : Linux seulement"

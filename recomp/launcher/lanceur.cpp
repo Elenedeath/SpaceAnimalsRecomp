@@ -64,15 +64,15 @@ void jlog(const wchar_t* fmt, ...) {
     b[2047] = 0;
     std::lock_guard<std::mutex> l(g_jl_lk);
     if (g.dossier_exe.empty()) return;
-    const std::wstring p = g.dossier_exe + L"\\lanceur.log";
+    const std::wstring p = g.dossier_exe + ch(L"/lanceur.log");
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > (1u << 20))
-        MoveFileExW(p.c_str(), (g.dossier_exe + L"\\lanceur_precedent.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+        MoveFileExW(p.c_str(), (g.dossier_exe + ch(L"/lanceur_precedent.log")).c_str(), MOVEFILE_REPLACE_EXISTING);
     FILE* f = _wfopen(p.c_str(), L"ab");
     if (!f) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
-    // Chemin du profil Windows (le dossier personnel, qui porte le nom d'utilisateur) remplacé par %USERPROFILE% :
+    // Dossier personnel (il porte le nom d'utilisateur) remplacé par %USERPROFILE% sous Windows, par ~ sous Linux :
     // un lanceur.log joint à la main à une
     // issue publique ne donne plus le nom d'utilisateur (le jeu fait de même, host_main.cpp ; le rapport de bug
     // l'anonymisait déjà). LANCEUR_LOG_PATHS=1 : chemins laissés tels quels.
@@ -88,8 +88,13 @@ void jlog(const wchar_t* fmt, ...) {
     if (!profil.empty())
         for (size_t i = 0; i + profil.size() <= ligne.size();) {
             if (!_wcsnicmp(ligne.c_str() + i, profil.c_str(), profil.size())) {
-                ligne.replace(i, profil.size(), L"%USERPROFILE%");
-                i += 13;
+#ifdef _WIN32
+                static const std::wstring jeton = L"%USERPROFILE%";
+#else
+                static const std::wstring jeton = L"~";
+#endif
+                ligne.replace(i, profil.size(), jeton);
+                i += jeton.size();
             } else {
                 i++;
             }
@@ -114,7 +119,7 @@ const wchar_t* CLASSE = LANCEUR_CLASSE;
 
 bool existe(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 std::wstring parent(const std::wstring& p) {
-    const size_t k = p.find_last_of(L"\\/");
+    const size_t k = p.find_last_of(SEPARATEURS);
     return k == std::wstring::npos ? p : p.substr(0, k);
 }
 std::wstring absolu(const std::wstring& p) {
@@ -138,24 +143,24 @@ void chemins() {
     wchar_t b[2048];
     GetModuleFileNameW(nullptr, b, 2048);
     g.dossier_exe = parent(b);
-    for (const wchar_t* rel : {L"", L"\\recomp", L"\\..", L"\\..\\.."}) {
+    for (const std::wstring& rel : {std::wstring(), ch(L"/recomp"), ch(L"/.."), ch(L"/../..")}) {
         const std::wstring c = absolu(g.dossier_exe + rel);
-        if (existe(c + L"\\fullbuild.py")) {
+        if (existe(c + ch(L"/fullbuild.py"))) {
             g.recomp = c;
             break;
         }
     }
     if (g.recomp.empty()) g.recomp = g.dossier_exe;
     // paquet installé (lanceur.exe à la racine, recomp/ à côté) : il se met à jour depuis les releases GitHub
-    g.paquet = existe(g.dossier_exe + L"\\recomp\\fullbuild.py") && existe(g.dossier_exe + L"\\recomp\\launcher\\maj.py");
+    g.paquet = existe(g.dossier_exe + ch(L"/recomp/fullbuild.py")) && existe(g.dossier_exe + ch(L"/recomp/launcher/maj.py"));
 #ifndef _WIN32
     // Linux : l'AppImage se met à jour en remplaçant le fichier ; pas de mise à jour, de déplacement ni de
     // désinstallation par le launcher (maj.py, deplacer.py et desinstaller.py visent le paquet Windows)
     g.paquet = false;
 #endif
-    g.sources = existe(g.recomp + L"\\launcher\\lanceur.cpp");   // dossier de développement : jamais déplacé
+    g.sources = existe(g.recomp + ch(L"/launcher/lanceur.cpp"));   // dossier de développement : jamais déplacé
     g.version = VERSION;
-    if (FILE* f = _wfopen((g.recomp + L"\\VERSION").c_str(), L"rb")) {
+    if (FILE* f = _wfopen((g.recomp + ch(L"/VERSION")).c_str(), L"rb")) {
         char b[64] = {};
         if (fgets(b, sizeof b, f)) {
             std::string v = b;
@@ -164,20 +169,20 @@ void chemins() {
         }
         fclose(f);
     }
-    g.jeu = g.recomp + L"\\build\\full";
-    g.extraits = g.recomp + L"\\launcher\\extraits";
-    g.ini = g.dossier_exe + L"\\lanceur.ini";
+    g.jeu = g.recomp + ch(L"/build/full");
+    g.extraits = g.recomp + ch(L"/launcher/extraits");
+    g.ini = g.dossier_exe + ch(L"/lanceur.ini");
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     g.fils_max = std::max<int>(1, (int)si.dwNumberOfProcessors);
 }
 
 void detecter_jeu() {
-    g.jeu_pret = existe(g.jeu + JEU_EXE) && existe(g.jeu + L"\\manifest.txt") &&
-                 compter(g.jeu + L"\\shader_cache\\*.spv") > 1000;
+    g.jeu_pret = existe(g.jeu + JEU_EXE) && existe(g.jeu + ch(L"/manifest.txt")) &&
+                 compter(g.jeu + ch(L"/shader_cache/*.spv")) > 1000;
     // version des sources qui a construit le jeu (notée par preparer.py) : autre que l'actuelle après une mise à jour
     std::string v;
-    if (FILE* f = _wfopen((g.jeu + L"\\.preparation\\version.ok").c_str(), L"rb")) {
+    if (FILE* f = _wfopen((g.jeu + ch(L"/.preparation/version.ok")).c_str(), L"rb")) {
         char b[64] = {};
         if (fgets(b, sizeof b, f)) v = b;
         fclose(f);
@@ -264,7 +269,7 @@ void config_lire() {
     if (!ancien.empty() && _wcsicmp(ancien.c_str(), g.dossier_exe.c_str()) != 0) {
         jlog(L"install folder changed since the last start");
         if (g.copie.size() > ancien.size() + 1 && !_wcsnicmp(g.copie.c_str(), ancien.c_str(), ancien.size()) &&
-            g.copie[ancien.size()] == L'\\' && !existe(g.copie) && existe(g.dossier_exe + g.copie.substr(ancien.size()))) {
+            g.copie[ancien.size()] == SEP_C && !existe(g.copie) && existe(g.dossier_exe + g.copie.substr(ancien.size()))) {
             g.copie = g.dossier_exe + g.copie.substr(ancien.size());
             ini_ecrire(L"copie", g.copie);
         }
@@ -293,10 +298,10 @@ void copie_trouver() {
     // sinon : une copie posée dans le dossier du projet, ou à côté du launcher
     for (const std::wstring& d : {parent(g.recomp), g.dossier_exe}) {
         WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW((d + L"\\*.nup").c_str(), &fd);
+        HANDLE h = FindFirstFileW((d + ch(L"/*.nup")).c_str(), &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         FindClose(h);
-        g.copie = d + L"\\" + fd.cFileName;
+        g.copie = d + SEP + fd.cFileName;
         g.copie_ok = verifier_copie(g.copie, g.copie_message);
         if (g.copie_ok) config_ecrire();
         return;
@@ -321,7 +326,11 @@ void cartes_lister() {
     std::vector<Carte> l;
     int ecartees = 0;   // cartes pas proposées (voir plus bas)
     const ULONGLONG t0 = GetTickCount64();
+#ifdef _WIN32
     if (HMODULE lib = LoadLibraryW(L"vulkan-1.dll")) {
+#else
+    if (HMODULE lib = LoadLibraryW(L"libvulkan.so.1")) {
+#endif
         const auto gipa = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(lib, "vkGetInstanceProcAddr");
         const auto creer = gipa ? (PFN_vkCreateInstance)gipa(nullptr, "vkCreateInstance") : nullptr;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -424,7 +433,7 @@ std::wstring nom_carte(const std::string& nom) {
 namespace {
 
 // ---------------------------------------------------------------- recomp.ini du jeu
-std::wstring recomp_ini() { return g.jeu + L"\\recomp.ini"; }
+std::wstring recomp_ini() { return g.jeu + ch(L"/recomp.ini"); }
 
 std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
@@ -798,7 +807,7 @@ std::wstring trouver_python(bool& lanceur_py) {
     wchar_t b0[2048];
     if (SearchPathW(nullptr, L"python3", nullptr, 2048, b0, nullptr)) return b0;
     return {};
-#endif
+#else
     for (const std::wstring& base : {parent(g.recomp) + L"\\outils", g.recomp + L"\\outils"}) {   // paquet, puis développement
         const std::wstring fourni = base + L"\\python\\python.exe";
         if (existe(fourni)) return fourni;
@@ -814,6 +823,7 @@ std::wstring trouver_python(bool& lanceur_py) {
         return b;
     }
     return {};
+#endif
 }
 
 FILE* g_journal = nullptr;
@@ -972,21 +982,21 @@ void lancer_construction(bool forcer) {
     if (!g.copie_ok) return echec(T("pas_de_copie"));
     // LANCEUR_PREPARER : autre script de construction (vérification de l'interface)
     const wchar_t* autre = _wgetenv(L"LANCEUR_PREPARER");
-    std::wstring cmd = commande_python(autre ? std::wstring(autre) : g.recomp + L"\\launcher\\preparer.py");
+    std::wstring cmd = commande_python(autre ? std::wstring(autre) : g.recomp + ch(L"/launcher/preparer.py"));
     if (cmd.empty()) return echec(T("pas_de_python"));
     cmd += L" --copie \"" + g.copie + L"\" --fils " + std::to_wstring(fils_effectifs());
     if (forcer) cmd += L" --forcer";
     SHCreateDirectoryExW(nullptr, g.jeu.c_str(), nullptr);
     // compilation en priorité basse : le PC reste utilisable
     jlog(L"build: %ls", cmd.c_str());
-    lancer_tache(Tache::Construction, cmd, g.recomp, g.jeu + L"\\preparation.log", BELOW_NORMAL_PRIORITY_CLASS);
+    lancer_tache(Tache::Construction, cmd, g.recomp, g.jeu + ch(L"/preparation.log"), BELOW_NORMAL_PRIORITY_CLASS);
 }
 
 // ---------------------------------------------------------------- mises à jour (releases GitHub, recomp/launcher/maj.py)
 // Au démarrage : maj.py --verifier interroge la dernière release ; une version plus récente s'affiche en haut.
 void verifier_mises_a_jour() {
     if (!g.paquet || !g.maj_auto) return;
-    const std::wstring cmd0 = commande_python(g.recomp + L"\\launcher\\maj.py");
+    const std::wstring cmd0 = commande_python(g.recomp + ch(L"/launcher/maj.py"));
     if (cmd0.empty()) return;
     std::thread([cmd = cmd0 + L" --verifier --racine \"" + g.dossier_exe + L"\""]() mutable {
         SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
@@ -1028,7 +1038,7 @@ void verifier_mises_a_jour() {
 // reconstruction l'impose donc toujours, même sans changement de numéro de version.
 void verifier_reconstruction() {
     if (!g.jeu_pret || !g.copie_ok || g.copie.empty()) return;
-    const std::wstring cmd0 = commande_python(g.recomp + L"\\launcher\\preparer.py");
+    const std::wstring cmd0 = commande_python(g.recomp + ch(L"/launcher/preparer.py"));
     if (cmd0.empty()) return;
     std::thread([cmd = cmd0 + L" --copie \"" + g.copie + L"\" --a-refaire"]() mutable {
         SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
@@ -1105,7 +1115,7 @@ void desinstaller() {
     if (MessageBoxW(g.hwnd, T("desinst_question"), NOM, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     const bool sauvegardes =
         MessageBoxW(g.hwnd, T("desinst_sauvegardes"), NOM, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
-    std::wstring cmd = commande_python(g.recomp + L"\\launcher\\desinstaller.py");
+    std::wstring cmd = commande_python(g.recomp + ch(L"/launcher/desinstaller.py"));
     if (cmd.empty()) {
         g.statut_jeu = T("pas_de_python");
         return;
@@ -1132,17 +1142,17 @@ void desinstaller() {
 
 void lancer_mise_a_jour() {
     if (g.cons.active || g.jeu_lance) return;
-    const std::wstring cmd = commande_python(g.recomp + L"\\launcher\\maj.py");
+    const std::wstring cmd = commande_python(g.recomp + ch(L"/launcher/maj.py"));
     if (cmd.empty()) return;
     jlog(L"update: installing %ls", g.maj.c_str());
     lancer_tache(Tache::MiseAJour, cmd + L" --installer --racine \"" + g.dossier_exe + L"\"", g.dossier_exe,
-                 g.dossier_exe + L"\\mise_a_jour.log", NORMAL_PRIORITY_CLASS);
+                 g.dossier_exe + ch(L"/mise_a_jour.log"), NORMAL_PRIORITY_CLASS);
 }
 
 // mise à jour téléchargée et vérifiée : maj.py --finir attend la fermeture du launcher, installe les fichiers puis le
 // relance (lanceur.exe ne peut pas être remplacé tant qu'il tourne)
 void finir_mise_a_jour() {
-    std::wstring cmd = commande_python(g.recomp + L"\\launcher\\maj.py");
+    std::wstring cmd = commande_python(g.recomp + ch(L"/launcher/maj.py"));
     if (cmd.empty()) return;
     cmd += L" --finir --pid " + std::to_wstring(GetCurrentProcessId()) + L" --racine \"" + g.dossier_exe + L"\"";
     STARTUPINFOW si{};
@@ -1167,9 +1177,13 @@ void finir_mise_a_jour() {
 // argument entre guillemets : des barres obliques inverses finales (« D:\ ») sont doublées, sinon la dernière
 // échapperait le guillemet fermant
 std::wstring entre_guillemets(const std::wstring& p) {
+#ifdef _WIN32
     size_t n = 0;
     while (n < p.size() && p[p.size() - 1 - n] == L'\\') n++;
     return L"\"" + p + std::wstring(n, L'\\') + L"\"";
+#else
+    return L"\"" + p + L"\"";
+#endif
 }
 
 // lance une commande sans fenêtre et rend sa sortie (vide si elle n'a pas démarré)
@@ -1227,7 +1241,7 @@ bool lancer_detache(std::wstring cmd) {
 // qu'un dossier qui porte sa marque, jamais celui d'où il tourne)
 void abandonner_deplacement() {
     if (g.dep_vers.empty()) return;
-    const std::wstring cmd = commande_python(g.recomp + L"\\launcher\\deplacer.py");
+    const std::wstring cmd = commande_python(g.recomp + ch(L"/launcher/deplacer.py"));
     if (!cmd.empty()) lancer_detache(cmd + L" --abandonner --vers " + entre_guillemets(g.dep_vers));
     ini_ecrire(L"deplacement_vers", L"");
     g.dep_vers.clear();
@@ -1280,7 +1294,7 @@ void deplacer() {
 #endif
     }
     if (choix.empty() || g.cons.active || g.jeu_lance) return;
-    const std::wstring script = commande_python(g.recomp + L"\\launcher\\deplacer.py");
+    const std::wstring script = commande_python(g.recomp + ch(L"/launcher/deplacer.py"));
     if (script.empty()) {
         g.statut_jeu = T("pas_de_python");
         return;
@@ -1307,7 +1321,7 @@ void deplacer() {
     jlog(L"move requested (%ls)", autre ? L"other drive: copy, then the old folder is deleted" : L"same drive: the folder is renamed");
     g.page = Page::Construction;
     lancer_tache(Tache::Deplacement, base + L" --copier --vers " + entre_guillemets(dest), g.dossier_exe,
-                 g.dossier_exe + L"\\deplacement.log", NORMAL_PRIORITY_CLASS);
+                 g.dossier_exe + ch(L"/deplacement.log"), NORMAL_PRIORITY_CLASS);
 }
 
 // Copie faite (ou rien à copier) : deplacer.py --finir attend la fermeture du launcher, renomme le dossier ou supprime
@@ -1321,7 +1335,7 @@ void finir_deplacement() {
 #endif
     std::wstring cmd;
     if (g.dep_autre_volume && existe(python) && existe(script)) cmd = L"\"" + python + L"\" -u -X utf8 \"" + script + L"\"";
-    else cmd = commande_python(g.recomp + L"\\launcher\\deplacer.py");
+    else cmd = commande_python(g.recomp + ch(L"/launcher/deplacer.py"));
     if (!cmd.empty())
         cmd += L" --finir --pid " + std::to_wstring(GetCurrentProcessId()) + L" --racine " + entre_guillemets(g.dossier_exe) +
                L" --vers " + entre_guillemets(g.dep_vers);
@@ -1378,8 +1392,8 @@ void lancer_jeu() {
     const std::wstring exe = g.jeu + JEU_EXE;
     std::wstring cmd = L"\"" + exe + L"\"";
     // le jeu réécrit recomp_run.log : le journal de la partie précédente est gardé à côté
-    const std::wstring journal = g.jeu + L"\\recomp_run.log";
-    if (existe(journal)) MoveFileExW(journal.c_str(), (g.jeu + L"\\recomp_run_precedent.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+    const std::wstring journal = g.jeu + ch(L"/recomp_run.log");
+    if (existe(journal)) MoveFileExW(journal.c_str(), (g.jeu + ch(L"/recomp_run_precedent.log")).c_str(), MOVEFILE_REPLACE_EXISTING);
     // la copie choisie : le jeu la reprend si le manifeste pointe vers un ancien emplacement (dossier déplacé, issue n° 4)
     if (!g.copie.empty() && existe(g.copie)) SetEnvironmentVariableW(L"RECOMP_NUP", g.copie.c_str());
     // environnement : celui du launcher, plus le volume choisi
@@ -1400,7 +1414,7 @@ void lancer_jeu() {
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, env.empty() ? nullptr : env.data(),
                         g.jeu.c_str(), &si, &pi)) {
-        g.statut_jeu = L"recomp_main.exe : erreur " + std::to_wstring(GetLastError());
+        g.statut_jeu = std::wstring(&JEU_EXE[1]) + L" : erreur " + std::to_wstring(GetLastError());
         jlog(L"game: cannot start (error %lu)", GetLastError());
         return;
     }
@@ -1553,7 +1567,7 @@ template <class T> void cycler(T& v, std::initializer_list<T> valeurs, int sens)
 // <racine>\SpaceAnimalsRecomp-bug-report.zip ; l'Explorateur s'ouvre ensuite sur ce fichier.
 void rapport_de_bug() {
     if (g.rapport_en_cours) return;
-    std::wstring cmd = commande_python(g.recomp + L"\\launcher\\rapport.py");
+    std::wstring cmd = commande_python(g.recomp + ch(L"/launcher/rapport.py"));
     if (cmd.empty()) {
         g.statut_jeu = T("pas_de_python");
         return;
@@ -1719,7 +1733,7 @@ void action(int z) {
     case Z_FILS_D: g.fils = (g.fils + (z == Z_FILS_D ? 1 : -1) + g.fils_max + 1) % (g.fils_max + 1); config_ecrire(); return;
     case Z_RECONSTRUIRE: lancer_construction(true); return;
     case Z_ANNULER: annuler_construction(); return;
-    case Z_JOURNAL: ShellExecuteW(g.hwnd, L"open", (g.jeu + L"\\preparation.log").c_str(), nullptr, nullptr, SW_SHOWNORMAL); return;
+    case Z_JOURNAL: ShellExecuteW(g.hwnd, L"open", (g.jeu + ch(L"/preparation.log")).c_str(), nullptr, nullptr, SW_SHOWNORMAL); return;
     case Z_VIB_G:
     case Z_VIB_D: cycler(g.reglages.vibration, {0, 25, 50, 75, 100}, z == Z_VIB_D ? 1 : -1); reglages_ecrire(); return;
     case Z_MENU_RAPPORT: rapport_de_bug(); return;
@@ -1935,8 +1949,13 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (chemin && !chemin->empty()) {
             jlog(L"bug report created");
             g.statut_jeu = std::wstring(T("rapport_ok"));
+#ifdef _WIN32
             // l'Explorateur s'ouvre sur le fichier, sélectionné : il n'y a plus qu'à le glisser dans l'issue
             ShellExecuteW(h, nullptr, L"explorer.exe", (L"/select,\"" + *chemin + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+#else
+            // le gestionnaire de fichiers du bureau s'ouvre sur son dossier (xdg-open)
+            ShellExecuteW(h, nullptr, parent(*chemin).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
         } else {
             g.statut_jeu = std::wstring(T("rapport_echec"));
             jlog(L"bug report: failed");
