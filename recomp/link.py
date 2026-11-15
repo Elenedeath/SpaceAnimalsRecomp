@@ -146,7 +146,16 @@ def main():
         cmd = [cxx, *plateforme.cible_linux(cxx), "-o", part, "@" + rsp, "-lpthread", "-ldl",
                "-Wl,-rpath,$ORIGIN/../../../outils/sdl3/lib:$ORIGIN/../../outils/sdl3/lib"]
         cmd += (["-L" + lib] if lib else []) + ["-lSDL3"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    env = None
+    if plateforme.LINUX:
+        # cache de zig de l'édition de liens (libc++ compilée une fois) : le nôtre, pas ~/.cache/zig de l'utilisateur.
+        # Ici et pas dans l'enveloppe de plateforme.py : plateforme.py fait partie de la signature de l'étape
+        # « recompiler » (preparer.py), et le modifier refait 1 h 30 de recompilation chez le joueur (2026-11-15).
+        c = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+                         "spaceanimalsrecomp-zig", "commun")
+        os.makedirs(c, exist_ok=True)
+        env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=c)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode:
         print(r.stderr[:8000])
         if os.path.exists(part):
