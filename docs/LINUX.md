@@ -43,6 +43,10 @@ Pour le launcher seul : `python3 recomp/launcher/construire.py --sysroot <sysroo
 
 ## Limites connues
 
-- Mise à jour, déplacement et désinstallation depuis le launcher : désactivés (l'AppImage se remplace d'un bloc).
-- Rendu vérifié sous WSLg (llvmpipe) seulement ; RADV (Steam Deck) reste à essayer sur la machine.
+- Mise à jour et déplacement depuis le launcher : désactivés (l'AppImage se remplace d'un bloc). La désinstallation passe
+  par `desinstaller_linux.py` (bouton DÉSINSTALLER).
+- Steam Deck (RADV VANGOGH) : le jeu tourne, 60 img/s à l'écran titre. Dans la cinématique du prologue, le brouillard
+  volumétrique (`volumetric_fog_light.comp`) prend 25 ms par image, 82 % du GPU : le couper (page Graphismes,
+  `volumetric_fog = false`) fait passer de 13-22 à 45-60 img/s. Le reste dépend de la surface couverte par les
+  personnages (shaders de pixels) : rendu 3D à 75 % conseillé.
 - Polices : Barlow (OFL) remplace Bahnschrift, absente de Linux.
