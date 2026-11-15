@@ -19,6 +19,8 @@ Contenu de l'AppImage :
   app/recomp/launcher/extraits/*.mpg   extraits du fond, en MPEG-1 (lu par pl_mpeg), convertis depuis les MP4
   app/polices/           Barlow (licence OFL), à la place de Bahnschrift
   app/lib/               libSDL3.so.0 (racine système), trouvée par le launcher à côté de lui (RUNPATH $ORIGIN/lib)
+  app/lib/libdecor/      module cairo de libdecor (racine système, licence MIT) : barre de titre du jeu fenêtré sous
+                         GNOME (AppRun : LIBDECOR_PLUGIN_DIR)
   outils/                Python, zig, glslang (outils.py), SDL3 (racine système)
 
 Bibliothèques : seule SDL3 est fournie. cairo, pango, glib, fontconfig, freetype, harfbuzz, X11… sont celles du
@@ -67,6 +69,31 @@ POLICES = list(POLICES_SHA256)
 # X11, Wayland et le son du bureau. Rien qui charge des modules du système
 # ou lise sa configuration : ces bibliothèques-là doivent être celles du système.
 FOURNIES = {"libSDL3.so.0"}
+# libdecor (module cairo, app/lib/libdecor) : licence MIT, https://gitlab.freedesktop.org/libdecor/libdecor (0.2.2,
+# version de la racine système), texte posé à côté du module
+LIBDECOR_LICENCE = """libdecor-cairo.so: libdecor 0.2.2 (Steam Runtime 3 "sniper" SDK), cairo plugin, unmodified
+source: https://gitlab.freedesktop.org/libdecor/libdecor/-/archive/0.2.2/libdecor-0.2.2.tar.gz
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
 # Prises chez le joueur : la glibc et libstdc++/libgcc_s (celles de tout bureau sont plus récentes que celles de la
 # racine système), et la pile graphique du launcher (SteamOS a GTK 3, donc toutes ; tout bureau aussi).
 SYSTEME = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "ld-linux-x86-64.so.2",
@@ -113,6 +140,10 @@ if [ -n "${APPIMAGE:-}" ]; then
         if cmp -s "$entree.new" "$entree"; then rm -f "$entree.new"; else mv -f "$entree.new" "$entree"; fi
     } 2>/dev/null || true
 fi
+# libdecor (barre de titre du jeu fenêtré sous GNOME, Wayland) : notre module cairo plutôt que le module GTK du
+# système. Le module GTK charge GTK dans le jeu, et avec le pilote NVIDIA la fenêtre restait grise (image Vulkan jamais
+# montrée, 2026-11-15, Ubuntu 26.04) ; le module cairo ne dessine qu'un cadre (cairo, pango). Valeur du joueur gardée.
+export LIBDECOR_PLUGIN_DIR="${LIBDECOR_PLUGIN_DIR:-$home/lib/libdecor}"
 # bibliothèques : celles du système, sauf SDL3 (app/lib/, trouvée par le launcher à côté de lui) ; LD_LIBRARY_PATH
 # n'est pas touché, les programmes du système lancés par le launcher (xdg-open, zenity) gardent les leurs
 exec "$home/lanceur" "$@"
@@ -176,7 +207,16 @@ def fournir_libs(sr, exe, lib):
         src = trouver_lib(sr, n)
         shutil.copy2(src, os.path.join(lib, n))
         a_faire += besoins(src)
-    dire("bibliothèques fournies : " + " ".join(sorted(os.listdir(lib))))
+    # module cairo de libdecor (AppRun : LIBDECOR_PLUGIN_DIR) ; chargé par la libdecor du système, que SDL charge
+    # lui-même : ses dépendances (wayland, cairo, pango, dbus) sont celles de tout bureau Wayland
+    plugin = os.path.join(sr, "usr", "lib", T, "libdecor", "plugins-1", "libdecor-cairo.so")
+    if not os.path.exists(plugin):
+        sys.exit(f"{plugin} : absent de la racine système (module cairo de libdecor)")
+    os.makedirs(os.path.join(lib, "libdecor"), exist_ok=True)
+    shutil.copy2(os.path.realpath(plugin), os.path.join(lib, "libdecor", "libdecor-cairo.so"))
+    with open(os.path.join(lib, "libdecor", "LICENSE.txt"), "w", encoding="utf-8") as f:
+        f.write(LIBDECOR_LICENCE)
+    dire("bibliothèques fournies : " + " ".join(sorted(os.listdir(lib))) + " ; libdecor/libdecor-cairo.so")
 
 
 def icone_png(dest):
