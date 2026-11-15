@@ -590,8 +590,11 @@ void bloc_copie() {
     if (shaders) texte(info, F_CORPS, 44, y + 66, VERT_PALE, 1.f, 0.f, 0, 400);
     // message d'état : sur deux lignes au besoin (l'avertissement de mémoire était coupé à « Fermez d'a… » sur une ligne
     // de 400 px : le joueur ne voyait ni le conseil ni « recliquez pour lancer quand même »)
-    else if (!g.statut_jeu.empty()) texte_lignes(g.statut_jeu, F_CORPS, 44, y + 66, 640, AMBRE);
+    else if (!g.statut_jeu.empty() && !(g.jeu_pret && g.jeu_obsolete)) texte_lignes(g.statut_jeu, F_CORPS, 44, y + 66, 640, AMBRE);
     else if (g.jeu_pret && g.jeu_obsolete) {
+        // (2026-11-15) le lien reste visible quand un message d'état est là (fin de partie, rapport de bug…) : il le
+        // cachait, et le joueur voyait « reconstruction nécessaire » sans moyen de la lancer ; le message prend alors la
+        // place de la précision grise, à droite du lien
         // Reconstruction proposée, jamais imposée : le bouton principal lance le jeu actuel ; ce lien refait les étapes
         // qui ont changé.
         const bool libre = !g.cons.active && !g.jeu_lance;
@@ -599,7 +602,8 @@ void bloc_copie() {
         const float lw = texte(T("jeu_obsolete_aide"), F_CORPS, 44, y + 66, sv ? BLANC : libre ? VERT : GRIS, 1.f, 0.5f);
         if (libre) zone(D2D1::RectF(40, y + 62, 44 + lw + 6, y + 86), Z_MAJ_JEU);
         if (sv) ligne(44, y + 85, 44 + lw, y + 85, BLANC, 0.8f, 1.f);
-        texte(T("jeu_obsolete_detail"), F_CORPS, 44 + lw + 14, y + 66, GRIS, 1.f, 0.f, 0, 330);
+        if (g.statut_jeu.empty()) texte(T("jeu_obsolete_detail"), F_CORPS, 44 + lw + 14, y + 66, GRIS, 1.f, 0.f, 0, 330);
+        else texte(g.statut_jeu, F_CORPS, 44 + lw + 14, y + 66, AMBRE, 1.f, 0.f, 0, 330);
     } else texte(!g.jeu_pret ? T("jeu_absent_aide") : T("jeu_pret_aide"), F_CORPS, 44, y + 66, GRIS, 1.f, 0.f, 0, 400);
 }
 
