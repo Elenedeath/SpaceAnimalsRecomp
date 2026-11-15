@@ -301,8 +301,19 @@ def main():
     dire("polices")
     polices(os.path.join(app, "polices"), cache)
     icone_png(os.path.join(app, "lanceur.png"))
+    # empreinte de tout app/ (chemins et contenus) : AppRun recopie app/ dès qu'un fichier change. Jusqu'au 2026-11-15,
+    # celle du seul launcher : une AppImage qui ne changeait que des scripts Python (build.py, rapport.py) n'était pas
+    # recopiée, et le joueur gardait les anciens.
+    h = hashlib.sha256()
+    for racine, dossiers, fichiers in os.walk(app):
+        dossiers.sort()
+        for n in sorted(fichiers):
+            if racine == app and n == ".paquet":
+                continue
+            p = os.path.join(racine, n)
+            h.update(os.path.relpath(p, app).encode() + b"\0" + paquet.empreinte(p).encode() + b"\n")
     with open(os.path.join(app, ".paquet"), "w") as f:   # change à chaque AppImage : AppRun recopie app/
-        f.write(f"{a.version} {paquet.empreinte(os.path.join(app, 'lanceur'))}\n")
+        f.write(f"{a.version} {h.hexdigest()}\n")
     dire("outils")
     outils(os.path.join(appdir, "outils"), sr, cache)
     dire("bibliothèques")
