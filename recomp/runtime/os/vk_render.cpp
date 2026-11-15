@@ -7669,6 +7669,17 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
             caps.currentExtent.width != UINT32_MAX &&
             (caps.currentExtent.width != g.scext.width || caps.currentExtent.height != g.scext.height))
             g.sc_stale = true;
+#ifndef _WIN32
+        // Wayland : la surface n'a pas de taille (currentExtent vaut UINT32_MAX), c'est la swapchain qui la donne.
+        // Taille de la fenêtre en pixels comparée à celle de la swapchain : sans cela, une fenêtre redimensionnée par
+        // le bureau (cadre libdecor de GNOME, F11, à la main) gardait une swapchain d'une autre taille, et le pilote
+        // NVIDIA n'en montrait rien (fond gris du cadre).
+        else if (caps.currentExtent.width == UINT32_MAX) {
+            int pw = 0, ph = 0;
+            gfx_window_pixels(&pw, &ph);
+            if (pw > 0 && ph > 0 && ((uint32_t)pw != g.scext.width || (uint32_t)ph != g.scext.height)) g.sc_stale = true;
+        }
+#endif
     }
     if (g.sc_stale && g.hwnd) {
         VkSurfaceCapabilitiesKHR caps;

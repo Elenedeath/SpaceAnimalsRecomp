@@ -351,6 +351,22 @@ void creer_fenetre() {   // fil principal
     static const bool cachee = getenv("RECOMP_WINDOW_HIDDEN") != nullptr;
     SDL_WindowFlags f = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (cachee) f |= SDL_WINDOW_HIDDEN;
+    // fenêtré : la fenêtre tient dans la zone utilisable de l'écran, barre de titre comprise, proportions gardées
+    // (comme sous Windows, window_thread). Pour une sortie 3840×2160 elle mesurait 2560×1440, plus que l'écran 1080p :
+    // GNOME la ramenait à la taille de l'écran (on aurait dit du plein écran), et sous Wayland l'image disparaissait.
+    // Tailles en points (l'échelle de l'écran est appliquée par SDL : SDL_WINDOW_HIGH_PIXEL_DENSITY).
+    {
+        SDL_Rect zt{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &zt) && zt.w > 0 && zt.h > 0) {
+            const int cadre_h = 48, marge = 16;   // barre de titre du bureau (libdecor, GNOME) et bords
+            const int mw = zt.w - marge, mh = zt.h - cadre_h - marge;
+            if (mw > 0 && mh > 0 && (g_w > mw || g_h > mh)) {
+                const double r = std::min((double)mw / g_w, (double)mh / g_h);
+                g_w = (int)lround(g_w * r);
+                g_h = (int)lround(g_h * r);
+            }
+        }
+    }
     SDL_Window* w = SDL_CreateWindow("StarFox Remake [recompiled]", g_w, g_h, f);
     if (!w) {
         HLOG("gfx", "SDL_CreateWindow failed: %s", SDL_GetError());
