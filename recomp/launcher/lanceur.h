@@ -73,6 +73,7 @@ enum Zone : int {
     Z_DLSS_G, Z_DLSS_D, Z_DLSSM_G, Z_DLSSM_D,                 // page Graphismes : mode et modèle du DLSS
     Z_FSR_G, Z_FSR_D, Z_FSRV_G, Z_FSRV_D,                     // page Graphismes : mode et version du FSR d'AMD
     Z_GPU_G, Z_GPU_D,                                         // page Graphismes : carte graphique
+    Z_BROUIL_G, Z_BROUIL_D,                                   // page Graphismes (Linux) : brouillard volumétrique
     Z_DEPLACER, Z_RACCOURCI,                                  // page Réglages : emplacement du jeu, raccourci
     Z_ONGLET_CLAVIER, Z_ONGLET_MANETTE, Z_PAD_DEFAUT,         // page Contrôles : onglets, manette par défaut
     Z_PAD0, Z_PAD_FIN = Z_PAD0 + NB_PAD - 1,                  // bouton de la Switch (liste) : attend l'entrée voulue
@@ -112,6 +113,9 @@ struct ReglagesJeu {   // recomp.ini du jeu
     bool sans_bordure = true;   // plein écran sans bordure, sinon fenêtré
     std::string langue = "auto";   // langue du jeu (code de la console), auto = celle de Windows
     int vibration = 100;        // vibrations de la manette, en % (0 : aucune)
+    // brouillard volumétrique du moteur (volumetric_fog, page Graphismes sous Linux) : coupé, la cinématique du prologue
+    // passe de 13-22 à 55-60 img/s sur le Steam Deck
+    bool brouillard = true;
     // touches du clavier par action (scancodes, 0xE0xx : touche étendue ; 0 : aucune) ; par défaut les positions du jeu
     unsigned touches[NB_TOUCHES] = {0x2E, 0x2D, 0x2F, 0x2C, 0x10, 0x12, 0x13, 0x14, 0x32, 0x31, 0x21, 0x23,
                                     0xE048, 0xE050, 0xE04B, 0xE04D, 0x11, 0x1F, 0x1E, 0x20, 0x17, 0x25, 0x24, 0x26};

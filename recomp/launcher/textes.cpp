@@ -74,6 +74,11 @@ const Texte TEXTES[] = {
     {"reg_hz", L"Images par s.", L"Frames per s."},
     {"reg_hz_aide", L"90 et 120 : pas encore stables", L"90 and 120: not yet stable"},
     {"reg_natif", L"Rendu 3D", L"3D rendering"},
+    // brouillard volumétrique (page Graphismes, Linux)
+    {"reg_brouillard", L"Brouillard", L"Fog"},
+    {"reg_brouillard_aide", L"désactivé : bien plus rapide (Steam Deck)", L"off: much faster (Steam Deck)"},
+    {"brouillard_oui", L"Activé", L"On"},
+    {"brouillard_non", L"Désactivé", L"Off"},
     {"natif", L"100 % (natif)", L"100% (native)"},
     // rendu 3D (page Graphismes) : toutes les mises à l'échelle sont dites expérimentales (demande de l'utilisateur)
     {"reg_natif_aide", L"sous 100 % : expérimental, plus rapide", L"below 100%: experimental, faster"},

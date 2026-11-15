@@ -53,6 +53,10 @@ std::vector<std::pair<std::string, std::string>> recomp_cvars() {
     v.push_back({"render.dynres_enabled", "false"});
     v.push_back({"render.dlss_allowed", "false"});   // pas le réseau DLSS de la console
     v.push_back({"render.ndsr_allowed", "false"});   // ni son agrandissement NDSR
+    if (!settings().volumetric_fog) {   // brouillard volumétrique coupé (settings.h, volumetric_fog)
+        v.push_back({"render.volumetric_fog_enabled", "false"});
+        v.push_back({"render.volumetric_fog_handheld_enabled", "false"});
+    }
     return v;
 }
 

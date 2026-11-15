@@ -593,6 +593,7 @@ void reglages_lire() {
         else if (k == "window_mode") g.reglages.sans_bordure = !(v == "windowed" || v == "window" || v == "fenetre");
         else if (k == "language") g.reglages.langue = v.empty() ? "auto" : v;
         else if (k == "vibration") g.reglages.vibration = std::clamp(atoi(v.c_str()), 0, 100);
+        else if (k == "volumetric_fog") g.reglages.brouillard = !(v == "false" || v == "0" || v == "off" || v == "non");
         else if (k.rfind("pad_", 0) == 0) {
             for (int i = 0; i < NB_PAD; i++)
                 if (k == PAD_CLES[i])
@@ -631,6 +632,9 @@ void reglages_ecrire() {
         {"language", g.reglages.langue},
         {"vibration", std::to_string(g.reglages.vibration)},
     };
+#ifndef _WIN32
+    cles.push_back({"volumetric_fog", g.reglages.brouillard ? "true" : "false"});   // page Graphismes (Linux)
+#endif
     if (g.reglages.touches_ecrites)   // touches du clavier : seulement une fois que le joueur en a changé une
         for (int i = 0; i < NB_TOUCHES; i++) {
             char b[16];
@@ -695,6 +699,23 @@ void reglages_ecrire() {
         if (!fait && k == "fsr_version") {   // juste après fsr, qui vient d'être écrit
             auto pos = std::find_if(v.begin(), v.end(), [](const std::string& l) { return trim(l).rfind("fsr =", 0) == 0; });
             v.insert(pos != v.end() ? pos + 1 : v.end(), k + " = " + val);
+            continue;
+        }
+        if (!fait && k == "volumetric_fog") {   // Linux (2026-11-15) : expliqué, avant la section des touches
+            const std::vector<std::string> bloc = {
+                "",
+                "; Brouillard volumétrique du jeu : true ou false. Coupé, les scènes brumeuses (cinématique du prologue)",
+                "; sont bien plus rapides sur les petits GPU (Steam Deck : de 13-22 à 55-60 images par seconde).",
+                "; Volumetric fog: true or false. Off, foggy scenes (prologue cutscene) are much faster on small GPUs",
+                "; (Steam Deck: from 13-22 to 55-60 frames per second).",
+                k + " = " + val};
+            auto pos = std::find_if(v.begin(), v.end(), [](const std::string& l) { return trim(l) == "[keyboard]"; });
+            if (pos != v.end()) {
+                while (pos != v.begin() && trim(*(pos - 1)).empty()) --pos;
+                v.insert(pos, bloc.begin(), bloc.end());
+            } else {
+                v.insert(v.end(), bloc.begin(), bloc.end());
+            }
             continue;
         }
         if (!fait && k == "gpu") {   // apparu après la 1.0.3 : expliqué (comme le jeu le fait, settings.cpp kCleGpu),
@@ -1663,6 +1684,8 @@ void action(int z) {
     case Z_FSR_D: cycler(g.reglages.fsr, {0, 1, 2, 3, 4, 5}, z == Z_FSR_D ? 1 : -1); reglages_ecrire(); return;
     case Z_FSRV_G:
     case Z_FSRV_D: cycler(g.reglages.fsr_version, {0, 4, 3}, z == Z_FSRV_D ? 1 : -1); reglages_ecrire(); return;
+    case Z_BROUIL_G:
+    case Z_BROUIL_D: g.reglages.brouillard = !g.reglages.brouillard; reglages_ecrire(); return;
     case Z_GPU_G:
     case Z_GPU_D: {   // Automatique, puis chaque carte (nom complet dans recomp.ini)
         if (!g.cartes_pretes.load(std::memory_order_acquire) || g.cartes.empty()) return;

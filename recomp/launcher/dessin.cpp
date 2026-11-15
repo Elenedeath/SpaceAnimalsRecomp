@@ -774,7 +774,11 @@ void page_reglages() {
 void page_graphismes() {
     panneau(T("gra_titre"));
     float y = PY0 + 58;
+#ifdef _WIN32
     const float pas = 33;   // neuf réglages depuis le FSR (2026-11-12)
+#else
+    const float pas = 31;   // dix sous Linux : le brouillard volumétrique en plus (2026-11-15)
+#endif
     wchar_t v[64];
     {   // carte graphique : Automatique (la carte que le jeu prendra est nommée), puis chaque carte vue par Vulkan
         const bool pretes = g.cartes_pretes.load(std::memory_order_acquire);
@@ -865,6 +869,11 @@ void page_graphismes() {
     else if (g.reglages.echelle >= 100) swprintf(echelle, 48, L"%ls", T("natif"));
     else swprintf(echelle, 48, L"%d %%", g.reglages.echelle);
     selecteur(y, echelle, Z_NATIF_G, Z_NATIF_D, e_dlss == 0);
+#ifndef _WIN32
+    y += pas;   // brouillard volumétrique (volumetric_fog) : 82 % du GPU du Steam Deck dans les scènes brumeuses
+    libelle(y, "reg_brouillard", "reg_brouillard_aide");
+    selecteur(y, g.reglages.brouillard ? T("brouillard_oui") : T("brouillard_non"), Z_BROUIL_G, Z_BROUIL_D);
+#endif
     y += pas + 6;
     ligne(PX0 + 24, y, PX1 - 24, y, VERT, 0.15f);
     texte_lignes(T("gra_note"), F_PETIT, PX0 + 24, y + 12, PX1 - PX0 - 48, GRIS);

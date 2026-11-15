@@ -85,6 +85,10 @@ struct Settings {
     // textures sautés, caches d'enregistrement et d'appels indirects, attente active entre fils du jeu) : false les
     // coupe toutes d'un coup (comme la 1.0.3), à essayer si un défaut d'image ou un plantage apparaît.
     bool fast_rendering = true;
+    // Brouillard volumétrique du moteur (volumetric_fog, 2026-11-15) : false coupe render.volumetric_fog_enabled et sa
+    // variante portable (recomp_cvars, svc_fs.cpp). Son calcul (volumetric_fog_light.comp) prend 25 ms par image sur
+    // le Steam Deck, 82 % du GPU dans la cinématique du prologue ; coupé, celle-ci passe de 13-22 à 55-60 img/s.
+    bool volumetric_fog = true;
     std::string file;                // fichier de réglages utilisé
 };
 

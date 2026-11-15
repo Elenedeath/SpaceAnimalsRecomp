@@ -309,6 +309,10 @@ void apply(const std::string& key, const std::string& val, const char* src) {
         if (parse_int(v, &n) && n >= 0 && n <= 100) g_settings.vibration = (int)n;
         else if (parse_bool(v, &b)) g_settings.vibration = b ? 100 : 0;
         else HLOG("cfg", "%s: vibration = '%s' invalid (0 to 100): ignored", src, v.c_str());
+    } else if (k == "volumetric_fog") {
+        bool b;
+        if (parse_bool(v, &b)) g_settings.volumetric_fog = b;
+        else HLOG("cfg", "%s: volumetric_fog = '%s' invalid (true or false): ignored", src, v.c_str());
     } else if (k == "memory_saver") {
         bool b;
         if (parse_bool(v, &b)) g_settings.memory_saver = b;
@@ -499,6 +503,7 @@ void settings_init(int argc, char** argv) {
     if (const char* e = getenv("RECOMP_ZERO_PAGE_RELEASE")) apply("zero_page_release", e, "RECOMP_ZERO_PAGE_RELEASE");
     if (const char* e = getenv("RECOMP_COLD_PAGE_RELEASE")) apply("cold_page_release", e, "RECOMP_COLD_PAGE_RELEASE");
     if (const char* e = getenv("RECOMP_FAST_RENDERING")) apply("fast_rendering", e, "RECOMP_FAST_RENDERING");
+    if (const char* e = getenv("RECOMP_VOLUMETRIC_FOG")) apply("volumetric_fog", e, "RECOMP_VOLUMETRIC_FOG");
     for (int i = 1; i + 1 < argc; i++) {
         std::string a = argv[i];
         if (a == "--refresh") apply("refresh_rate", argv[++i], "command line");
@@ -520,6 +525,7 @@ void settings_init(int argc, char** argv) {
          s.refresh_rate, g_src[0], res, g_src[1], echelle, g_src[2],
          s.borderless ? "borderless fullscreen" : "windowed", s.language.c_str(), language_code().c_str(), s.vibration,
          s.file.c_str());
+    if (!s.volumetric_fog) HLOG("cfg", "volumetric fog off");
     if (s.dlss) {
         static const char* const modes[] = {"off", "DLAA", "Quality (67 %)", "Balanced (58 %)", "Performance (50 %)",
                                             "Ultra Performance (33 %)"};
