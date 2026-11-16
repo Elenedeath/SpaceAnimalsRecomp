@@ -381,7 +381,7 @@ python link.py                                   # after modifying the runtime
 | `RECOMP_FRAMES_IN_FLIGHT` | frames waiting to be displayed before acquisition blocks (2 by default) |
 | `RECOMP_NO_VSYNC_EMU=1` | no back-pressure at the virtual vblank (free-running frame rate) |
 | `RECOMP_FH_MODE=9` | empty `ListFrameHistory` (the engine's regulator runs open-loop) |
-| `RECOMP_PERF=1` | per-frame timings: presentation, GPU thread, operations, `draw` steps, sync waits |
+| `RECOMP_PERF=1` | per-frame timings: presentation, GPU thread, operations, `draw` steps, sync waits; real GPU time per frame (avg, max, frames over one display period) |
 | `RECOMP_FRAME_TRACE=N`, `RECOMP_FRAME_TRACE_MS=x` | system calls longer than x ms (1 by default) in frames N to N+2 |
 | `RECOMP_TS_LOG=N` | GPU timestamps written and read back by the game (frames N to N+3) |
 | `RECOMP_AUTOPRESS=1` | presses A for 100 ms every 2 s (title screen) |
@@ -419,7 +419,8 @@ python link.py                                   # after modifying the runtime
 | `RECOMP_FINISH_NO_FLUSH=1` | `nvnQueueFinish` without submitting the recorded Vulkan work (former cause of the blocky text) |
 | `RECOMP_COPY_IN_PLACE=1` | `CopyBufferToTexture` reads the source at GPU execution time instead of a snapshot taken at recording time |
 | `RECOMP_CPU_BUFFER_COPY=1` | `CopyBufferToBuffer` done by the CPU at recording time (old behavior) instead of an ordered GPU copy |
-| `RECOMP_GPU_PROFILE=N` | at frame N, GPU duration of each draw and compute dispatch (timestamps), summed per program: the 30 most expensive go to the log |
+| `RECOMP_GPU_PROFILE=N` | at frame N, GPU duration of each draw and compute dispatch (timestamps), summed per program: the 30 most expensive go to the log, with the span from first to last draw |
+| `RECOMP_GPU_PROFILE=auto` | same profile, taken on the frame after a slow one (GPU time over one display period, or display image acquisition over half of it); 100 profiles at most, 5 s apart, each line gives the reason; draws without a fragment shader name their vertex shader, each draw line gives its vertex count, and `target` lines sum the time per render target (size, `depth only` for depth/shadow passes) |
 | `RECOMP_SYNC_SUBMIT=1` | synchronous submissions: the GPU thread waits for each submission to finish (before the 8th pass) |
 | `RECOMP_SNAPSHOT_EVERY=n`, `RECOMP_SNAPSHOT_DIR=d` | one snapshot every n frames; (existing) folder for the snapshots |
 | `RECOMP_VOLUME=0..100` | output volume (100 by default; 0: muted, the sound card still paces the game's audio) |
