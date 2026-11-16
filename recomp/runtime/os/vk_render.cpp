@@ -210,6 +210,12 @@ struct Vk {
     bool prof = false;
     float ts_period = 1.0f;
     std::vector<std::string> qlabel;
+    std::vector<std::string> qpass;   // cible du dessin (« 2048x2048 depth only »…), « compute » pour un calcul
+    std::vector<uint64_t> qverts;     // sommets traités (count × instances)
+    std::string prof_why;   // RECOMP_GPU_PROFILE=auto : raison du déclenchement de l'image profilée
+    // RECOMP_PERF ou RECOMP_GPU_PROFILE=auto : temps GPU réel de chaque image, deux horodatages par
+    // enregistrement (début après la barrière complète de tête, fin avant vkEndCommandBuffer), par emplacement
+    VkQueryPool ftpool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;   // tampon de commandes de l'emplacement en cours (voir Slot)
     bool recording = false;
     uint64_t host_align = 4096;
@@ -343,6 +349,9 @@ struct Vk {
         std::vector<std::string> batch;         // shaders de la soumission (diagnostic des blocages)
         VkSemaphore sem_acq = VK_NULL_HANDLE;   // acquisition de l'image d'écran (présentation)
         uint64_t serial = 0;                    // valeur chronologique de sa dernière soumission (0 : jamais)
+        bool ft_written = false;                // horodatages de temps GPU écrits (relus à la réutilisation)
+        bool ft_present = false;                // dernier enregistrement d'une image (présentation)
+        uint64_t ft_frame = 0;                  // numéro de cette image
     };
     static constexpr int NSLOT = 6;
     Slot slots[NSLOT];
@@ -1045,7 +1054,7 @@ bool init(HWND hwnd) {
     // mémoire globale des calculs (LDG/STG/ATOMG) : pointeurs de tampon vers les pools importés
     f12.bufferDeviceAddress = VK_TRUE;
     f12.shaderBufferInt64Atomics = VK_TRUE;
-    f12.hostQueryReset = VK_TRUE;   // profileur GPU (RECOMP_GPU_PROFILE)
+    f12.hostQueryReset = VK_TRUE;   // profileur GPU (RECOMP_GPU_PROFILE) et temps GPU des images (RECOMP_PERF)
     f12.timelineSemaphore = VK_TRUE;   // soumissions asynchrones (Vk::Slot)
     f12.pNext = &f13;
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -2265,6 +2274,73 @@ void tex_write(uint32_t binding, uint32_t element, VkDescriptorType type, const 
     if (!groupe) flush_tex_writes();
 }
 
+// ---- temps GPU réel de chaque image (RECOMP_PERF, RECOMP_GPU_PROFILE=auto)
+// Somme des durées GPU des enregistrements de l'image (début : après la barrière complète de tête, donc après
+// le travail précédent ; fin : dernière commande). Les trous entre enregistrements (GPU sans travail) ne
+// comptent pas : c'est le temps où la carte est occupée par l'image, copies et effacements compris.
+// Relu sans attente à la réutilisation de l'emplacement (le GPU l'a fini) : bilan en retard de quelques images.
+struct FtAcc {
+    double sum = 0, mx = 0;
+    int n = 0, slow = 0;
+};
+FtAcc g_ft;                    // fenêtre de la ligne [perf]
+double g_ft_cur = 0;           // image en cours de bilan
+double g_ft_last = 0;          // dernière image complète (ms GPU)
+uint64_t g_ft_last_frame = 0;  // son numéro
+bool gpu_profile_auto() {
+    static const bool on = getenv("RECOMP_GPU_PROFILE") && !strcmp(getenv("RECOMP_GPU_PROFILE"), "auto");
+    return on;
+}
+bool ft_enabled() {
+    static const bool on = getenv("RECOMP_PERF") || gpu_profile_auto();
+    return on;
+}
+double frame_budget_ms() { return 1000.0 / std::max(1, settings().refresh_rate); }
+void ft_collect(Vk::Slot& s) {
+    if (!s.ft_written) return;
+    s.ft_written = false;
+    uint64_t ts[2] = {};
+    const uint32_t q = 2 * (uint32_t)(&s - g.slots);
+    if (vkGetQueryPoolResults(g.dev, g.ftpool, q, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        ts[1] > ts[0])
+        g_ft_cur += (ts[1] - ts[0]) * g.ts_period * 1e-6;
+    if (!s.ft_present) return;
+    g_ft_last = g_ft_cur, g_ft_last_frame = s.ft_frame, g_ft_cur = 0;
+    g_ft.sum += g_ft_last, g_ft.mx = std::max(g_ft.mx, g_ft_last), g_ft.n++;
+    if (g_ft_last > frame_budget_ms()) g_ft.slow++;
+}
+// en tête d'enregistrement, l'emplacement étant fini sur le GPU (begin_frame)
+void ft_start() {
+    if (!ft_enabled()) return;
+    if (!g.ftpool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * Vk::NSLOT;
+        if (vkCreateQueryPool(g.dev, &qi, nullptr, &g.ftpool) != VK_SUCCESS) {
+            g.ftpool = VK_NULL_HANDLE;
+            return;
+        }
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(g.pd, &pp);
+        g.ts_period = pp.limits.timestampPeriod;
+        vkResetQueryPool(g.dev, g.ftpool, 0, 2 * Vk::NSLOT);
+    }
+    Vk::Slot& s = g.slots[g.slot];
+    ft_collect(s);
+    vkResetQueryPool(g.dev, g.ftpool, 2 * (uint32_t)g.slot, 2);
+    vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.ftpool, 2 * (uint32_t)g.slot);
+    s.ft_written = true;
+    s.ft_present = false;
+}
+// avant vkEndCommandBuffer ; present : dernier enregistrement de l'image `frame`
+void ft_end(bool present, uint64_t frame) {
+    Vk::Slot& s = g.slots[g.slot];
+    if (!g.ftpool || !s.ft_written) return;
+    vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.ftpool, 2 * (uint32_t)g.slot + 1);
+    s.ft_present = present;
+    s.ft_frame = frame;
+}
+
 void begin_frame() {
     if (g.recording) return;
     free_done_staging();
@@ -2316,6 +2392,7 @@ void begin_frame() {
     // Les soumissions s'exécutaient une à une (attente du GPU entre elles) : une barrière complète en tête
     // garde cet ordre sur le GPU (sa première portée couvre tout le travail soumis avant sur la file).
     barrier_all();
+    ft_start();   // RECOMP_PERF : temps GPU de l'image (après la barrière : le travail précédent est fini)
     if (!g.dummies) fill_dummy_descriptors();
 }
 
@@ -2508,39 +2585,89 @@ int prof_begin() {
     vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.qpool, (uint32_t)q);
     return q;
 }
-void prof_end(int q, const std::string& label) {
+void prof_end(int q, const std::string& label, const std::string& pass = "compute", uint64_t verts = 0) {
     if (q < 0) return;
     vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.qpool, (uint32_t)q + 1);
     g.qlabel.push_back(label);
+    g.qpass.push_back(pass);
+    g.qverts.push_back(verts);
 }
-// à la présentation, après l'attente du GPU : bilan de l'image profilée, puis armement de la suivante
-void prof_frame(uint64_t frame) {
-    static const long pf = getenv("RECOMP_GPU_PROFILE") ? atol(getenv("RECOMP_GPU_PROFILE")) : -1;
-    if (pf < 0) return;
+// à la présentation, après l'attente du GPU : bilan de l'image profilée, puis armement de la suivante.
+// RECOMP_GPU_PROFILE=N : l'image N ; RECOMP_GPU_PROFILE=auto : l'image qui suit une image lente (temps GPU au-delà
+// d'une période d'écran, ou acquisition de l'image d'écran au-delà d'une demi-période), 100 fois au plus, 5 s d'écart
+// (un profil toutes les 5 s pendant tout un creux, au lieu des seuls premiers).
+void prof_frame(uint64_t frame, double acquire_ms) {
+    static const char* pe = getenv("RECOMP_GPU_PROFILE");
+    static const bool autom = gpu_profile_auto();
+    static const long pf = pe && !autom ? atol(pe) : -1;
+    if (pf < 0 && !autom) return;
     if (g.prof) {
         g.prof = false;
         std::vector<uint64_t> ts(g.qn, 0);
         if (g.qn && vkGetQueryPoolResults(g.dev, g.qpool, 0, g.qn, ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT) ==
                         VK_SUCCESS) {
-            std::map<std::string, std::pair<double, int>> acc;
+            struct Acc {
+                double ms = 0;
+                int n = 0;
+                uint64_t verts = 0;
+            };
+            std::map<std::string, Acc> acc, pass;
             double total = 0;
+            uint64_t t0 = ~0ull, t1 = 0;   // premier début, dernière fin
             for (size_t k = 0; k < g.qlabel.size() && 2 * k + 1 < ts.size(); k++) {
                 const double ms = ts[2 * k + 1] > ts[2 * k] ? (ts[2 * k + 1] - ts[2 * k]) * g.ts_period * 1e-6 : 0.0;
+                if (ts[2 * k] && ts[2 * k + 1] > ts[2 * k]) t0 = std::min(t0, ts[2 * k]), t1 = std::max(t1, ts[2 * k + 1]);
+                const uint64_t nv = k < g.qverts.size() ? g.qverts[k] : 0;
                 auto& a = acc[g.qlabel[k]];
-                a.first += ms, a.second++;
+                a.ms += ms, a.n++, a.verts += nv;
+                auto& p = pass[k < g.qpass.size() ? g.qpass[k] : std::string("?")];
+                p.ms += ms, p.n++, p.verts += nv;
                 total += ms;
             }
-            std::vector<std::pair<double, std::string>> v;
-            for (auto& [l, a] : acc) v.push_back({a.first, l + " ×" + std::to_string(a.second)});
-            std::sort(v.rbegin(), v.rend());
-            HLOG("gpuprof", "frame %llu: %zu draws / computes measured, %.2f ms GPU in total", (unsigned long long)frame,
-                 g.qlabel.size(), total);
+            auto liste = [](const std::map<std::string, Acc>& m) {
+                std::vector<std::pair<double, std::string>> v;
+                for (auto& [l, a] : m) {
+                    char b[64];
+                    snprintf(b, sizeof b, " ×%d", a.n);
+                    std::string t = l + b;
+                    if (a.verts) snprintf(b, sizeof b, ", %.0fk vertices", a.verts / 1000.0), t += b;
+                    v.push_back({a.ms, t});
+                }
+                std::sort(v.rbegin(), v.rend());
+                return v;
+            };
+            const auto v = liste(acc), vp = liste(pass);
+            // span : du premier dessin au dernier ; l'écart avec le total = copies, effacements, barrières, attentes
+            HLOG("gpuprof", "frame %llu%s: %zu draws / computes measured, %.2f ms GPU in total, span %.2f ms",
+                 (unsigned long long)frame, g.prof_why.c_str(), g.qlabel.size(), total,
+                 t1 > t0 ? (t1 - t0) * g.ts_period * 1e-6 : 0.0);
             for (size_t k = 0; k < v.size() && k < 30; k++)
                 HLOG("gpuprof", "  %6.2f ms  %4.1f %%  %s", v[k].first, total > 0 ? 100.0 * v[k].first / total : 0.0,
                      v[k].second.c_str());
+            for (size_t k = 0; k < vp.size() && k < 12; k++)   // par cible : passes d'ombres, prépasse, rendu principal…
+                HLOG("gpuprof", "  target %6.2f ms  %4.1f %%  %s", vp[k].first, total > 0 ? 100.0 * vp[k].first / total : 0.0,
+                     vp[k].second.c_str());
         }
     }
-    if ((long)frame + 1 == pf) {
+    bool arm = (long)frame + 1 == pf;
+    if (autom) {
+        constexpr int MAXCAP = 100;
+        static int ncap = 0;
+        static std::chrono::steady_clock::time_point last{};
+        const auto now = std::chrono::steady_clock::now();
+        const double budget = frame_budget_ms();
+        const bool slow_gpu = g_ft_last > budget && g_ft_last_frame + 8 >= frame;   // bilan récent (en retard)
+        const bool slow_acq = acquire_ms > budget * 0.5;
+        if ((slow_gpu || slow_acq) && ncap < MAXCAP && (!ncap || now - last > std::chrono::seconds(5))) {
+            ncap++, last = now, arm = true;
+            char b[256];
+            snprintf(b, sizeof b, " (auto %d/%d after frame %llu: GPU %.2f ms of frame %llu, acquire %.2f ms, budget %.2f ms)",
+                     ncap, MAXCAP, (unsigned long long)frame, g_ft_last, (unsigned long long)g_ft_last_frame, acquire_ms,
+                     budget);
+            g.prof_why = b;
+        }
+    }
+    if (arm) {
         if (!g.qpool) {
             VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -2553,6 +2680,8 @@ void prof_frame(uint64_t frame) {
         vkResetQueryPool(g.dev, g.qpool, 0, QMAX);
         g.qn = 0;
         g.qlabel.clear();
+        g.qpass.clear();
+        g.qverts.clear();
         g.prof = true;
     }
 }
@@ -5210,6 +5339,7 @@ uint64_t submit_cb(const char* where, VkSemaphore wait_bin = VK_NULL_HANDLE, VkS
 uint64_t submit_locked(const char* where) {
     if (!g.ok || !g.recording) return 0;
     end_render();
+    ft_end(false, 0);
     vkEndCommandBuffer(g.cb);
     g.recording = false;
     return submit_cb(where);
@@ -6774,13 +6904,18 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
         uint32_t isz = d.index_type == 0 ? 1 : d.index_type == 1 ? 2 : 4;
         if (!find_pool(d.index_addr, (uint64_t)d.count * isz, &b, &o) || d.index_type == 0) {
             skip(d.index_type == 0 ? "8-bit index" : "index buffer not found", prog.label);
-            prof_end(pq, "(draw skipped)");
+            prof_end(pq, "(draw skipped)", "skipped");
             return;
         }
         vkCmdBindIndexBuffer(g.cb, b, o, d.index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(g.cb, d.count, d.instances, 0, d.base_vertex, d.base_instance);
     }
-    if (pq >= 0) prof_end(pq, prog.label + (fs ? " [fs " + fs->hash + "]" : " [no fs]"));
+    if (pq >= 0) {   // sans fragment shader : le vertex shader identifie le programme (20 variantes du même fichier)
+        char pass[64];
+        snprintf(pass, sizeof pass, "%ux%u%s", W, H, rts[0] ? "" : " depth only");
+        prof_end(pq, prog.label + (fs ? " [fs " + fs->hash + "]" : " [no fs, vs " + vs->hash + "]"), pass,
+                 (uint64_t)d.count * std::max(1u, (uint32_t)d.instances));
+    }
     if (g.checkpoints) mark("after " + mk);
     if (watch_ring != ~0ull) {   // banque 2 vue par le GPU à l'exécution, contre son contenu à l'enregistrement
         static int nw = 0;
@@ -7806,6 +7941,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     if (have) vkCmdPipelineBarrier2(g.cb, &di);
     static const long audit_every = getenv("RECOMP_POOL_AUDIT") ? atol(getenv("RECOMP_POOL_AUDIT")) : 0;
     if (audit_every > 0 && frame % (uint64_t)audit_every == 0) pool_audit(frame);
+    ft_end(true, frame);
     vkEndCommandBuffer(g.cb);
     g.recording = false;
     // fin de copie vers l'image d'écran : un sémaphore par image (réutilisé quand l'image revient)
@@ -7838,7 +7974,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     auto t_f = std::chrono::steady_clock::now();
     // soumissions asynchrones : pas d'attente, sauf pour relire l'état du GPU (profileur, tampon de débogage)
     if (!g.async || g.prof || g.dbgptr) wait_serial(serial, "presentation");
-    prof_frame(frame);   // RECOMP_GPU_PROFILE : bilan de l'image profilée, armement de la suivante
+    prof_frame(frame, d_acq);   // RECOMP_GPU_PROFILE : bilan de l'image profilée, armement de la suivante
     if (g.dbgptr && g.dbgptr[1]) {   // RECOMP_DBG_SSBO : enregistrements (4 mots) rangés par le shader surveillé
         static int nd = 0;
         uint32_t n = std::min<uint32_t>(g.dbgptr[1], 4000);
@@ -7882,6 +8018,11 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
                  o.c_str(), (unsigned long long)g.frame_draws, g_flush_us.exchange(0) / 120e3, (unsigned long long)g_flush_n.exchange(0),
                  g_wait_us.exchange(0) / 120e3, g.ring_peak / 1048576.0);
             g.ring_peak = 0;
+            // temps GPU réel des images dont le bilan est arrivé dans la fenêtre (en retard de quelques images)
+            if (g_ft.n)
+                HLOG("perf", "GPU time per frame: %.2f ms avg, %.2f ms max; %d of %d frames over %.2f ms",
+                     g_ft.sum / g_ft.n, g_ft.mx, g_ft.slow, g_ft.n, frame_budget_ms());
+            g_ft = FtAcc();
             HLOG("perf", "draw: %.1f calls/frame, ms/frame: prog %.3f textures %.3f pass %.3f pipeline %.3f descriptors %.3f end %.3f",
                  g_dn.exchange(0) / 120.0, g_dt[0].exchange(0) / 120e6, g_dt[1].exchange(0) / 120e6, g_dt[2].exchange(0) / 120e6,
                  g_dt[3].exchange(0) / 120e6, g_dt[4].exchange(0) / 120e6, g_dt[5].exchange(0) / 120e6);

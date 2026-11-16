@@ -378,7 +378,7 @@ python link.py                                   # après modification du runtim
 | `RECOMP_FRAMES_IN_FLIGHT` | images en attente d'affichage avant blocage de l'acquisition (2 par défaut) |
 | `RECOMP_NO_VSYNC_EMU=1` | pas de contre-pression au vblank virtuel (cadence libre) |
 | `RECOMP_FH_MODE=9` | `ListFrameHistory` vide (régulateur du moteur en boucle ouverte) |
-| `RECOMP_PERF=1` | temps par image : présentation, thread GPU, opérations, étapes de `draw`, attentes de syncs |
+| `RECOMP_PERF=1` | temps par image : présentation, thread GPU, opérations, étapes de `draw`, attentes de syncs ; temps GPU réel par image (moyenne, maximum, images au-delà d'une période d'écran) |
 | `RECOMP_FRAME_TRACE=N`, `RECOMP_FRAME_TRACE_MS=x` | appels système de plus de x ms (1 par défaut) des images N à N+2 |
 | `RECOMP_TS_LOG=N` | horodatages GPU écrits et relus par le jeu (images N à N+3) |
 | `RECOMP_AUTOPRESS=1` | appuie sur A 100 ms toutes les 2 s (écran titre) |
@@ -416,7 +416,8 @@ python link.py                                   # après modification du runtim
 | `RECOMP_FINISH_NO_FLUSH=1` | `nvnQueueFinish` sans soumission du travail Vulkan enregistré (ancienne cause du texte en pavés) |
 | `RECOMP_COPY_IN_PLACE=1` | `CopyBufferToTexture` lit la source au moment de l'exécution GPU au lieu d'un instantané pris à l'enregistrement |
 | `RECOMP_CPU_BUFFER_COPY=1` | `CopyBufferToBuffer` par le processeur à l'enregistrement (ancien comportement) au lieu d'une copie GPU ordonnée |
-| `RECOMP_GPU_PROFILE=N` | à l'image N, durée GPU de chaque dessin et calcul (horodatages), sommée par programme : 30 plus coûteux au journal |
+| `RECOMP_GPU_PROFILE=N` | à l'image N, durée GPU de chaque dessin et calcul (horodatages), sommée par programme : 30 plus coûteux au journal, avec l'étendue du premier au dernier dessin |
+| `RECOMP_GPU_PROFILE=auto` | même profil, pris à l'image qui suit une image lente (temps GPU au-delà d'une période d'écran, ou acquisition de l'image d'écran au-delà d'une demi-période) ; 100 profils au plus, 5 s d'écart, la raison sur chaque ligne ; les dessins sans fragment shader donnent leur vertex shader, chaque ligne le nombre de sommets, et les lignes `target` totalisent le temps par cible de rendu (taille, `depth only` pour les passes de profondeur et d'ombres) |
 | `RECOMP_SYNC_SUBMIT=1` | soumissions synchrones : le thread GPU attend la fin de chaque soumission (avant la 8e passe) |
 | `RECOMP_SNAPSHOT_EVERY=n`, `RECOMP_SNAPSHOT_DIR=d` | un instantané toutes les n images ; dossier (existant) des instantanés |
 | `RECOMP_VOLUME=0..100` | volume de sortie (100 par défaut ; 0 : muet, la carte son rythme quand même l'audio du jeu) |
