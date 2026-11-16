@@ -1348,9 +1348,64 @@ class Emitter:
         raise Unsupported(f"global memory ({n})")
 
     # ---------------------------------------------------------------- programme
+    def cibles_brx(self, brx, words):
+        """Cibles exactes d'un BRX d'aiguillage (switch), ou None si le motif n'est pas reconnu.
+
+        Le compilateur de la console borne l'indice avant de lire la table : IMNMX non signé (min avec une constante
+        K), décalage à gauche de 2, LDC dans la banque 1, puis BRX sur la valeur lue (voir le shader du matériau
+        principal, 4f420df06d6a73e1, en 0x1700-0x1750). Seules les entrées 0..K sont alors lisibles ; le reste de la
+        banque (souvent des zéros, qui donneraient le début du shader) ne peut pas être une cible. Les instructions
+        du motif doivent se suivre dans un même bloc (aucune cible de saut entre elles), sans prédicat, et aucun autre
+        écrit ne doit toucher les registres en jeu entre la borne et le BRX. Renvoie (adresse de la borne, cibles) :
+        translate() écarte le motif si une cible de saut tombe après la borne (elle serait contournée)."""
+        k = self.insns.index(brx)
+        if not brx.guard.true or (brx.psrc and not brx.psrc[0].true) or not isinstance(brx.srcs[0], Reg):
+            return None
+        val, idx, decale, borne, ecrits = brx.srcs[0].n, None, False, None, set()
+        for j in range(k - 1, max(-1, k - 12), -1):
+            i = self.insns[j]
+            if i.name in ("bra", "brx", "retr", "call", "ret", "exit") or not i.guard.true:
+                return None
+            dsts = i.dst if isinstance(i.dst, list) else [i.dst] if i.dst is not None else []
+            nums = {d.n for d in dsts if isinstance(d, Reg) and not d.uni}
+            if idx is None:
+                if val in nums:
+                    if (i.name != "ldc" or i.mods.get("type") != 4 or i.mods.get("mode") != 0
+                            or not isinstance(i.srcs[0], CBuf) or i.srcs[0].bank != 1 or i.srcs[0].ubank is not None
+                            or len(i.srcs) < 2 or not isinstance(i.srcs[1], Reg) or i.srcs[1].uni):
+                        return None
+                    off, idx = i.srcs[0].off, i.srcs[1].n
+                continue
+            if idx in nums:
+                if (not decale and i.name == "shf" and not i.mods.get("right") and not i.mods.get("hi")
+                        and i.mods.get("type") == "u32" and isinstance(i.srcs[0], Reg) and i.srcs[0].n == idx
+                        and isinstance(i.srcs[1], Imm) and i.srcs[1].v == 2
+                        and isinstance(i.srcs[2], Reg) and i.srcs[2].zero):
+                    decale = True
+                    continue
+                if (decale and i.name == "imnmx" and not i.mods.get("signed") and i.psrc and i.psrc[0].true
+                        and isinstance(i.srcs[0], Reg) and i.srcs[0].n == idx and isinstance(i.srcs[1], Imm)):
+                    borne, debut = i.srcs[1].v, i.pc
+                    break
+                return None
+            ecrits |= nums
+        if borne is None or idx in ecrits or val in ecrits or off % 4 or borne > 255:
+            return None
+        cibles = set()
+        for e in range(borne + 1):
+            w = off // 4 + e
+            if w >= len(words):
+                return None
+            t = brx.mods["base"] + words[w]
+            if t % 16 or not 0 <= t < len(self.insns) * 16:
+                return None
+            cibles.add(t)
+        return debut, cibles
+
     def translate(self):
         targets = {0}
         calls = False
+        self.brx_cibles = {}   # BRX d'aiguillage dont les cibles sont connues exactement (cibles_brx)
         for i in self.insns:
             if i.target is not None and i.name in ("bra", "call") and i.target < len(self.insns) * 16:
                 targets.add(i.target)
@@ -1371,6 +1426,14 @@ class Emitter:
                     t = base + v
                     if t % 16 == 0 and 0 <= t < len(self.insns) * 16:
                         targets.add(t)
+                bornees = self.cibles_brx(i, words)
+                if bornees is not None:
+                    self.brx_cibles[i.pc] = bornees
+        for pc, (debut, cibles) in list(self.brx_cibles.items()):   # un saut au milieu du motif contournerait la borne
+            if any(debut < t <= pc for t in targets):
+                del self.brx_cibles[pc]
+            else:
+                self.brx_cibles[pc] = cibles
         body = []
         for i in self.insns:
             if i.pc in targets:
@@ -1552,12 +1615,12 @@ class Emitter:
             L.append("    return;")
             L.append("  }")
         else:
-            L += en_chaine(body, loops)
+            L += en_chaine(body, loops, self.brx_cibles)
         L.append("}")
         return "\n".join(L) + "\n"
 
 
-def en_chaine(body, boucle):
+def en_chaine(body, boucle, brx_cibles=None):
     """Corps de main() à partir des blocs `case N:` de l'émetteur, sans boucle de répartition.
 
     Jusqu'à la 1.0.2 : `while (true) { switch (pc) { case N: … pc = M; continue; … default: return; } return; }`.
@@ -1596,7 +1659,13 @@ def en_chaine(body, boucle):
             for cible in re.findall(r"\bpc = ([^;]+);", code):   # saut constant vers l'arrière, ou saut calculé
                 cible = cible.strip()
                 if not re.fullmatch(r"\d+u", cible):
-                    boucle = calcule = True
+                    boucle = True
+                    m = re.search(r"  // brx ([0-9a-f]+)$", l)
+                    connues = (brx_cibles or {}).get(int(m.group(1), 16)) if m else None
+                    if connues is None:   # retour (RET.NODEC) ou table non bornée : forme d'avant
+                        calcule = True
+                    else:   # aiguillage borné : ses sauts arrière font des boucles comme les sauts constants
+                        regions += [[t, pc] for t in connues if t <= pc]
                 elif int(cible[:-1]) <= pc:
                     boucle = True
                     regions.append([int(cible[:-1]), pc])
