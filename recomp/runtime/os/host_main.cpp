@@ -285,6 +285,8 @@ LONG WINAPI veh(EXCEPTION_POINTERS* ep) {
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
     // premier accès à une page de la mémoire du jeu engagée à la demande (memory.cpp) : on l'engage et on reprend
     if (code == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[0] <= 1) {
+        // RECOMP_VB_VRAM : écriture dans un morceau copié en mémoire vidéo (protégé) : il redevient inscriptible
+        if (er->ExceptionInformation[0] == 1 && vkr::vbw_faute(er->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
         const int r = mem_fault(er->ExceptionInformation[1], er->ExceptionInformation[0] == 1);
         if (r >= 2) {   // données de texture rendues puis redemandées : qui y revient ? (les 20 premières fois)
             static std::atomic<int> dits{0};

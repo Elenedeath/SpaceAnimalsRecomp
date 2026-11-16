@@ -131,6 +131,13 @@ void mem_vides_init();                                  // recomp.ini, zero_page
 // du jeu : ReadFile dans la mémoire du jeu (svc_fs.cpp), import d'une fenêtre dans Vulkan (vk_render.cpp).
 void mem_noyau_debut();
 void mem_noyau_fin();
+bool mem_noyau_essayer();   // garde prise seule (aucun ReadFile en cours dans la mémoire du jeu) ; faux : déjà tenue
+void mem_noyau_liberer();   // fin de mem_noyau_essayer
+// RECOMP_VB_VRAM (vk_render.cpp) : morceaux de la mémoire du jeu copiés en mémoire vidéo, protégés en écriture
+namespace vkr {
+bool vbw_faute(uint64_t addr);                     // écriture fautive : vrai si c'était un morceau suivi (reprendre)
+void vbw_ecriture(uint64_t addr, uint64_t size);   // écrite sans faute (noyau, GPU) ou remappée : copies périmées
+}  // namespace vkr
 struct MemNoyau {
     MemNoyau() { mem_noyau_debut(); }
     ~MemNoyau() { mem_noyau_fin(); }
