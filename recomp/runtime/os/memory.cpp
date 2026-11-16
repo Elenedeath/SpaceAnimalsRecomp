@@ -628,6 +628,7 @@ bool mem_release_actif() {
 // rend le nombre d'octets rendus (0 : rien n'a changé) et le numéro du rendu dans *id.
 uint64_t mem_release(uint64_t addr, uint64_t size, uint64_t* id) {
     *id = 0;
+    vkr::vbw_ecriture(addr, size);   // pages bientôt désengagées : plus suivies
     if (!mem_release_actif()) return 0;
     const uint64_t d = (addr + 0xfff) & ~0xfffull, f = (addr + size) & ~0xfffull;
     if (f <= d) return 0;
@@ -719,6 +720,7 @@ void mem_release_stats(RelStats* s) {
 }
 
 bool mem_commit_lazy(uint64_t addr, uint64_t size) {
+    vkr::vbw_ecriture(addr, size);   // plage remappée : copies en mémoire vidéo périmées
     if (!settings().memory_saver) return mem_commit(addr, size);   // recomp.ini : comportement de la 1.0.2
     if (!size) return true;
     if (g_rel_present.load(std::memory_order_acquire) || g_vides_present.load(std::memory_order_acquire)) {
@@ -856,6 +858,7 @@ int mem_fault(uint64_t addr, bool ecriture) {
 // ou au pilote graphique. Faux si Windows refuse la mémoire.
 bool mem_ensure(uint64_t addr, uint64_t size) {
     if (!size) return true;
+    vkr::vbw_ecriture(addr, size);   // le noyau va y écrire sans faute : copies en mémoire vidéo périmées
     const uint64_t end = addr + size;
     bool ok = true;
     // pages rendues de la plage : restaurées d'abord (engagées ici, elles se liraient à zéro) ; le verrou exclut un
@@ -1396,6 +1399,8 @@ void vides_balayer(unsigned periode) {
 
 void mem_noyau_debut() { AcquireSRWLockShared(&g_noyau_lock); }
 void mem_noyau_fin() { ReleaseSRWLockShared(&g_noyau_lock); }
+bool mem_noyau_essayer() { return TryAcquireSRWLockExclusive(&g_noyau_lock) != 0; }
+void mem_noyau_liberer() { ReleaseSRWLockExclusive(&g_noyau_lock); }
 void mem_epingler(uint64_t addr, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_epingle_mx);
     g_epingles[{addr, addr + size}]++;
@@ -1441,6 +1446,7 @@ void mem_lazy_stats(uint64_t* blocs, uint64_t* octets, uint64_t* reserves) {
 
 void mem_decommit(uint64_t addr, uint64_t size) {
     if (size) {
+        vkr::vbw_ecriture(addr, size);   // pages libérées : plus suivies
         const bool rel = g_rel_present.load(std::memory_order_acquire) || g_vides_present.load(std::memory_order_acquire);
         if (rel) {   // pages rendues de la plage (textures, pages vides) : leur contenu n'a plus d'objet
             AcquireSRWLockExclusive(&g_rel_lock);
