@@ -1171,16 +1171,22 @@ class Emitter:
                 cnt = {4: 1, 5: 2, 6: 4, 7: 4}[t]
                 if cnt == 1:
                     return self.setr(i.dst, f"gld({a})")
-                out = ["{ uint64_t ga = " + a + ";"]
-                out += [self.setr(self.rn(i.dst, k), f"gld(ga + {4 * k}ul)") for k in range(cnt)]
-                return " ".join(out) + " }"
+                # Vecteur (2 ou 4 mots, aligné sur sa taille par le matériel) : une seule traduction. Les fenêtres
+                # importées commencent et finissent sur l'alignement d'import de l'hôte (4 Ko ou plus, find_import) :
+                # un vecteur n'en chevauche jamais deux, et hors de toute fenêtre il se lit à zéro comme mot par
+                # mot. Chaque traduction est une copie de gxl() dans le shader : traduire les mots un par un
+                # multipliait ces copies, et c'est leur nombre qui faisait la pression sur les registres (brouillard,
+                # dcf771efb55667e4, sur le Steam Deck : 240 → 144 VGPR, débit estimé ÷ 3,4).
+                vite = [self.setr(self.rn(i.dst, k), f"GW(gd + {4 * k}ul).v") for k in range(cnt)]
+                zero = [self.setr(self.rn(i.dst, k), "0u") for k in range(cnt)]
+                return (f"{{ uint64_t gd = gxln({a}, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} "
+                        f"else {{ {' '.join(zero)} }} }}")
             data = i.srcs[2]
             if t <= 3:
                 return f"gst{8 if t <= 1 else 16}({a}, {self.u(data)});"
             cnt = {4: 1, 5: 2, 6: 4, 7: 4}[t]
-            out = ["{ uint64_t ga = " + a + ";"]
-            out += [f"gst(ga + {4 * k}ul, {self.u(self.rn(data, k))});" for k in range(cnt)]
-            return " ".join(out) + " }"
+            vite = [f"GW(gd + {4 * k}ul).v = {self.u(self.rn(data, k))};" for k in range(cnt)]
+            return f"{{ uint64_t gd = gxln({a}, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} }}"
         # ATOMG / RED : 32 bits (types 0 non signé, 1 signé), addition flottante (type 3)
         self.uses.add("gatomic")
         op = m["op"]
@@ -1211,14 +1217,12 @@ class Emitter:
         g = self.GTAB_WORD
         L = [f"layout(buffer_reference, std430, buffer_reference_align = 4) {coh}buffer GW {{ uint v; }};",
              f"layout(buffer_reference, std430, buffer_reference_align = 4) {coh}buffer GI {{ int v; }};",
-             # dernier pool trouvé essayé d'abord (les accès d'un shader visent presque tous le même pool)
-             "uint gxl_last = 0u;",
-             "uint64_t gxl_try(uint k, uint64_t a) {",
-             f"  uint b = {g + 4}u + 8u * k;",
-             f"  uint64_t o = a - packUint2x32(uvec2({cb}[b], {cb}[b + 1u]));",
-             f"  uint64_t sz = packUint2x32(uvec2({cb}[b + 4u], {cb}[b + 5u]));",
-             f"  return (o < sz && sz - o >= 4ul) ? packUint2x32(uvec2({cb}[b + 2u], {cb}[b + 3u])) + o : 0ul;",
-             "}",
+             # Dernière fenêtre trouvée gardée en registres (base invitée, taille, adresse Vulkan ; taille 0 : aucune) :
+             # les accès d'un shader visent presque tous le même pool, et un accès qui y retombe ne relit plus la
+             # table dans le tampon uniforme. Avant, chaque accès relisait au moins une entrée (6 mots) : le shader de
+             # la lumière du brouillard (dcf771efb55667e4, ~220 accès dans ses boucles) en faisait 6 lectures de table
+             # par mot utile.
+             "uint64_t gxl_b = 0ul, gxl_s = 0ul, gxl_d = 0ul;",
              # Adresse absente de la table : notée dans le tampon de retour du runtime (son adresse GPU est dans la table,
              # mots g + 2 et g + 3 ; 0 : pas de tampon), qui importera sa fenêtre pour les calculs suivants
              # (vk_render.cpp, glob_retour). Depuis la 1.0.3, la mémoire du jeu n'est plus importée en entier.
@@ -1231,16 +1235,24 @@ class Emitter:
              "  uint i = atomicAdd(fb.n, 1u);",
              "  if (i < 255u) fb.a[i] = a;",
              "}",
-             "uint64_t gxl(uint64_t a) {",
-             f"  uint n = min({cb}[{g}u], 78u);",
-             "  if (gxl_last < n) { uint64_t d = gxl_try(gxl_last, a); if (d != 0ul) return d; }",
-             "  for (uint k = 0u; k < n; k++) {",
-             "    uint64_t d = gxl_try(k, a);",
-             "    if (d != 0ul) { gxl_last = k; return d; }",
+             "uint64_t gxln(uint64_t a, uint64_t n) {",   # adresse Vulkan de [a, a + n), ou 0
+             "  uint64_t o = a - gxl_b;",
+             "  if (o < gxl_s && gxl_s - o >= n) return gxl_d + o;",
+             f"  uint c = min({cb}[{g}u], 78u);",
+             "  for (uint k = 0u; k < c; k++) {",
+             f"    uint b = {g + 4}u + 8u * k;",
+             f"    uint64_t base = packUint2x32(uvec2({cb}[b], {cb}[b + 1u]));",
+             f"    uint64_t sz = packUint2x32(uvec2({cb}[b + 4u], {cb}[b + 5u]));",
+             "    uint64_t p = a - base;",
+             "    if (p < sz && sz - p >= n) {",
+             f"      gxl_b = base; gxl_s = sz; gxl_d = packUint2x32(uvec2({cb}[b + 2u], {cb}[b + 3u]));",
+             "      return gxl_d + p;",
+             "    }",
              "  }",
              "  gxl_miss(a);",
              "  return 0ul;",
              "}",
+             "uint64_t gxl(uint64_t a) { return gxln(a, 4ul); }",
              "uint gld(uint64_t a) { uint64_t d = gxl(a & ~3ul); return d != 0ul ? GW(d).v : 0u; }",
              "void gst(uint64_t a, uint v) { uint64_t d = gxl(a & ~3ul); if (d != 0ul) GW(d).v = v; }",
              "uint gld8(uint64_t a) { return (gld(a) >> (uint(a & 3ul) * 8u)) & 0xffu; }",
