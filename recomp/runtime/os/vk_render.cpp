@@ -801,6 +801,11 @@ bool carte_prevue(std::string* nom, uint32_t* fabricant) {
     return ok;
 }
 
+// RECOMP_VB_VRAM : sommets et index en mémoire vidéo (définis avec le dessin)
+bool vbv_actif();
+void vbw_copier();
+void vbw_oublie(uint64_t base, uint64_t size);
+extern thread_local bool t_vbw_muet;
 namespace {
 
 bool init(HWND hwnd) {
@@ -1192,7 +1197,10 @@ PoolBuf* import_range(uint64_t base, uint64_t size, const nvn::Pool& found) {
     // pages du jeu engagées à la demande (memory.cpp) : le pilote ne verrouille que des pages engagées. Garde du noyau
     // de l'engagement à l'épinglage de la fenêtre : aucune page vide n'en est rendue à Windows entre-temps.
     MemNoyau garde;
-    if (!mem_ensure(base, size)) return refus("not enough PC memory", 0);
+    t_vbw_muet = true;   // engagement seulement : rien n'est écrit (RECOMP_VB_VRAM)
+    const bool engagee = mem_ensure(base, size);
+    t_vbw_muet = false;
+    if (!engagee) return refus("not enough PC memory", 0);
     VkMemoryHostPointerPropertiesEXT hpp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult r = vkGetMemoryHostPointerPropertiesEXT(g.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                      (void*)base, &hpp);
@@ -1385,6 +1393,7 @@ void ref_image(Image& o) {
 
 void pools_released_locked(uint64_t addr, uint64_t size) {
     if (!size) return;
+    vbw_oublie(addr, size);   // RECOMP_VB_VRAM : la mémoire sera remappée, ses copies ne valent plus rien
     // Images dont la mémoire est dans le pool : la ressource n'existe plus. Elles n'étaient jamais détruites :
     // au fil des niveaux, 6 170 images et 15 Go de textures sur une carte de 16 Go (2026-11-09) ; les créations
     // finissaient par échouer sans bruit et des textures manquaient (icônes en carrés pleins, vignettes
@@ -2293,6 +2302,7 @@ void begin_frame() {
     // Les soumissions s'exécutaient une à une (attente du GPU entre elles) : une barrière complète en tête
     // garde cet ordre sur le GPU (sa première portée couvre tout le travail soumis avant sur la file).
     barrier_all();
+    if (vbv_actif()) vbw_copier();   // RECOMP_VB_VRAM : morceaux demandés, avant tout dessin
     ft_start();   // RECOMP_PERF : temps GPU de l'image (après la barrière : le travail précédent est fini)
     if (!g.dummies) fill_dummy_descriptors();
 }
@@ -5945,6 +5955,389 @@ void draw(const DrawCall& d) {
     draw_verrouille(d, dtm);
 }
 // corps de draw, verrou pris (rappelé aussi par dlss_taa pour la comparaison en écran partagé)
+// ---- RECOMP_VB_VRAM=1 : sommets et index lus en mémoire vidéo (2b ; désactivé par défaut tant qu'il est à l'essai).
+// Mesuré (2026-11-16, runs 7 et 8) : le GPU lit les sommets et les index dans la mémoire du jeu importée, donc dans la
+// RAM du PC à travers le PCIe ; les passes limitées par les sommets (ombres, personnages animés) y plafonnaient à
+// 0,3-1 G sommets/s, et allaient 3 à 8 fois plus vite sur une copie en mémoire vidéo. Une copie faite une fois pour
+// toutes fige les tampons que le jeu réécrit (clignotements), et un filtre par contenu sur de grandes plages n'en
+// gardait presque rien (run 9 : 3 Mo copiés). Ici, la mémoire du jeu est suivie par morceaux de 64 Ko, dans des
+// cellules de 32 Mo alignées (une copie en mémoire vidéo par cellule) :
+//   * un dessin dit les octets qu'il lit (index : count × taille ; sommets : bornes des index, mises en cache, ou
+//     first + count ; flux par instance : base_instance + instances). Tous propres : il lit la copie ; sinon il lit
+//     l'import comme avant, et les morceaux qui manquent sont demandés ;
+//   * en tête du tampon de commandes suivant (begin_frame), les morceaux demandés passent en lecture seule
+//     (VirtualProtect) puis sont copiés depuis l'import (vkCmdCopyBuffer), par suites ;
+//   * une écriture du jeu ou du runtime dans un morceau protégé faute (vbw_faute, gestionnaire de host_main.cpp) :
+//     le morceau repasse en lecture-écriture, sa copie est périmée, les dessins relisent l'import jusqu'à la copie
+//     suivante. Écritures sans faute : noyau (ReadFile, IPC : mem_ensure), remappage (mem_commit_lazy, mem_decommit),
+//     données de textures rendues (mem_release), copies GPU (CopyBufferToBuffer), tampons de stockage des calculs à
+//     mémoire globale : vbw_ecriture. Pools libérés : vbw_oublie. Fenêtres des calculs : copiées (RECOMP_VB_VRAM_CALC=0 : jamais) ;
+//   * un morceau réécrit trois fois de suite moins de 30 images après sa copie est « chaud » (tampon dynamique) :
+//     laissé sur l'import pendant 1200 images ;
+//   * la protection n'est posée que garde du noyau libre (aucun ReadFile en cours dans la mémoire du jeu).
+// RECOMP_VB_VRAM_MO : plafond de mémoire vidéo (2048 Mo par défaut, soit 64 cellules).
+constexpr uint64_t VBW_CELL = 32ull << 20, VBW_P = 64ull << 10;
+constexpr uint32_t VBW_NP = (uint32_t)(VBW_CELL / VBW_P);
+enum : uint8_t { VW_ABSENT, VW_DEMANDE, VW_PROPRE, VW_SALE, VW_CHAUD };
+struct VbCell {
+    uint64_t base = 0;
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    uint8_t st[VBW_NP] = {};
+    uint8_t coups[VBW_NP] = {};      // réécritures de suite peu après une copie
+    uint32_t gen[VBW_NP] = {};       // réécritures (cache des bornes d'index)
+    uint32_t copie[VBW_NP] = {};     // image de la dernière copie
+    uint32_t attente[VBW_NP] = {};   // chaud ou refusé : pas redemandé avant cette image
+    std::atomic<uint64_t> propre[VBW_NP / 64] = {};   // copie à jour et protégée : lu sans verrou par les dessins
+};
+SRWLOCK g_vbw_lk = SRWLOCK_INIT;   // états des morceaux (fil de rendu, gestionnaire d'exceptions, noyau)
+std::map<uint64_t, VbCell*> g_vbw;   // par base ; insertion par le fil de rendu seul, verrou tenu
+std::atomic<int> g_vbw_n{0};
+std::atomic<uint32_t> g_vbw_img{0};
+std::vector<uint64_t> g_vbw_dem;   // morceaux demandés (fil de rendu)
+thread_local bool t_vbw_muet = false;   // import d'une fenêtre : mem_ensure n'écrit rien
+std::atomic<uint64_t> g_vbw_fautes{0}, g_vbw_ecrits{0}, g_vbw_chauds{0};
+uint64_t g_vbw_copie = 0, g_vbw_servis = 0, g_vbw_repli = 0, g_vbw_refus = 0, g_vbw_hors = 0, g_vbw_reportes = 0;
+// liaisons restées sur l'import, par raison : bornes des index inconnues (index pas encore copiés), plage qui touche
+// un morceau chaud, refusé (fenêtre de calcul, hors import), pas encore copié (demandé)
+uint64_t g_vbw_r_bornes = 0, g_vbw_r_chaud = 0, g_vbw_r_refus = 0, g_vbw_r_attente = 0;
+struct VbIdx { uint32_t count = 0, isz = 0; uint64_t gsum = 0; uint32_t mn = 0, mx = 0; };
+std::unordered_map<uint64_t, VbIdx> g_vbw_idx;
+
+bool vbv_actif() {
+    static const bool on = getenv("RECOMP_VB_VRAM") && atoi(getenv("RECOMP_VB_VRAM")) != 0;
+    return on;
+}
+
+inline void vbw_bit(VbCell& c, uint32_t i, bool on) {
+    const uint64_t m = 1ull << (i & 63);
+    if (on) c.propre[i >> 6].fetch_or(m, std::memory_order_release);
+    else c.propre[i >> 6].fetch_and(~m, std::memory_order_release);
+}
+
+bool vbw_propres(const VbCell& c, uint32_t i0, uint32_t i1) {   // [i0, i1]
+    for (uint32_t w = i0 >> 6; w <= (i1 >> 6); w++) {
+        uint64_t m = ~0ull;
+        if (w == (i0 >> 6)) m &= ~0ull << (i0 & 63);
+        if (w == (i1 >> 6)) m &= ~0ull >> (63 - (i1 & 63));
+        if ((c.propre[w].load(std::memory_order_acquire) & m) != m) return false;
+    }
+    return true;
+}
+
+// [i0, i1) de la cellule, verrou tenu : morceaux protégés rendus en lecture-écriture ; nouvel état VW_SALE (écrits
+// sans faute) ou VW_ABSENT (mémoire libérée)
+void vbw_marquer_cellule(VbCell& c, uint32_t i0, uint32_t i1, uint8_t nouvel) {
+    DWORD av = 0;
+    for (uint32_t i = i0; i < i1;) {
+        if (c.st[i] != VW_PROPRE) {
+            if (nouvel == VW_ABSENT && c.st[i] != VW_DEMANDE) c.st[i] = VW_ABSENT, c.coups[i] = 0, c.attente[i] = 0;
+            i++;
+            continue;
+        }
+        uint32_t j = i;
+        while (j < i1 && c.st[j] == VW_PROPRE) j++;
+        if (!VirtualProtect((void*)(c.base + i * VBW_P), (j - i) * VBW_P, PAGE_READWRITE, &av))
+            for (uint32_t k = i; k < j; k++)   // une partie n'est plus engagée : le reste quand même
+                VirtualProtect((void*)(c.base + k * VBW_P), VBW_P, PAGE_READWRITE, &av);
+        for (uint32_t k = i; k < j; k++) {
+            c.st[k] = nouvel;
+            c.gen[k]++;
+            vbw_bit(c, k, false);
+        }
+        i = j;
+    }
+}
+
+void vbw_marquer(uint64_t addr, uint64_t size, uint8_t nouvel) {
+    if (!size || !g_vbw_n.load(std::memory_order_acquire)) return;
+    const uint64_t fin = addr + size;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    for (auto it = g_vbw.lower_bound(addr & ~(VBW_CELL - 1)); it != g_vbw.end() && it->first < fin; ++it) {
+        VbCell& c = *it->second;
+        const uint32_t i0 = addr > c.base ? (uint32_t)((addr - c.base) / VBW_P) : 0;
+        const uint32_t i1 = (uint32_t)std::min<uint64_t>(VBW_NP, (fin - c.base + VBW_P - 1) / VBW_P);
+        vbw_marquer_cellule(c, i0, i1, nouvel);
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+}
+
+void vbw_ecriture(uint64_t addr, uint64_t size) {
+    if (t_vbw_muet || !g_vbw_n.load(std::memory_order_acquire)) return;
+    g_vbw_ecrits++;
+    vbw_marquer(addr, size, VW_SALE);
+}
+
+void vbw_oublie(uint64_t base, uint64_t size) { vbw_marquer(base, size, VW_ABSENT); }
+
+bool vbw_faute(uint64_t addr) {
+    if (!g_vbw_n.load(std::memory_order_acquire)) return false;
+    thread_local uint64_t der = 0;
+    thread_local int rep = 0;
+    const uint64_t page = addr & ~0xfffull;
+    bool ok = false;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    auto it = g_vbw.find(addr & ~(VBW_CELL - 1));
+    if (it != g_vbw.end()) {
+        VbCell& c = *it->second;
+        const uint32_t i = (uint32_t)((addr - c.base) / VBW_P);
+        DWORD av = 0;
+        if (c.st[i] == VW_PROPRE) {
+            ok = VirtualProtect((void*)(c.base + i * VBW_P), VBW_P, PAGE_READWRITE, &av) != 0;
+            c.gen[i]++;
+            vbw_bit(c, i, false);
+            c.st[i] = ok ? VW_SALE : VW_ABSENT;
+            if (ok) {
+                g_vbw_fautes++;
+                const uint32_t img = g_vbw_img.load(std::memory_order_relaxed);
+                if (img - c.copie[i] < 30) {
+                    if (++c.coups[i] >= 3) {
+                        c.st[i] = VW_CHAUD;
+                        c.attente[i] = img + 1200;
+                        c.coups[i] = 0;
+                        g_vbw_chauds++;
+                    }
+                } else {
+                    c.coups[i] = 0;
+                }
+            }
+            der = page, rep = 0;
+        } else if (page != der || rep < 2) {
+            // déjà rendu en écriture par un autre fil au même instant : l'instruction reprend (deux fois au plus :
+            // une page qui faute encore est protégée par autre chose, mem_fault s'en occupe)
+            rep = page == der ? rep + 1 : 1;
+            der = page;
+            ok = VirtualProtect((void*)(c.base + i * VBW_P), VBW_P, PAGE_READWRITE, &av) != 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    return ok;
+}
+
+VbCell* vbw_cellule(uint64_t cb) {
+    auto it = g_vbw.find(cb);
+    if (it != g_vbw.end()) return it->second;
+    static const uint64_t plafond =
+        (getenv("RECOMP_VB_VRAM_MO") ? strtoull(getenv("RECOMP_VB_VRAM_MO"), nullptr, 10) : 2048ull) << 20;
+    if ((g_vbw.size() + 1) * VBW_CELL > plafond) return nullptr;
+    VbCell* c = new VbCell;
+    c->base = cb;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    g_vbw[cb] = c;
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    g_vbw_n.store((int)g_vbw.size(), std::memory_order_release);
+    return c;
+}
+
+// Copie à lier pour lire [lo, hi) d'un tampon qui commence à `addr` (décalage de liaison). Faux : lire l'import ;
+// les morceaux qui manquent sont demandés pour le tampon de commandes suivant.
+bool vbw_lier(uint64_t addr, uint64_t lo, uint64_t hi, VkBuffer* b, uint64_t* off) {
+    if (hi <= lo || addr > lo) return false;
+    const uint64_t cb = lo & ~(VBW_CELL - 1);
+    if (((hi - 1) & ~(VBW_CELL - 1)) != cb || (addr & ~(VBW_CELL - 1)) != cb) {
+        g_vbw_hors++, g_vbw_repli++;
+        return false;
+    }
+    VbCell* c = vbw_cellule(cb);
+    if (!c) {
+        g_vbw_repli++, g_vbw_r_refus++;
+        return false;
+    }
+    const uint32_t i0 = (uint32_t)((lo - cb) / VBW_P), i1 = (uint32_t)((hi - 1 - cb) / VBW_P);
+    if (c->b && vbw_propres(*c, i0, i1)) {
+        *b = c->b, *off = addr - cb;
+        g_vbw_servis++;
+        return true;
+    }
+    g_vbw_repli++;
+    const uint32_t img = (uint32_t)g.cur_frame;
+    bool chaud = false, refuse = false;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    for (uint32_t i = i0; i <= i1; i++) {
+        uint8_t& e = c->st[i];
+        if ((e == VW_ABSENT || e == VW_CHAUD) && (int32_t)(img - c->attente[i]) < 0) {
+            (e == VW_CHAUD ? chaud : refuse) = true;
+            continue;
+        }
+        if (e == VW_ABSENT || e == VW_SALE || e == VW_CHAUD) {
+            e = VW_DEMANDE;
+            g_vbw_dem.push_back(cb + i * VBW_P);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    (chaud ? g_vbw_r_chaud : refuse ? g_vbw_r_refus : g_vbw_r_attente)++;
+    return false;
+}
+
+// Plus petit et plus grand index de [addr, addr + count × isz) (valeur de redémarrage exclue), quand ces index sont
+// déjà copiés et protégés : en cache tant qu'aucun de leurs morceaux n'a été réécrit. Faux : bornes inconnues.
+bool vbw_index_bornes(uint64_t addr, uint32_t count, uint32_t isz, uint32_t* mn, uint32_t* mx) {
+    if (!count || (isz != 2 && isz != 4)) return false;
+    const uint64_t fin = addr + (uint64_t)count * isz, cb = addr & ~(VBW_CELL - 1);
+    if (((fin - 1) & ~(VBW_CELL - 1)) != cb) return false;
+    auto it = g_vbw.find(cb);
+    if (it == g_vbw.end() || !it->second->b) return false;
+    const VbCell& c = *it->second;
+    const uint32_t i0 = (uint32_t)((addr - cb) / VBW_P), i1 = (uint32_t)((fin - 1 - cb) / VBW_P);
+    if (!vbw_propres(c, i0, i1)) return false;
+    uint64_t gs = 0;
+    for (uint32_t i = i0; i <= i1; i++) gs += c.gen[i];
+    auto e = g_vbw_idx.find(addr);
+    if (e != g_vbw_idx.end() && e->second.count == count && e->second.isz == isz && e->second.gsum == gs) {
+        *mn = e->second.mn, *mx = e->second.mx;
+        return true;
+    }
+    uint32_t a = UINT32_MAX, z = 0;
+    if (isz == 2) {
+        const uint16_t* p = (const uint16_t*)addr;
+        for (uint32_t k = 0; k < count; k++)
+            if (p[k] != 0xffff) a = std::min<uint32_t>(a, p[k]), z = std::max<uint32_t>(z, p[k]);
+    } else {
+        const uint32_t* p = (const uint32_t*)addr;
+        for (uint32_t k = 0; k < count; k++)
+            if (p[k] != 0xffffffffu) a = std::min(a, p[k]), z = std::max(z, p[k]);
+    }
+    if (a > z || !vbw_propres(c, i0, i1)) return false;   // réécrits pendant la lecture : pas de cache
+    if (g_vbw_idx.size() > 200000) g_vbw_idx.clear();
+    g_vbw_idx[addr] = {count, isz, gs, a, z};
+    *mn = a, *mx = z;
+    return true;
+}
+
+// Flux de sommets `st` du dessin : copie en mémoire vidéo si les octets lus y sont à jour.
+bool vbw_flux(const nvn::GfxState& s, uint32_t st, const DrawCall& d, int64_t vmin, int64_t vmax, VkBuffer* b,
+              uint64_t* o) {
+    const uint64_t addr = s.vb[st].addr, size = s.vb[st].size;
+    const uint64_t stride = st < (uint32_t)s.nstream ? s.streams[st][0] : 0;
+    const bool inst = st < (uint32_t)s.nstream && s.streams[st][1];
+    int64_t e0 = vmin, e1 = vmax;
+    if (inst) e0 = d.base_instance, e1 = (int64_t)d.base_instance + std::max(1u, d.instances) - 1;
+    if (e0 < 0 || e1 < e0) {   // index pas encore copiés (ou réécrits) : bornes inconnues, flux lu sur l'import
+        g_vbw_r_bornes++, g_vbw_repli++;
+        return false;
+    }
+    uint64_t lo = addr + (uint64_t)e0 * stride, hi = addr + ((uint64_t)e1 + 1) * stride + 64;   // + décalage d'attribut
+    if (!stride) lo = addr, hi = addr + 64;
+    if (size) hi = std::min(hi, addr + size);
+    return vbw_lier(addr, lo, hi, b, o);
+}
+
+void vbw_bilan() {
+    static uint64_t prochain = 600;
+    if (g.cur_frame < prochain) return;
+    prochain = g.cur_frame + 600;
+    uint64_t propres = 0, sales = 0, chauds = 0, cellules = 0;
+    for (auto& [cb, c] : g_vbw) {   // lecture sans verrou : ordre de grandeur
+        if (c->b) cellules++;
+        for (uint32_t i = 0; i < VBW_NP; i++) {
+            const uint8_t e = c->st[i];
+            propres += e == VW_PROPRE, sales += e == VW_SALE || e == VW_DEMANDE, chauds += e == VW_CHAUD;
+        }
+    }
+    const uint64_t liaisons = g_vbw_servis + g_vbw_repli;
+    HLOG("vk", "VB_VRAM: %llu cells (%.0f MB of video memory), %.0f MB copied and watched, %llu pieces waiting for a "
+               "copy, %llu hot (left on the import); last 600 frames: %.0f MB copied, %llu write faults, %llu writes "
+               "outside the processor, %.1f %% of the bindings from video memory (%llu on the import), %llu refused, "
+               "%llu outside a cell, %llu protections postponed (kernel busy); left on the import because of: index bounds "
+               "unknown %llu, hot pieces %llu, refused pieces %llu, not copied yet %llu",
+         (unsigned long long)cellules, cellules * (VBW_CELL / 1048576.0), propres * (VBW_P / 1048576.0),
+         (unsigned long long)sales, (unsigned long long)chauds, g_vbw_copie / 1048576.0,
+         (unsigned long long)g_vbw_fautes.exchange(0), (unsigned long long)g_vbw_ecrits.exchange(0),
+         liaisons ? 100.0 * g_vbw_servis / liaisons : 0.0, (unsigned long long)g_vbw_repli,
+         (unsigned long long)g_vbw_refus, (unsigned long long)g_vbw_hors, (unsigned long long)g_vbw_reportes,
+         (unsigned long long)g_vbw_r_bornes, (unsigned long long)g_vbw_r_chaud, (unsigned long long)g_vbw_r_refus,
+         (unsigned long long)g_vbw_r_attente);
+    g_vbw_copie = g_vbw_servis = g_vbw_repli = g_vbw_refus = g_vbw_hors = g_vbw_reportes = 0;
+    g_vbw_r_bornes = g_vbw_r_chaud = g_vbw_r_refus = g_vbw_r_attente = 0;
+}
+
+// Tête d'un tampon de commandes (begin_frame, après la barrière) : morceaux demandés protégés puis copiés.
+void vbw_copier() {
+    g_vbw_img.store((uint32_t)g.cur_frame, std::memory_order_relaxed);
+    vbw_bilan();
+    if (g_vbw_dem.empty()) return;
+    std::sort(g_vbw_dem.begin(), g_vbw_dem.end());
+    g_vbw_dem.erase(std::unique(g_vbw_dem.begin(), g_vbw_dem.end()), g_vbw_dem.end());
+    // sources, hors verrou (un import peut se faire ici : mem_ensure) ; tampons des cellules créés au besoin
+    struct Src { uint64_t p; VbCell* c; VkBuffer buf; uint64_t base; };
+    std::vector<Src> srcs;
+    srcs.reserve(g_vbw_dem.size());
+    for (uint64_t p : g_vbw_dem) {
+        VbCell* c = g_vbw.find(p & ~(VBW_CELL - 1))->second;
+        if (!c->b && !make_buffer(VBW_CELL, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &c->b, &c->m))
+            c->b = VK_NULL_HANDLE;
+        VkBuffer buf = VK_NULL_HANDLE;
+        uint64_t base = 0;
+        // Fenêtres des calculs : 9 des 26 fenêtres au run 10. Ce que les calculs écrivent par la mémoire globale
+        // est déjà marqué par vbw_ecriture. RECOMP_VB_VRAM_CALC=0 :
+        // fenêtres des calculs jamais copiées (le GPU pourrait y écrire ailleurs, par adresse).
+        static const bool sans_calc = getenv("RECOMP_VB_VRAM_CALC") && atoi(getenv("RECOMP_VB_VRAM_CALC")) == 0;
+        PoolBuf* pb = c->b ? find_import(p, VBW_P) : nullptr;
+        if (pb && !(sans_calc && pb->calc) && p + VBW_P <= pb->base + pb->size) {
+            buf = pb->buf, base = pb->base;
+            if (sans_calc)
+                for (const PoolBuf& q : g.pools)   // une fenêtre de calcul couvre ce morceau : le GPU peut y écrire
+                    if (q.calc && q.base < p + VBW_P && p < q.base + q.size) buf = VK_NULL_HANDLE;
+        }
+        srcs.push_back({p, c, buf, base});
+    }
+    if (!mem_noyau_essayer()) {   // un ReadFile écrit peut-être dans ces pages : au tampon suivant
+        g_vbw_reportes++;
+        return;
+    }
+    std::map<std::pair<VkBuffer, VkBuffer>, std::vector<VkBufferCopy>> lots;
+    const uint32_t img = (uint32_t)g.cur_frame;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    auto idx = [](const Src& s) { return (uint32_t)((s.p - s.c->base) / VBW_P); };
+    for (size_t k = 0; k < srcs.size();) {
+        VbCell& c = *srcs[k].c;
+        const uint32_t ik = idx(srcs[k]);
+        if (c.st[ik] != VW_DEMANDE) {   // oublié ou écrit entre-temps
+            k++;
+            continue;
+        }
+        if (!srcs[k].buf) {
+            c.st[ik] = VW_ABSENT;
+            c.attente[ik] = img + 600;
+            g_vbw_refus++;
+            k++;
+            continue;
+        }
+        size_t j = k;
+        while (j + 1 < srcs.size() && srcs[j + 1].c == srcs[k].c && srcs[j + 1].p == srcs[j].p + VBW_P &&
+               srcs[j + 1].buf == srcs[k].buf && srcs[j + 1].base == srcs[k].base && c.st[idx(srcs[j + 1])] == VW_DEMANDE)
+            j++;
+        const uint64_t a = srcs[k].p, n = (j - k + 1) * VBW_P;
+        DWORD av = 0;
+        const bool ok = VirtualProtect((void*)a, n, PAGE_READONLY, &av) != 0;
+        for (size_t q = k; q <= j; q++) {
+            const uint32_t i = idx(srcs[q]);
+            if (ok) {
+                c.st[i] = VW_PROPRE;
+                c.copie[i] = img;
+                vbw_bit(c, i, true);
+            } else {
+                c.st[i] = VW_ABSENT;
+                c.attente[i] = img + 600;
+                g_vbw_refus++;
+            }
+        }
+        if (ok) {
+            lots[{srcs[k].buf, c.b}].push_back({a - srcs[k].base, a - c.base, n});
+            g_vbw_copie += n;
+        }
+        k = j + 1;
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    mem_noyau_liberer();
+    g_vbw_dem.clear();
+    if (lots.empty()) return;
+    for (auto& [bb, cps] : lots) vkCmdCopyBuffer(g.cb, bb.first, bb.second, (uint32_t)cps.size(), cps.data());
+    barrier_all();   // copies finies avant les lectures de sommets et d'index qui suivent
+}
+
 void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
     ensure_init();
     if (!g.ok) return;
@@ -6641,6 +7034,15 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
     vkCmdBindDescriptorSets(g.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 3, all, 0, nullptr);
     dtm.mark();   // 4 : descripteurs
     // ---- tampons de sommets (chaque flux une fois par dessin : plusieurs attributs lisent souvent le même)
+    // RECOMP_VB_VRAM : sommets lus par ce dessin (bornes des index, ou first + count), base_vertex compris
+    const bool vbw = vbv_actif();
+    int64_t vmin = 0, vmax = -1;
+    if (vbw) {
+        uint32_t a, z;
+        if (d.kind == DrawCall::Arrays) vmin = d.first, vmax = (int64_t)d.first + d.count - 1;
+        else if (d.index_type != 0 && vbw_index_bornes(d.index_addr, d.count, d.index_type == 1 ? 2 : 4, &a, &z))
+            vmin = (int64_t)a + d.base_vertex, vmax = (int64_t)z + d.base_vertex;
+    }
     uint32_t flux_lies = 0;
     for (int loc : vs->vin) {
         uint32_t a = loc < s.nattr ? s.attribs[loc] : 0;
@@ -6649,7 +7051,9 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
         flux_lies |= 1u << st;
         VkBuffer b = g.ring;
         uint64_t o = 0;
-        if (st < 32 && s.vb[st].addr && !find_pool(s.vb[st].addr, std::max<uint64_t>(s.vb[st].size, 1), &b, &o)) {
+        if (st < 32 && s.vb[st].addr &&
+            !(vbw && vbw_flux(s, st, d, vmin, vmax, &b, &o)) &&
+            !find_pool(s.vb[st].addr, std::max<uint64_t>(s.vb[st].size, 1), &b, &o)) {
             static std::set<std::string> seen;
             if (seen.size() < 64 && seen.insert(prog.label + "|" + std::to_string(st)).second)
                 HLOG("vk", "vertex buffer not found: stream %u at 0x%llx ('%s')", st,
@@ -6718,7 +7122,9 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
         VkBuffer b;
         uint64_t o;
         uint32_t isz = d.index_type == 0 ? 1 : d.index_type == 1 ? 2 : 4;
-        if (!find_pool(d.index_addr, (uint64_t)d.count * isz, &b, &o) || d.index_type == 0) {
+        if (d.index_type == 0 ||
+            (!(vbw && vbw_lier(d.index_addr, d.index_addr, d.index_addr + (uint64_t)d.count * isz, &b, &o)) &&
+             !find_pool(d.index_addr, (uint64_t)d.count * isz, &b, &o))) {
             skip(d.index_type == 0 ? "8-bit index" : "index buffer not found", prog.label);
             prof_end(pq, "(draw skipped)", "skipped");
             return;
@@ -6949,6 +7355,7 @@ void dispatch(const nvn::GfxState& s, uint32_t gx, uint32_t gy, uint32_t gz) {
             }
             for (uint32_t k = 0; k < nssbo && k < 32; k++) {
                 const nvn::Range& r = s.ssbo[5][k];
+                if (cs->glob && r.addr && r.size) vbw_ecriture(r.addr, r.size);   // RECOMP_VB_VRAM : écrit par le GPU
                 const uint64_t d[2] = {r.addr, r.size};
                 if (ssbo_base + 16 * k + 16 <= GTAB) memcpy(p + ssbo_base + 16 * k, d, 16);
                 if (cs->glob && r.addr && r.size && !getenv("RECOMP_GLOB_RETOUR_SEUL") && !guest_devaddr(r.addr, r.size)) {   // importe sa fenêtre au besoin
@@ -7333,6 +7740,7 @@ bool copy_buffer(uint64_t src, uint64_t dst, uint64_t size) {
     VkBufferCopy c{so, dof, size};
     vkCmdCopyBuffer(g.cb, sb, db, 1, &c);
     barrier_all();
+    vbw_ecriture(dst, size);   // RECOMP_VB_VRAM : écrit par le GPU, sans faute
     static int nlog = 0;
     if (nlog++ < 6) HLOG("vk", "CopyBufferToBuffer 0x%llx → 0x%llx (%llu bytes): on the GPU", (unsigned long long)src,
                          (unsigned long long)dst, (unsigned long long)size);
