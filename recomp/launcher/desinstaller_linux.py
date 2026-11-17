@@ -29,6 +29,8 @@ Ce que l'AppImage écrit sur une machine :
   Bureau/StarFox Remake [recompiled].desktop raccourci créé depuis le launcher, s'il mène à cette installation
   ~/.local/share/applications/spaceanimalsrecomp.desktop, ~/.local/share/icons/hicolor/256x256/apps/spaceanimalsrecomp.png
                                              entrée de menu et icône (AppRun, à chaque lancement)
+  ~/.local/share/applications/spaceanimalsrecomp-game.desktop, …/256x256/apps/spaceanimalsrecomp-game.png
+                                             entrée cachée et icône du jeu (le jeu, à chaque lancement)
   ~/.local/share/SpaceAnimalsRecomp          sauvegardes et copies de secours (à côté de l'installation)
 Journal : ${TMPDIR:-/tmp}/SpaceAnimalsRecomp-uninstall.log (en anglais).
 """
@@ -125,10 +127,11 @@ def raccourci_bureau(racine, appimage):
 
 
 def integration():
-    """Entrée de menu et icône posées par AppRun (paquet_linux.py), au nom de l'identifiant des fenêtres."""
+    """Entrées de bureau et icônes, au nom de l'identifiant des fenêtres : celles du launcher (AppRun, paquet_linux.py) et
+    celles du jeu (present.cpp, integrer_bureau)."""
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    return [os.path.join(base, "applications", "spaceanimalsrecomp.desktop"),
-            os.path.join(base, "icons", "hicolor", "256x256", "apps", "spaceanimalsrecomp.png")]
+    return [os.path.join(base, "applications", f"{n}.desktop") for n in ("spaceanimalsrecomp", "spaceanimalsrecomp-game")] + \
+           [os.path.join(base, "icons", "hicolor", "256x256", "apps", f"{n}.png") for n in ("spaceanimalsrecomp", "spaceanimalsrecomp-game")]
 
 
 def elements(racine, appimage):

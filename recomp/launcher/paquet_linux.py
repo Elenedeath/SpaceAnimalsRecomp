@@ -123,8 +123,8 @@ if command -v flock >/dev/null 2>&1; then
 else
     ln -sfn "$here/outils" "$home/outils"
 fi
-# intégration au bureau : entrée de menu et icône, au nom de l'identifiant des fenêtres du launcher et du jeu
-# (SDL_HINT_APP_ID « spaceanimalsrecomp »). GNOME (Wayland) ne prend l'icône d'une fenêtre que dans le .desktop de
+# intégration au bureau : entrée de menu et icône, au nom de l'identifiant des fenêtres du launcher
+# (SDL_HINT_APP_ID « spaceanimalsrecomp » ; le jeu pose la sienne, spaceanimalsrecomp-game, avec l'icône du jeu). GNOME (Wayland) ne prend l'icône d'une fenêtre que dans le .desktop de
 # même nom : sans lui, un engrenage dans le dock. Refaite quand l'AppImage a changé de place ou d'icône ; retirée par
 # DÉSINSTALLER (desinstaller_linux.py). Jamais bloquante : une erreur ici n'empêche pas le lancement.
 if [ -n "${APPIMAGE:-}" ]; then

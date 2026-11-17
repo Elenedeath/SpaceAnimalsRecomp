@@ -309,11 +309,124 @@ void gfx_present(const float rgba[4], uint64_t frame) {
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+
+// Icône du jeu (JPEG tiré de la copie du joueur par preparer.py) : décodée par stb_image (domaine public / MIT,
+// third_party/stb_image.h, v2.32), JPEG seulement.
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_JPEG
+#define STBI_NO_LINEAR
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#include "stb_image.h"
+#pragma GCC diagnostic pop
+
 namespace hos {
 namespace vkr {
 void save_caches();   // vk_render.cpp : écrit pipelines.cache
 }
 namespace {
+
+SDL_Surface* g_icone_jeu = nullptr;   // icône du jeu (fenêtre), nullptr sans elle
+
+// Icône du jeu : build/full/icone_jeu.jpg, à côté de recomp_main (preparer.py, tirée de votre copie du jeu ; elle
+// reste sur ce PC). C'est l'icône de recomp_main.exe sous Windows. nullptr si elle manque ou ne se décode pas.
+SDL_Surface* icone_jeu() {
+    const char* base = SDL_GetBasePath();
+    if (!base) return nullptr;
+    int w = 0, h = 0, n = 0;
+    unsigned char* px = stbi_load((std::string(base) + "icone_jeu.jpg").c_str(), &w, &h, &n, 4);
+    if (!px) return nullptr;
+    SDL_Surface* s = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_RGBA32);
+    if (s)
+        for (int y = 0; y < h; y++)
+            memcpy((uint8_t*)s->pixels + (size_t)y * s->pitch, px + (size_t)y * w * 4, (size_t)w * 4);
+    stbi_image_free(px);
+    return s;
+}
+
+bool lire_fichier(const std::string& p, std::string& out) {
+    FILE* f = fopen(p.c_str(), "rb");
+    if (!f) return false;
+    char b[65536];
+    size_t n;
+    out.clear();
+    while ((n = fread(b, 1, sizeof b, f)) > 0) out.append(b, n);
+    fclose(f);
+    return true;
+}
+bool ecrire_si_change(const std::string& p, const std::string& contenu) {   // vrai si le fichier a changé
+    std::string actuel;
+    if (lire_fichier(p, actuel) && actuel == contenu) return false;
+    const std::string tmp = p + ".new";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = fwrite(contenu.data(), 1, contenu.size(), f) == contenu.size();
+    if (fclose(f) != 0 || !ok || rename(tmp.c_str(), p.c_str()) != 0) {
+        remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+void creer_dossiers(const std::string& d) {   // mkdir -p
+    for (size_t i = 1; i <= d.size(); i++)
+        if (i == d.size() || d[i] == '/') mkdir(d.substr(0, i).c_str(), 0755);
+}
+
+// Entrée de bureau du jeu (AppImage seulement, comme celle du launcher posée par AppRun) : GNOME (Wayland) ne prend
+// l'icône d'une fenêtre que dans le .desktop au nom de son identifiant ; sans lui, un engrenage dans le dock. Entrée
+// cachée du menu (NoDisplay : le menu lance le launcher), refaite si l'icône ou la place de l'AppImage ont changé,
+// retirée par DÉSINSTALLER (desinstaller_linux.py). Jamais bloquante.
+void integrer_bureau(SDL_Surface* icone) {
+    const char* appimage = getenv("APPIMAGE");
+    if (!appimage || !*appimage) return;
+    const char* xdg = getenv("XDG_DATA_HOME");
+    const char* home = getenv("HOME");
+    std::string donnees;
+    if (xdg && *xdg) donnees = xdg;
+    else if (home && *home) donnees = std::string(home) + "/.local/share";
+    else return;
+    const std::string theme = donnees + "/icons/hicolor", apps = donnees + "/applications";
+    const std::string png = theme + "/256x256/apps/spaceanimalsrecomp-game.png";
+    creer_dossiers(theme + "/256x256/apps");
+    creer_dossiers(apps);
+    // icône : PNG 256 × 256 (taille du dossier hicolor)
+    SDL_Surface* s = icone->w == 256 && icone->h == 256 ? icone : SDL_ScaleSurface(icone, 256, 256, SDL_SCALEMODE_LINEAR);
+    if (s) {
+        const std::string tmp = png + ".tmp";
+        std::string donnees_png;
+        if (SDL_SavePNG(s, tmp.c_str()) && lire_fichier(tmp, donnees_png) && ecrire_si_change(png, donnees_png)) {
+            // cache d'icônes plus ancien que l'icône : rendu périmé (GTK ne s'y fie que s'il est plus récent que le
+            // dossier hicolor, que l'ajout d'une icône dans un sous-dossier ne date pas ; voir AppRun)
+            struct stat c{};
+            if (stat((theme + "/icon-theme.cache").c_str(), &c) == 0) utimensat(AT_FDCWD, theme.c_str(), nullptr, 0);
+        }
+        remove(tmp.c_str());
+        if (s != icone) SDL_DestroySurface(s);
+    }
+    // Exec : chemin entre guillemets, échappé selon la spécification Desktop Entry (comme AppRun)
+    std::string exec;
+    for (const char* c = appimage; *c; c++) {
+        if (*c == '\\') exec += "\\\\\\\\";
+        else if (*c == '"' || *c == '`' || *c == '$') exec += "\\\\", exec += *c;
+        else if (*c == '%') exec += "%%";
+        else exec += *c;
+    }
+    ecrire_si_change(apps + "/spaceanimalsrecomp-game.desktop",
+                     "[Desktop Entry]\n"
+                     "Type=Application\n"
+                     "Name=StarFox Remake [recompiled]\n"
+                     "Comment=Native port of Star Fox (Switch 2), built on your PC from your own copy\n"
+                     "Exec=\"" + exec + "\"\n"
+                     "Icon=spaceanimalsrecomp-game\n"
+                     "StartupWMClass=spaceanimalsrecomp-game\n"
+                     "Categories=Game;\n"
+                     "NoDisplay=true\n"
+                     "Terminal=false\n");
+}
 
 std::mutex g_lk;
 std::condition_variable g_cv;
@@ -375,9 +488,12 @@ void creer_fenetre() {   // fil principal
     HLOG("gfx", "host window %dx%d (SDL %s video driver)", g_w, g_h, SDL_GetCurrentVideoDriver());
     if (cachee) HLOG("gfx", "window hidden (RECOMP_WINDOW_HIDDEN)");
     else if (settings().borderless) set_borderless(w, true);
-    // icône de la fenêtre : lanceur.png de l'installation (recomp_main est dans <installation>/recomp/build/full).
-    // X11 et KDE la montrent ; GNOME prend celle de l'entrée de menu spaceanimalsrecomp.desktop (posée par AppRun)
-    if (const char* base = SDL_GetBasePath()) {
+    // icône de la fenêtre : celle du jeu (icone_jeu, comme recomp_main.exe sous Windows), à défaut lanceur.png de
+    // l'installation (recomp_main est dans <installation>/recomp/build/full). X11 et KDE la montrent ; GNOME prend
+    // celle du .desktop au nom de l'identifiant de la fenêtre (integrer_bureau, ou spaceanimalsrecomp d'AppRun)
+    if (g_icone_jeu) {
+        SDL_SetWindowIcon(w, g_icone_jeu);
+    } else if (const char* base = SDL_GetBasePath()) {
         if (SDL_Surface* icone = SDL_LoadPNG((std::string(base) + "../../../lanceur.png").c_str())) {
             SDL_SetWindowIcon(w, icone);
             SDL_DestroySurface(icone);
@@ -392,7 +508,12 @@ void creer_fenetre() {   // fil principal
 // Fil principal : vidéo de SDL et boucle d'événements jusqu'à la fin du jeu (fini(arg) vrai)
 void gfx_boucle_principale(bool (*fini)(void*), void* arg) {
     SDL_SetHint(SDL_HINT_APP_NAME, "StarFox Remake [recompiled]");
-    SDL_SetHint(SDL_HINT_APP_ID, "spaceanimalsrecomp");
+    // Le jeu a son icône et son identifiant (spaceanimalsrecomp-game), le launcher les siens (spaceanimalsrecomp) :
+    // le dock montre l'icône de l'application active, comme la barre des tâches de Windows. Sans icône du jeu,
+    // l'identifiant du launcher (son entrée de menu existe, pas d'engrenage dans le dock).
+    g_icone_jeu = icone_jeu();
+    if (g_icone_jeu) integrer_bureau(g_icone_jeu);
+    SDL_SetHint(SDL_HINT_APP_ID, g_icone_jeu ? "spaceanimalsrecomp-game" : "spaceanimalsrecomp");
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
     const bool ok = SDL_InitSubSystem(SDL_INIT_VIDEO) && SDL_Vulkan_LoadLibrary(nullptr);
     {

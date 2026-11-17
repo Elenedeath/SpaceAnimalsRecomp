@@ -41,6 +41,11 @@ Produit `SpaceAnimalsRecomp-<version>-x86_64.AppImage`. Au lancement, `AppRun` g
 sources) dans `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp/app` : le jeu construit, `recomp.ini` et les caches
 y restent ; les outils (Python, zig, glslang, SDL3) restent dans l'image montée.
 
+Bureau : `AppRun` pose l'entrée de menu et l'icône du launcher (`spaceanimalsrecomp`). Le jeu pose sa propre entrée,
+cachée du menu (`spaceanimalsrecomp-game`, `NoDisplay`), avec l'icône du jeu tirée de votre copie
+(`build/full/icone_jeu.jpg`, décodée par stb_image) : la fenêtre du jeu a l'icône du jeu et le launcher garde la sienne,
+comme sous Windows, et le dock montre celle de l'application active. DÉSINSTALLER retire les deux.
+
 Pour le launcher seul : `python3 recomp/launcher/construire.py --sysroot <sysroot>` (écrit `lanceur` à la racine).
 
 ## Limites connues

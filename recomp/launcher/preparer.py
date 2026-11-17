@@ -704,7 +704,7 @@ def extraire_icone(copie):
     chemin_jpg = os.path.join(FULL, "icone.jpg")
     with open(chemin_jpg, "wb") as f:
         f.write(jpg)
-    if plateforme.LINUX:   # pas d'icône dans l'exécutable sous Linux : le JPEG est gardé (launcher, raccourci)
+    if plateforme.LINUX:   # pas d'icône dans l'exécutable sous Linux : le JPEG est gardé (fenêtre du jeu, present.cpp)
         os.replace(chemin_jpg, os.path.join(FULL, "icone_jeu.jpg"))
         dire("game icon: icone_jeu.jpg")
         return

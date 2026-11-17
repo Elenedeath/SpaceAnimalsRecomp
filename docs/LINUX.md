@@ -42,6 +42,11 @@ Produces `SpaceAnimalsRecomp-<version>-x86_64.AppImage`. On launch, `AppRun` kee
 sources) in `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp/app`: the built game, `recomp.ini` and the caches stay
 there; the tools (Python, zig, glslang, SDL3) stay in the mounted image.
 
+Desktop: `AppRun` installs the launcher's menu entry and icon (`spaceanimalsrecomp`). The game installs its own hidden
+entry (`spaceanimalsrecomp-game`, `NoDisplay`) with the game icon taken from your copy (`build/full/icone_jeu.jpg`,
+decoded by stb_image): the game window shows the game icon and the launcher keeps its own, as on Windows, and the dock
+shows the icon of the active application. UNINSTALL removes both.
+
 Launcher only: `python3 recomp/launcher/construire.py --sysroot <sysroot>` (writes `lanceur` at the root).
 
 ## Known limitations
