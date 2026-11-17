@@ -1,10 +1,13 @@
 # Releases of this fork.
 #
-#   Windows: push a tag "v<version>" on main (for example v1.1.0.1), or run this workflow by hand
-#            (Actions > Release > Run workflow, platform "windows").
-#   Linux:   run this workflow by hand with platform "linux": the AppImage is built from the "linux" branch and
-#            published under the tag "linux-v<version>" (not marked as the latest release, so the Windows
-#            launcher's update check keeps finding the Windows release).
+#   Windows: run this workflow by hand (Actions > Release > Run workflow, platform "windows"), or push a tag
+#            "v<version>" (for example v1.1.0.1). Built from the "shaders" branch.
+#   Linux:   run this workflow by hand with platform "linux": the AppImage is built from the "linux" branch with
+#            the "shaders" branch merged in, and published under the tag "linux-v<version>" (not marked as the
+#            latest release, so the Windows launcher's update check keeps finding the Windows release).
+#
+# Branches: the first one is checked out, the others are merged into it for the build only (nothing is pushed).
+# The release tag points at the head of the first branch; the notes list the commit of every branch.
 #
 # The launcher background videos are not in git (.gitignore): they are taken from this repository's "extraits"
 # release (assets extrait_*.mp4).
@@ -21,15 +24,15 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: "windows (built from main) or linux (AppImage built from the linux branch)"
+        description: "windows (zip) or linux (AppImage)"
         type: choice
         options: [windows, linux]
         default: windows
       version:
         description: "Version number without the v, for example 1.1.0.1"
         required: true
-      branch:
-        description: "Branch to build (empty: main for windows, linux for linux)"
+      branches:
+        description: "Branches to build, the others merged into the first (empty: 'shaders' for windows, 'linux shaders' for linux)"
         required: false
         default: ""
 
@@ -53,21 +56,37 @@ jobs:
         id: v
         env:
           IN_VERSION: ${{ inputs.version }}
-          IN_BRANCH: ${{ inputs.branch }}
+          IN_BRANCHES: ${{ inputs.branches }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            tag="$GITHUB_REF_NAME"; version="${tag#v}"; ref="$GITHUB_SHA"
+            tag="$GITHUB_REF_NAME"; version="${tag#v}"
           else
-            version="$IN_VERSION"; tag="v$version"; ref="${IN_BRANCH:-main}"
+            version="$IN_VERSION"; tag="v$version"
           fi
+          branches="${IN_BRANCHES:-shaders}"; ref="${branches%% *}"
           echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+)+$' || { echo "::error::bad version: $version"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "branches=$branches" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.v.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Merge the other branches (build only)
+        id: m
+        run: |
+          git config user.name "release workflow"
+          git config user.email "release-workflow@users.noreply.github.com"
+          echo "target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          notes="$(echo ${{ steps.v.outputs.branches }} | cut -d' ' -f1) $(git rev-parse --short HEAD)"
+          for b in $(echo ${{ steps.v.outputs.branches }} | cut -s -d' ' -f2-); do
+            git merge --no-edit "origin/$b" || { echo "::error::$b does not merge cleanly"; exit 1; }
+            notes="$notes, $b $(git rev-parse --short origin/$b)"
+          done
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v5
         with:
@@ -103,9 +122,9 @@ jobs:
         run: |
           ls -l dist
           gh release create "${{ steps.v.outputs.tag }}" dist/*.zip dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
-            --target "$(git rev-parse HEAD)" --latest \
+            --target "${{ steps.m.outputs.target }}" --latest \
             --title "SpaceAnimalsRecomp ${{ steps.v.outputs.version }}" \
-            --notes "Windows build of commit $(git rev-parse --short HEAD)."
+            --notes "Windows build. Branches: ${{ steps.m.outputs.notes }}."
 
   linux:
     if: github.event_name == 'workflow_dispatch' && inputs.platform == 'linux'
@@ -115,17 +134,33 @@ jobs:
         id: v
         env:
           IN_VERSION: ${{ inputs.version }}
-          IN_BRANCH: ${{ inputs.branch }}
+          IN_BRANCHES: ${{ inputs.branches }}
         run: |
-          version="$IN_VERSION"; tag="linux-v$version"; ref="${IN_BRANCH:-linux}"
+          version="$IN_VERSION"; tag="linux-v$version"
+          branches="${IN_BRANCHES:-linux shaders}"; ref="${branches%% *}"
           echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+)+$' || { echo "::error::bad version: $version"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "branches=$branches" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.v.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Merge the other branches (build only)
+        id: m
+        run: |
+          git config user.name "release workflow"
+          git config user.email "release-workflow@users.noreply.github.com"
+          echo "target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          notes="$(echo ${{ steps.v.outputs.branches }} | cut -d' ' -f1) $(git rev-parse --short HEAD)"
+          for b in $(echo ${{ steps.v.outputs.branches }} | cut -s -d' ' -f2-); do
+            git merge --no-edit "origin/$b" || { echo "::error::$b does not merge cleanly"; exit 1; }
+            notes="$notes, $b $(git rev-parse --short origin/$b)"
+          done
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
 
       - name: Build packages
         run: |
@@ -160,6 +195,6 @@ jobs:
       - name: Publish the release
         run: |
           gh release create "${{ steps.v.outputs.tag }}" dist/*.AppImage dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
-            --target "$(git rev-parse HEAD)" --latest=false \
+            --target "${{ steps.m.outputs.target }}" --latest=false \
             --title "SpaceAnimalsRecomp ${{ steps.v.outputs.version }} (Linux)" \
-            --notes "Linux AppImage (Steam Deck and desktop Linux) of commit $(git rev-parse --short HEAD), branch ${{ steps.v.outputs.ref }}."
+            --notes "Linux AppImage (Steam Deck and desktop Linux). Branches: ${{ steps.m.outputs.notes }}."
