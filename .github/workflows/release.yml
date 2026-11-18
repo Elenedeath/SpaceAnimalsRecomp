@@ -230,16 +230,22 @@ jobs:
       - name: Version (build only)
         run: printf '%s' "${{ steps.v.outputs.version }}" > recomp/VERSION
 
+      # The finished system root is cached (key: sysroot_linux.py, which pins the SDK and SDL versions): on a hit it is
+      # used as is; sysroot_linux.py (SDK unpacked, SDL3 compiled, ~1.2 GB downloaded) only runs when the script changes.
       - name: System root cache
+        id: src
         uses: actions/cache@v4
         with:
-          path: |
-            ~/sysroot
-            ~/sysroot.cache
-          key: sysroot-${{ hashFiles('recomp/launcher/sysroot_linux.py') }}
+          path: ~/sysroot
+          key: sysroot-only-${{ hashFiles('recomp/launcher/sysroot_linux.py') }}
 
       - name: System root (sysroot_linux.py)
-        run: python3 recomp/launcher/sysroot_linux.py "$HOME/sysroot" --cache "$HOME/sysroot.cache"
+        run: |
+          if [ "${{ steps.src.outputs.cache-hit }}" = true ] && [ -f "$HOME/sysroot/.sysroot_linux" ]; then
+            echo "system root from the cache:"; cat "$HOME/sysroot/.sysroot_linux"
+          else
+            python3 recomp/launcher/sysroot_linux.py "$HOME/sysroot" --cache "$HOME/sysroot.cache"
+          fi
 
       - name: AppImage (paquet_linux.py)
         run: |
