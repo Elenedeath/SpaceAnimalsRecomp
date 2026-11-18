@@ -634,7 +634,18 @@ bool mem_release_actif() {
 
 // Rend à Windows les pages entières de [addr, addr + size), que l'appelant vient de lire en entier. Tout ou rien :
 // rend le nombre d'octets rendus (0 : rien n'a changé) et le numéro du rendu dans *id.
-uint64_t mem_release(uint64_t addr, uint64_t size, uint64_t* id) {
+// id_impose : numéro d'un rendu déjà commencé (rendu par morceaux, mem_release_part), 0 : nouveau numéro
+static uint64_t rel_rendre(uint64_t addr, uint64_t size, uint64_t* id, uint64_t id_impose);
+uint64_t mem_release(uint64_t addr, uint64_t size, uint64_t* id) { return rel_rendre(addr, size, id, 0); }
+// Un morceau d'une grosse source, rendu sous le numéro *id (0 au premier morceau : un numéro est pris et rendu dans
+// *id). Les morceaux d'un même numéro, contigus, forment un seul rendu pour mem_released_intact et mem_release_vivant.
+uint64_t mem_release_part(uint64_t addr, uint64_t size, uint64_t* id) {
+    const uint64_t id0 = *id;
+    const uint64_t n = rel_rendre(addr, size, id, id0);
+    if (!n) *id = id0;
+    return n;
+}
+static uint64_t rel_rendre(uint64_t addr, uint64_t size, uint64_t* id, uint64_t id_impose) {
     *id = 0;
     vkr::vbw_ecriture(addr, size);   // pages bientôt désengagées : plus suivies
     if (!mem_release_actif()) return 0;
@@ -674,11 +685,12 @@ uint64_t mem_release(uint64_t addr, uint64_t size, uint64_t* id) {
             if (!ok) VirtualProtect((void*)d, f - d, PAGE_READWRITE, &avant);
         }
         if (ok) {
-            g_rel[d] = Rendu{f, off, ++g_rel_id, true};
+            const uint64_t nid = id_impose ? id_impose : ++g_rel_id;
+            g_rel[d] = Rendu{f, off, nid, true};
             g_rel_octets += f - d;
             g_rel_cumul += f - d;
             g_rel_ecrits += f - d;
-            *id = g_rel_id;
+            *id = nid;
             fait = f - d;
         } else {
             rel_liberer(off, f - d);
@@ -692,9 +704,16 @@ uint64_t mem_release(uint64_t addr, uint64_t size, uint64_t* id) {
 // Le rendu `id` de [addr, addr + size) n'a jamais été retouché : ni lu, ni écrit, ni restauré depuis.
 bool mem_released_intact(uint64_t addr, uint64_t size, uint64_t id) {
     if (!id || !size) return false;
+    // un seul rendu, ou les morceaux contigus d'un rendu par morceaux (mem_release_part), tous encore là
     AcquireSRWLockShared(&g_rel_lock);
-    auto it = g_rel.find(addr);
-    const bool ok = it != g_rel.end() && it->second.fin == addr + size && it->second.id == id;
+    const uint64_t fin = addr + size;
+    uint64_t p = addr;
+    bool ok = true;
+    while (ok && p < fin) {
+        auto it = g_rel.find(p);
+        ok = it != g_rel.end() && it->second.id == id && it->second.fin > p && it->second.fin <= fin;
+        if (ok) p = it->second.fin;
+    }
     ReleaseSRWLockShared(&g_rel_lock);
     return ok;
 }
