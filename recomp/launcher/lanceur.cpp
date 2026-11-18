@@ -1600,6 +1600,98 @@ float dip(int px) { return px * 96.f / g.dpi; }
 // fenêtre, dessin Direct2D, position de la souris) : la fenêtre grandit sans toucher à la mise en page. Si la zone de
 // travail de l'écran est trop petite pour la fenêtre agrandie, l'échelle est réduite pour qu'elle tienne (jusqu'à
 // 0,75 : avant, la fenêtre de 1000 × 600 dépassait d'un écran de 1366 × 768 réglé à 125 %).
+// ---- navigation à la manette (2026-11-18) : le launcher se mène sans souris (Steam Deck en mode Jeu). La croix ou le
+// stick gauche passe d'une zone cliquable à la plus proche dans la direction voulue (dessin.cpp, zone_voisine) ; la
+// zone choisie est celle « survolée » (mêmes reflets), avec un cadre. A (bouton du bas) vaut un clic, B (droite) Échap,
+// Start « JOUER » ; ← → changent directement un sélecteur ‹ › ; LB / RB passent d'un onglet à l'autre (Contrôles).
+// Rien pendant une attente d'appui de l'onglet Manette : l'appui est pour le bouton choisi (pad_suivre_capture).
+namespace {
+// sélecteurs ‹ › : zone de gauche (celle de droite la suit)
+const int SELECTEURS_G[] = {Z_RES_G,  Z_HZ_G,  Z_NATIF_G, Z_AFF_G,  Z_VOL_G,   Z_FOND_G, Z_FILS_G, Z_LANGUE_G, Z_MAJ_AUTO_G,
+                            Z_VIB_G,  Z_PRESET_G, Z_DLSS_G, Z_DLSSM_G, Z_FSR_G, Z_FSRV_G, Z_GPU_G};
+// zone ‹ et zone › du sélecteur qui contient z ; faux si z n'en est pas un
+bool selecteur_de(int z, int* zg, int* zd) {
+    for (int s : SELECTEURS_G)
+        if (z == s || z == s + 1) {
+            *zg = s, *zd = s + 1;
+            return true;
+        }
+    int i = -1;
+    if (z >= Z_PAD0 && z <= Z_PAD_FIN) i = z - Z_PAD0;   // onglet Manette : ligne d'un bouton de la Switch
+    else if (z >= Z_PADG0 && z <= Z_PADG_FIN) i = z - Z_PADG0;
+    else if (z >= Z_PADD0 && z <= Z_PADD_FIN) i = z - Z_PADD0;
+    if (i < 0) return false;
+    *zg = Z_PADG0 + i, *zd = Z_PADD0 + i;
+    return true;
+}
+// même effet qu'un clic sur la zone (WM_LBUTTONUP)
+void cliquer(int z) {
+    const int attente = g.capture;
+    g.capture = -1;
+    if (z >= Z_ENTREE0 && z <= Z_ENTREE_FIN) pad_entree_cliquee(z - Z_ENTREE0, -1);
+    else if (!(attente >= 0 && z == Z_TOUCHE0 + attente)) action(z);
+}
+uint32_t g_nav_prec = 0;      // entrées (et directions du stick) de l'image précédente
+ULONGLONG g_nav_repete = 0;   // direction tenue : prochaine répétition
+}  // namespace
+
+void manette_naviguer() {
+    const EtatManettes& e = manettes();
+    uint32_t m = e.appuyees;
+    // stick gauche : une direction quand il est poussé à plus de la moitié (l'axe dominant)
+    const float sx = e.axes[0], sy = e.axes[1];
+    if (std::fabs(sx) > 0.55f || std::fabs(sy) > 0.55f) {
+        if (std::fabs(sx) >= std::fabs(sy)) m |= 1u << (sx < 0 ? P_GAUCHE : P_DROITE);
+        else m |= 1u << (sy < 0 ? P_HAUT : P_BAS);
+    }
+    const uint32_t nouv = m & ~g_nav_prec;
+    g_nav_prec = m;
+    if (g.capture_pad >= 0 || GetForegroundWindow() != g.hwnd) return;
+    const ULONGLONG t = GetTickCount64();
+    auto appui = [&](int p) { return (nouv >> p & 1) != 0; };
+    // directions : au premier appui, puis répétées (0,4 s, puis toutes les 0,12 s) tant qu'elles sont tenues
+    const uint32_t DIRS = 1u << P_HAUT | 1u << P_BAS | 1u << P_GAUCHE | 1u << P_DROITE;
+    int dir = -1;
+    for (int p : {P_HAUT, P_BAS, P_GAUCHE, P_DROITE})
+        if (appui(p)) dir = p;
+    if (dir >= 0) {
+        g_nav_repete = t + 400;
+    } else if ((m & DIRS) && t >= g_nav_repete) {
+        for (int p : {P_HAUT, P_BAS, P_GAUCHE, P_DROITE})
+            if (m >> p & 1) dir = p;
+        g_nav_repete = t + 120;
+    }
+    if (dir >= 0) {
+        int z = g.pad_nav ? g.zone_survol : Z_AUCUNE;
+        if (z == Z_AUCUNE || !zone_presente(z)) {   // première direction : JOUER, ou la première zone de l'écran
+            z = zone_presente(Z_PRINCIPAL) ? Z_PRINCIPAL : zone_premiere();
+        } else {
+            int zg, zd;
+            const bool horiz = dir == P_GAUCHE || dir == P_DROITE;
+            if (horiz && selecteur_de(z, &zg, &zd)) {   // sélecteur : la valeur change, la sélection reste sur la ligne
+                const int c = dir == P_GAUCHE ? zg : zd;
+                action(c);
+                if (!(z >= Z_PAD0 && z <= Z_PAD_FIN)) z = c;
+            } else {
+                const int v = zone_voisine(z, dir == P_GAUCHE ? -1 : dir == P_DROITE ? 1 : 0,
+                                           dir == P_HAUT ? -1 : dir == P_BAS ? 1 : 0);
+                if (v != Z_AUCUNE) z = v;
+            }
+        }
+        g.zone_survol = z;
+        g.pad_nav = true;
+        g.sx = g.sy = -1;   // la souris ne reprend la sélection qu'en bougeant
+    }
+    if (appui(P_SUD) && g.pad_nav && g.zone_survol != Z_AUCUNE && zone_presente(g.zone_survol)) cliquer(g.zone_survol);
+    if (appui(P_EST)) {   // comme Échap
+        if (g.capture >= 0) g.capture = -1;
+        else g.page = Page::Aucune;
+    }
+    if (appui(P_START) && g.capture < 0) action(Z_PRINCIPAL);   // comme Entrée
+    if ((appui(P_EPAULE_G) || appui(P_EPAULE_D)) && g.page == Page::Controles && g.capture < 0)
+        g.onglet_manette = !g.onglet_manette;
+}
+
 float dpi_fenetre(float dpi_ecran, const RECT& zone) {
     const float lw = LARGEUR * dpi_ecran / 96, lh = HAUTEUR * dpi_ecran / 96;
     float e = std::min({ECHELLE, (zone.right - zone.left) / lw, (zone.bottom - zone.top) / lh});
@@ -1631,6 +1723,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     case WM_MOUSEMOVE:
+        g.pad_nav = false;   // la souris reprend la sélection (navigation à la manette)
         g.sx = dip(GET_X_LPARAM(l)), g.sy = dip(GET_Y_LPARAM(l));
         g.zone_survol = zone_sous(g.sx, g.sy);
         if (!suivi) {
@@ -1966,11 +2059,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             continue;
         }
         if (g.sx >= 0) g.zone_survol = zone_sous(g.sx, g.sy);
-        // onglet Manette ouvert, sans partie ni construction en cours : manettes lues (dessin, attente d'un appui) ;
-        // sinon SDL est arrêté et les manettes sont rendues (au jeu)
-        if (g.page == Page::Controles && g.onglet_manette && !g.jeu_lance && !g.cons.active) {
+        // hors partie : manettes lues (navigation dans le launcher ; onglet Manette : dessin, attente d'un appui) ;
+        // pendant une partie, SDL est arrêté et les manettes sont rendues (au jeu)
+        if (!g.jeu_lance) {
             manettes_lire();
-            pad_suivre_capture();
+            manette_naviguer();   // avant la capture : l'appui qui la termine ne déplace pas aussi la sélection
+            if (g.page == Page::Controles && g.onglet_manette && !g.cons.active) pad_suivre_capture();
+            else g.capture_pad = -1;
         } else {
             manettes_fermer();
             g.capture_pad = -1;
