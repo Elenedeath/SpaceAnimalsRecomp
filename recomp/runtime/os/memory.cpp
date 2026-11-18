@@ -1566,6 +1566,7 @@ uint64_t mem_release(uint64_t, uint64_t, uint64_t* id) {
     *id = 0;
     return 0;
 }
+uint64_t mem_release_part(uint64_t, uint64_t, uint64_t*) { return 0; }
 bool mem_released_intact(uint64_t, uint64_t, uint64_t) { return false; }
 void mem_release_vivant(uint64_t, uint64_t, uint64_t, bool) {}
 void mem_restore(uint64_t, uint64_t) {}
