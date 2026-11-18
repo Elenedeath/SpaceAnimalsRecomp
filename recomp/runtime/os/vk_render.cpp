@@ -65,13 +65,19 @@ void rt_stall_end();
 #include <map>
 #include <set>
 #include <sstream>
+#include <immintrin.h>   // désentrelacement (AVX2, écritures non temporelles)
 #include <thread>
 
 namespace hos {
+uint64_t mem_release_part(uint64_t addr, uint64_t size, uint64_t* id);   // memory.cpp : un morceau d'un rendu
 namespace vkr {
 void flush_locked(const char* where);   // soumet et attend le GPU (défini plus bas)
 void dlss_emplacement(int slot);        // jeux de descripteurs des passes du DLSS de cet emplacement, remis à zéro
 namespace {
+
+inline uint64_t hz_ns(std::chrono::steady_clock::time_point t0) {   // ns écoulées depuis t0
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
 
 // ================================================================ fonctions Vulkan
 #ifdef _WIN32
@@ -157,6 +163,9 @@ struct Image {
     // refait toutes les EPARSE_PERIODE images tant que la source n'est pas rendue à Windows. 0 : pas prise.
     // eparse_due : image affichée à partir de laquelle la refaire.
     uint64_t eparse = 0, eparse_due = 0;
+    // mémoire taillée dans un bloc partagé (vram_prendre) : numéro du bloc, -1 : allocation propre (mem)
+    int32_t bloc = -1;
+    uint64_t moff = 0, mtaille = 0;
 };
 struct PoolBuf {
     uint64_t base = 0, size = 0;
@@ -321,7 +330,10 @@ struct Vk {
     std::set<std::string> missing;
     // tampons intermédiaires des envois de textures : libérés après la prochaine attente du GPU ; taille non nulle :
     // tampon de la réserve des envois de textures (transit_prendre), projeté en p, rendu à la réserve (transit_rendre)
-    struct Staging { VkBuffer b; VkDeviceMemory m; uint64_t taille = 0; uint8_t* p = nullptr; };
+    struct Staging {
+        VkBuffer b; VkDeviceMemory m; uint64_t taille = 0; uint8_t* p = nullptr;
+        uint64_t off = 0; bool arene = false;   // morceau de l'arène préchauffée (arene_prendre) : décalage dans b
+    };
     std::vector<Staging> staging;
     uint64_t staging_bytes = 0;   // octets des tampons de transit de l'enregistrement en cours (voir borner_transit)
     // données des textures rendues (tex_release) : octets gardés parce qu'un import les verrouille, réemplois d'une
@@ -2140,17 +2152,133 @@ struct TransitLibre { Vk::Staging s; uint64_t vu; };
 std::vector<TransitLibre> g_transit_libres;
 uint64_t g_transit_reserve = 0, g_transit_crees = 0, g_transit_repris = 0;
 constexpr uint64_t TRANSIT_RESERVE_MAX = 128ull << 20, TRANSIT_CLASSE_MAX = 64ull << 20;
+// Réserve agrandie (2026-11-18, run 22) : un changement de scène envoie 200 à 300 Mo d'un coup ; avec 128 Mo de réserve
+// et les tampons de plus de 64 Mo créés puis détruits à chaque envoi, l'essentiel des envois écrivait dans de la
+// mémoire neuve (désentrelacement 34 à 57 ms quel que soit le nombre de fils) et vkFreeMemory coûtait jusqu'à 31 ms.
+// Au niveau de mémoire 0 (plus de 5 Go validables libres) : réserve de 512 Mo, classes jusqu'à 256 Mo, tampons gardés
+// 10 min sans resservir (600 images avant : la réserve était vide au chargement suivant). Niveaux 1 et 2 : inchangés.
+// RECOMP_STAGING_POOL_MB=n : réserve de n Mo au niveau 0 (128 : comportement d'avant pour la taille).
+constexpr uint64_t TRANSIT_CLASSE_ABS = 256ull << 20;
+uint64_t transit_reserve_n0() {
+    static const uint64_t v = [] {
+        const char* e = getenv("RECOMP_STAGING_POOL_MB");
+        return e ? (uint64_t)std::max(0, atoi(e)) << 20 : 512ull << 20;
+    }();
+    return v;
+}
 // Mémoire validable libre du PC, relevée toutes les 60 images (memory_saver) : 0 au-delà de 5 Go, 1 sous 5 Go, 2 sous
 // 3 Go — les mêmes seuils que le cache des images sans objet. Les parties de l'utilisateur tournent souvent au niveau
 // 1 (≈ 2 à 3 Go libres en jeu) : à ce niveau, la réserve et la file des rendus différés sont réduites, pas vidées.
 int g_memoire_niveau = 0;
-uint64_t transit_reserve_max() { return g_memoire_niveau >= 2 ? 0 : g_memoire_niveau == 1 ? 64ull << 20 : TRANSIT_RESERVE_MAX; }
+uint64_t transit_reserve_max() { return g_memoire_niveau >= 2 ? 0 : g_memoire_niveau == 1 ? 64ull << 20 : transit_reserve_n0(); }
+uint64_t transit_classe_max() { return g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? TRANSIT_CLASSE_ABS : TRANSIT_CLASSE_MAX; }
+uint64_t transit_garde() { return g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? 36000 : 600; }
+
+// Arène de transit préchauffée (E, 2026-11-18, run 26). Les envois vers un tampon de transit neuf payaient une faute de
+// page par page de 4 Ko au premier contact (92 448 fautes pour 302 Mo au chargement de 31 s ; 97 % du temps des fils
+// du désentrelacement sur le processeur) : 0,22 ms/Mo contre 0,13 en tampon repris. Au niveau de mémoire 0, un tampon
+// unique de 512 Mo est créé dès la première image, et un fil de fond en touche chaque page avant qu'il serve ; les
+// envois y prennent un morceau (grain de 64 Ko, meilleur ajustement, trous voisins fusionnés au retour), et la réserve
+// d'avant ne sert plus que quand l'arène est pleine. L'arène est détruite (si vide) sous 5 Go validables libres ou quand
+// Windows refuse de la mémoire, et recréée 600 images au plus tôt après le retour au niveau 0.
+// RECOMP_NO_STAGING_ARENA=1 : pas d'arène ; RECOMP_STAGING_ARENA_MB=n : taille.
+struct AreneTransit {
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    uint8_t* p = nullptr;
+    uint64_t taille = 0, pris = 0, detruite = 0;
+    std::map<uint64_t, uint64_t> trous;   // décalage → longueur
+    std::atomic<bool> pret{false};
+    bool echec = false;
+};
+AreneTransit g_arene;
+constexpr uint64_t ARENE_GRAIN = 64ull << 10;
+uint64_t arene_octets() {
+    static const uint64_t v = [] {
+        if (getenv("RECOMP_NO_STAGING_ARENA")) return (uint64_t)0;
+        const char* e = getenv("RECOMP_STAGING_ARENA_MB");
+        return (uint64_t)((e ? (uint64_t)std::max(0, atoi(e)) : 512ull) << 20);
+    }();
+    return v;
+}
+void arene_creer() {
+    const uint64_t t = arene_octets();
+    if (g_arene.b || g_arene.echec || !t || g_memoire_niveau != 0) return;
+    if (g_arene.detruite && g.cur_frame < g_arene.detruite + 600) return;
+    VkBuffer b;
+    VkDeviceMemory m;
+    if (!make_buffer(t, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     &b, &m)) {
+        g_arene.echec = true;
+        HLOG("vk", "texture staging arena: %llu MB refused by the driver, pool only", (unsigned long long)(t >> 20));
+        return;
+    }
+    uint8_t* p = nullptr;
+    if (vkMapMemory(g.dev, m, 0, VK_WHOLE_SIZE, 0, (void**)&p) != VK_SUCCESS || !p) {
+        vkDestroyBuffer(g.dev, b, nullptr);
+        vkFreeMemory(g.dev, m, nullptr);
+        g_arene.echec = true;
+        return;
+    }
+    g_arene.b = b, g_arene.m = m, g_arene.p = p, g_arene.taille = t, g_arene.pris = 0;
+    g_arene.trous.clear();
+    g_arene.trous[0] = t;
+    g_arene.pret = false;
+    std::thread([p, t] {   // préchauffage : une écriture par page, hors du fil du GPU
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const auto t0 = std::chrono::steady_clock::now();
+        volatile uint8_t* q = p;
+        for (uint64_t o = 0; o < t; o += 4096) q[o] = 0;
+        g_arene.pret.store(true, std::memory_order_release);
+        HLOG("vk", "texture staging arena: %llu MB ready (pages touched in %.0f ms, off the GPU thread)",
+             (unsigned long long)(t >> 20), hz_ns(t0) / 1e6);
+    }).detach();
+}
+void arene_detruire() {
+    if (!g_arene.b || !g_arene.pret.load(std::memory_order_acquire) || g_arene.pris) return;
+    vkDestroyBuffer(g.dev, g_arene.b, nullptr);
+    vkFreeMemory(g.dev, g_arene.m, nullptr);
+    g_arene.b = VK_NULL_HANDLE, g_arene.m = VK_NULL_HANDLE, g_arene.p = nullptr;
+    g_arene.trous.clear();
+    g_arene.detruite = g.cur_frame;
+    HLOG("vk", "texture staging arena released (less than 5 GB of commit free or memory refused)");
+}
+bool arene_prendre(uint64_t octets, Vk::Staging* st) {
+    if (!g_arene.b || !g_arene.pret.load(std::memory_order_acquire)) return false;
+    const uint64_t n = (octets + ARENE_GRAIN - 1) & ~(ARENE_GRAIN - 1);
+    auto best = g_arene.trous.end();
+    for (auto it = g_arene.trous.begin(); it != g_arene.trous.end(); ++it)
+        if (it->second >= n && (best == g_arene.trous.end() || it->second < best->second)) best = it;
+    if (best == g_arene.trous.end()) return false;
+    const uint64_t off = best->first, len = best->second;
+    g_arene.trous.erase(best);
+    if (len > n) g_arene.trous[off + n] = len - n;
+    g_arene.pris += n;
+    st->b = g_arene.b, st->m = VK_NULL_HANDLE, st->p = g_arene.p + off, st->taille = n, st->off = off;
+    st->arene = true;
+    return true;
+}
+void arene_rendre(const Vk::Staging& x) {
+    g_arene.pris -= x.taille;
+    uint64_t off = x.off, len = x.taille;
+    auto nx = g_arene.trous.lower_bound(off);
+    if (nx != g_arene.trous.end() && off + len == nx->first) len += nx->second, nx = g_arene.trous.erase(nx);
+    if (nx != g_arene.trous.begin()) {
+        auto pv = std::prev(nx);
+        if (pv->first + pv->second == off) {
+            pv->second += len;
+            return;
+        }
+    }
+    g_arene.trous[off] = len;
+}
 
 bool transit_prendre(uint64_t octets, Vk::Staging* st) {
     static const bool sans = getenv("RECOMP_NO_STAGING_POOL") != nullptr;
+    if (arene_prendre(octets, st)) return true;
     uint64_t taille = 64ull << 10;
     while (taille < octets) taille <<= 1;
-    if (sans || taille > TRANSIT_CLASSE_MAX) taille = octets;   // tampon à part
+    if (sans || taille > transit_classe_max()) taille = octets;   // tampon à part
     else
         for (size_t i = g_transit_libres.size(); i-- > 0;)
             if (g_transit_libres[i].s.taille == taille) {
@@ -2166,6 +2294,16 @@ bool transit_prendre(uint64_t octets, Vk::Staging* st) {
         return false;
     st->taille = taille;
     st->p = nullptr;
+    static bool dit = false;   // type de mémoire des tampons de transit, une fois (mise en cache ou combinée en écriture)
+    if (!dit) {
+        dit = true;
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(g.dev, st->b, &mr);
+        const uint32_t t = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        HLOG("vk", "texture staging: memory type %u (properties 0x%x), pool up to %llu MB, classes up to %llu MB", t,
+             t < g.memprops.memoryTypeCount ? (unsigned)g.memprops.memoryTypes[t].propertyFlags : 0u,
+             (unsigned long long)(transit_reserve_max() >> 20), (unsigned long long)(transit_classe_max() >> 20));
+    }
     if (vkMapMemory(g.dev, st->m, 0, VK_WHOLE_SIZE, 0, (void**)&st->p) != VK_SUCCESS || !st->p) {
         vkDestroyBuffer(g.dev, st->b, nullptr);
         vkFreeMemory(g.dev, st->m, nullptr);
@@ -2178,7 +2316,11 @@ bool transit_prendre(uint64_t octets, Vk::Staging* st) {
 // Tampon de transit que le GPU a fini de lire : à la réserve si c'en est un et qu'il y a la place, sinon détruit
 void transit_rendre(const Vk::Staging& x) {
     static const bool sans = getenv("RECOMP_NO_STAGING_POOL") != nullptr;
-    if (!sans && x.taille && x.taille <= TRANSIT_CLASSE_MAX && (x.taille & (x.taille - 1)) == 0 &&
+    if (x.arene) {
+        arene_rendre(x);
+        return;
+    }
+    if (!sans && x.taille && x.taille <= TRANSIT_CLASSE_ABS && (x.taille & (x.taille - 1)) == 0 &&
         g_transit_reserve + x.taille <= transit_reserve_max()) {
         g_transit_libres.push_back({x, g.cur_frame});
         g_transit_reserve += x.taille;
@@ -2195,10 +2337,12 @@ void transit_tailler() {
     const int pression = mem_pression();
     const bool tout = pression != pression_vue || g_memoire_niveau >= 2;
     pression_vue = pression;
+    if (tout || g_memoire_niveau >= 1) arene_detruire();
+    else arene_creer();
     if (g_transit_libres.empty() || (!tout && g.cur_frame % 60)) return;
     for (size_t i = g_transit_libres.size(); i-- > 0;) {
         const TransitLibre& t = g_transit_libres[i];
-        if (!tout && g.cur_frame < t.vu + 600 && g_transit_reserve <= transit_reserve_max()) continue;
+        if (!tout && g.cur_frame < t.vu + transit_garde() && g_transit_reserve <= transit_reserve_max()) continue;
         vkDestroyBuffer(g.dev, t.s.b, nullptr);
         vkFreeMemory(g.dev, t.s.m, nullptr);
         g_transit_reserve -= t.s.taille;
@@ -2316,6 +2460,76 @@ void ft_end(bool present, uint64_t frame) {
     s.ft_frame = frame;
 }
 
+// ---- blocs de mémoire vidéo des textures (2026-11-18, runs 22-24)
+// Un vkAllocateMemory par image coûtait ≈ 0,1 à 2 ms (5 à 28 ms par changement de scène, 82 images à ≈ 48 s). Les
+// textures du jeu (packagées ou compressées, 16 Mo au plus) sont taillées dans des blocs de 64 Mo : premier trou
+// assez grand, trous voisins fusionnés au retour ; un seul bloc vide est gardé. RECOMP_NO_IMAGE_BLOCKS=1 : une
+// allocation par image, comme avant.
+constexpr uint64_t VRAM_BLOC = 64ull << 20, VRAM_BLOC_IMAGE_MAX = 16ull << 20;
+struct BlocVram {
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint32_t type = 0;
+    uint64_t utilise = 0;
+    std::map<uint64_t, uint64_t> trous;   // décalage → taille
+};
+std::vector<BlocVram> g_blocs_vram;
+uint64_t g_blocs_vram_n = 0;
+bool vram_prendre(uint32_t type, uint64_t taille, uint64_t align, VkDeviceMemory* mem, int32_t* bloc, uint64_t* off) {
+    align = std::max<uint64_t>(1, align);
+    auto essayer = [&](size_t i) {
+        BlocVram& b = g_blocs_vram[i];
+        if (!b.mem || b.type != type) return false;
+        for (auto it = b.trous.begin(); it != b.trous.end(); ++it) {
+            const uint64_t d = (it->first + align - 1) / align * align;
+            if (d + taille > it->first + it->second) continue;
+            const uint64_t t0 = it->first, fin = it->first + it->second;
+            b.trous.erase(it);
+            if (d > t0) b.trous[t0] = d - t0;
+            if (d + taille < fin) b.trous[d + taille] = fin - (d + taille);
+            b.utilise += taille;
+            *mem = b.mem, *bloc = (int32_t)i, *off = d;
+            return true;
+        }
+        return false;
+    };
+    for (size_t i = 0; i < g_blocs_vram.size(); i++)
+        if (essayer(i)) return true;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = VRAM_BLOC;
+    ai.memoryTypeIndex = type;
+    BlocVram nb;
+    nb.type = type;
+    if (vkAllocateMemory(g.dev, &ai, nullptr, &nb.mem) != VK_SUCCESS) return false;
+    nb.trous[0] = VRAM_BLOC;
+    size_t i = 0;
+    while (i < g_blocs_vram.size() && g_blocs_vram[i].mem) i++;
+    if (i == g_blocs_vram.size()) g_blocs_vram.push_back(nb);
+    else g_blocs_vram[i] = nb;
+    if (g_blocs_vram_n++ == 0) HLOG("vk", "texture video memory: blocks of %llu MB (images up to %llu MB)",
+                                    (unsigned long long)(VRAM_BLOC >> 20), (unsigned long long)(VRAM_BLOC_IMAGE_MAX >> 20));
+    return essayer(i);
+}
+void vram_rendre(int32_t bloc, uint64_t off, uint64_t taille) {
+    if (bloc < 0 || (size_t)bloc >= g_blocs_vram.size() || !g_blocs_vram[bloc].mem) return;
+    BlocVram& b = g_blocs_vram[bloc];
+    b.utilise -= std::min(b.utilise, taille);
+    auto it = b.trous.emplace(off, taille).first;
+    auto suiv = std::next(it);
+    if (suiv != b.trous.end() && it->first + it->second == suiv->first) it->second += suiv->second, b.trous.erase(suiv);
+    if (it != b.trous.begin()) {
+        auto prec = std::prev(it);
+        if (prec->first + prec->second == it->first) prec->second += it->second, b.trous.erase(it);
+    }
+    if (b.utilise == 0) {   // bloc vide : rendu s'il en reste un autre vide du même type
+        for (size_t i = 0; i < g_blocs_vram.size(); i++)
+            if ((int32_t)i != bloc && g_blocs_vram[i].mem && g_blocs_vram[i].type == b.type && g_blocs_vram[i].utilise == 0) {
+                vkFreeMemory(g.dev, b.mem, nullptr);
+                b = BlocVram{};
+                return;
+            }
+    }
+}
+
 void begin_frame() {
     if (g.recording) return;
     free_done_staging();
@@ -2333,7 +2547,8 @@ void begin_frame() {
                 if (v) vkDestroyImageView(g.dev, v, nullptr);
             if (im.view) vkDestroyImageView(g.dev, im.view, nullptr);
             if (im.img) vkDestroyImage(g.dev, im.img, nullptr);
-            if (im.mem) vkFreeMemory(g.dev, im.mem, nullptr);
+            if (im.bloc >= 0) vram_rendre(im.bloc, im.moff, im.mtaille);
+            else if (im.mem) vkFreeMemory(g.dev, im.mem, nullptr);
             g.dead_images.erase(g.dead_images.begin() + i);
         }
     }
@@ -2530,6 +2745,93 @@ void deswizzle_level(const uint8_t* src, uint8_t* dst, uint32_t wbytes, uint32_t
             }
     }
     deswizzle_lignes(src, dst, wbytes, bh, std::max(y, ya), y1);   // fin d'une bande
+}
+
+// Envoi « dans l'ordre de la source » (2026-11-18, runs 23-24) : un travail = un morceau de 1 Mo de la source (celui de
+// l'empreinte) ; chaque GOB est lu une seule fois, recopié vers ses 8 lignes (écritures non temporelles de 64 o quand
+// la destination est alignée) puis ajouté à l'empreinte du morceau tant qu'il est dans le cache L1. Avant : bandes de
+// lignes désentrelacées, puis une seconde lecture complète de la source pour l'empreinte ; la mémoire était le
+// facteur limitant (runs 23-24 : ≈ 0,15 à 0,23 ms/Mo sur 4 fils, quel que soit le type mémoire du tampon). Banc
+// d'essai, 320 Mo sur 4 fils : 56 → 31 ms, mêmes octets et mêmes empreintes. RECOMP_DESWIZZLE_OLD=1 : ancien chemin.
+struct Hacheur {   // hash_bloc par étapes (mêmes résultats) : suite() par multiples de 32 octets, fin() pour le reste
+    uint64_t h;
+    explicit Hacheur(uint64_t n) : h(0x9E3779B97F4A7C15ull ^ n) {}
+    inline void suite(const uint8_t* p, uint64_t n) {
+        uint64_t a, b, c, d;
+        for (uint64_t i = 0; i < n; i += 32) {
+            memcpy(&a, p + i, 8), memcpy(&b, p + i + 8, 8), memcpy(&c, p + i + 16, 8), memcpy(&d, p + i + 24, 8);
+            h = (h ^ (a * 0x87C37B91114253D5ull)) * 0x4CF5AD432745937Full;
+            h = (h ^ (b * 0x52DCE729DA3ED6A5ull)) * 0x87C37B91114253D5ull;
+            h = (h ^ (c * 0x4CF5AD432745937Full)) * 0x52DCE729DA3ED6A5ull;
+            h = (h ^ (d * 0x9E3779B97F4A7C15ull)) * 0x4CF5AD432745937Full;
+            h ^= h >> 29;
+        }
+    }
+    uint64_t fin(const uint8_t* p, uint64_t n) {
+        for (uint64_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+        return h ^ (h >> 31);
+    }
+};
+struct RegionBL { uint64_t soff, taille; uint8_t* dst; uint32_t wbytes, rows, bh; };   // un niveau d'une couche
+inline void gob_vers_lignes(const RegionBL& R, const uint8_t* q, uint32_t x, uint32_t y, bool nt) {
+    if (y >= R.rows) return;   // lignes de remplissage du dernier bloc
+    const uint32_t nr = std::min<uint32_t>(8, R.rows - y);
+    static const uint32_t YO[8] = {0, 16, 32, 48, 128, 144, 160, 176};   // ligne r du GOB (bits y0 → 4, y1 → 5, y2 → 7)
+    uint8_t* d = R.dst + (uint64_t)y * R.wbytes + x;
+    if (x + 64 <= R.wbytes) {
+        for (uint32_t r = 0; r < nr; r++, d += R.wbytes) {
+            const uint8_t* s = q + YO[r];   // octets x[0..15] / [16..31] / [32..47] / [48..63] : +0, +64, +256, +320
+            const __m256i a = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)s)),
+                                                      _mm_loadu_si128((const __m128i*)(s + 64)), 1);
+            const __m256i b = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(s + 256))),
+                                                      _mm_loadu_si128((const __m128i*)(s + 320)), 1);
+            if (nt) {
+                _mm256_stream_si256((__m256i*)d, a);
+                _mm256_stream_si256((__m256i*)(d + 32), b);
+            } else {
+                _mm256_storeu_si256((__m256i*)d, a);
+                _mm256_storeu_si256((__m256i*)(d + 32), b);
+            }
+        }
+    } else {   // fin de ligne de moins de 64 octets
+        static const uint32_t PO[4] = {0, 64, 256, 320};
+        for (uint32_t r = 0; r < nr; r++, d += R.wbytes)
+            for (uint32_t i = 0; i < 4 && x + 16 * i < R.wbytes; i++)
+                memcpy(d + 16 * i, q + YO[r] + PO[i], std::min<uint32_t>(16, R.wbytes - x - 16 * i));
+    }
+}
+// Morceau [m0, m1) de la source (offsets depuis src) : désentrelacé vers les régions qu'il recouvre (triées, disjointes,
+// commençant sur un GOB), empreinte hash_bloc(src + m0, m1 − m0) rendue.
+uint64_t envoi_morceau_source(const uint8_t* src, const RegionBL* rg, size_t nrg, uint64_t m0, uint64_t m1) {
+    Hacheur H(m1 - m0);
+    uint64_t o = m0;
+    bool nt_fait = false;
+    for (size_t i = 0; i < nrg && o < m1; i++) {
+        const RegionBL& R = rg[i];
+        const uint64_t a = std::max(o, R.soff), b = std::min(m1, R.soff + R.taille);
+        if (a >= b) continue;
+        if (a > o) H.suite(src + o, a - o);   // entre deux couches : empreinte seulement
+        const uint64_t wg = (R.wbytes + 63) / 64, col = 512ull * R.bh, lb = wg * col;
+        const bool nt = (R.wbytes % 64) == 0 && ((uintptr_t)R.dst % 64) == 0;
+        nt_fait |= nt;
+        const uint64_t rel = a - R.soff;
+        uint32_t br = (uint32_t)(rel / lb), c = (uint32_t)(rel % lb / col), gg = (uint32_t)(rel % col / 512);
+        for (uint64_t off = a; off < b; off += 512) {   // GOB par GOB, dans l'ordre de la source
+            const uint8_t* q = src + off;
+            gob_vers_lignes(R, q, c * 64, br * 8 * R.bh + gg * 8, nt);
+            H.suite(q, 512);
+            if (++gg == R.bh) {
+                gg = 0;
+                if (++c == wg) c = 0, br++;
+            }
+        }
+        o = b;
+    }
+    const uint64_t r = (m1 - o) & ~31ull;
+    H.suite(src + o, r);
+    o += r;
+    if (nt_fait) _mm_sfence();   // écritures non temporelles visibles avant la copie par le GPU
+    return H.fin(src + o, m1 - o);
 }
 
 // Captures de cibles de rendu (RECOMP_RT_SNAPSHOT) : relues après l'attente du GPU.
@@ -2776,6 +3078,7 @@ void free_staging() {   // après une attente de la barrière du GPU
 // centaines de fois par changement de scène. lancer(n, f) exécute f(0) … f(n − 1) sur les fils et sur l'appelant et
 // rend la main quand tout est fait ; un lot à la fois, jamais depuis un travail d'un lot. Un fil qui se réveille en
 // retard ne peut prendre aucun travail d'un autre lot que le sien (numéro du lot dans le compteur des prises).
+unsigned nb_ouvriers();   // fils du désentrelacement (plus bas)
 struct Ouvriers {
     std::mutex appel, mx;
     std::condition_variable cv_lot, cv_fin;
@@ -2815,7 +3118,7 @@ struct Ouvriers {
         std::lock_guard<std::mutex> a(appel);
         if (!partis) {
             partis = true;
-            const unsigned nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
+            const unsigned nt = nb_ouvriers();
             for (unsigned t = 1; t < nt; t++) std::thread([this] { boucle(); }).detach();
         }
         uint32_t lt;
@@ -2831,6 +3134,21 @@ struct Ouvriers {
         cv_fin.wait(lk, [&] { return restants.load() == 0; });
     }
 };
+// Fils du désentrelacement et des empreintes (le fil appelant compris). Jusqu'au 2026-11-17 : la moitié des fils du
+// processeur (4 sur un i7-9700) ; pendant les chargements les fils du jeu attendent surtout le disque, et le
+// désentrelacement prenait encore 22 à 65 ms par changement de scène (run 20). Essai à tous les fils moins deux (6) au
+// run 22 : aucun gain (52 → 52 ms pour 303 Mo), retour à la moitié, 8 au plus. RECOMP_DESWIZZLE_THREADS=n : n fils.
+unsigned nb_ouvriers() {
+    static const unsigned n = [] {
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        unsigned v = std::min(8u, std::max(1u, hw / 2));
+        if (const char* e = getenv("RECOMP_DESWIZZLE_THREADS")) v = std::max(1u, std::min(16u, (unsigned)atoi(e)));
+        HLOG("vk", "texture deswizzle and hashing: %u threads%s", v, getenv("RECOMP_DESWIZZLE_THREADS") ? " (RECOMP_DESWIZZLE_THREADS)" : "");
+        return v;
+    }();
+    return n;
+}
+
 Ouvriers& ouvriers() {
     static Ouvriers* o = new Ouvriers;   // jamais détruit : ses fils l'attendent jusqu'à la fin du processus
     return *o;
@@ -2905,22 +3223,31 @@ uint64_t edges_hash(uint64_t addr, uint64_t n, uint64_t d, uint64_t f) {
 }
 
 // Rend les pages entières de la source de l'image, qui vient d'être lue en entier (envoi, ou empreinte inchangée).
-void tex_release(Image& im) {
-    im.rel_d = im.rel_f = im.rel_id = 0;
-    if (!mem_release_actif() || !im.src_bytes || !im.addr || im.rel_n >= 3) return;
+// Pages entières [*d, *f) de la source de l'image, si elles peuvent être rendues (fichier ouvert, assez grosses, hors
+// des imports que le GPU lit directement)
+bool tex_release_plage(Image& im, uint64_t* d_, uint64_t* f_) {
+    if (!mem_release_actif() || !im.src_bytes || !im.addr || im.rel_n >= 3) return false;
     const uint64_t d = (im.addr + 0xfff) & ~0xfffull, f = (im.addr + im.src_bytes) & ~0xfffull;
-    if (f < d + (64ull << 10)) return;   // petite texture : rien à gagner
+    if (f < d + (64ull << 10)) return false;   // petite texture : rien à gagner
     // pages verrouillées par un import (le GPU les lit directement) : on n'y touche pas
     for (auto& p : g.pools)
         if (d < p.base + p.size && p.base < f) {
             g.tex_rel_import += f - d;
-            return;
+            return false;
         }
     for (auto& dp : g.dead_pools)
         if (d < dp.second.base + dp.second.size && dp.second.base < f) {
             g.tex_rel_import += f - d;
-            return;
+            return false;
         }
+    *d_ = d, *f_ = f;
+    return true;
+}
+
+void tex_release(Image& im) {
+    im.rel_d = im.rel_f = im.rel_id = 0;
+    uint64_t d = 0, f = 0;
+    if (!tex_release_plage(im, &d, &f)) return;
     uint64_t id = 0;
     if (mem_release(d, f - d, &id) != f - d) return;
     im.rel_d = d, im.rel_f = f, im.rel_id = id, im.rel_n++;
@@ -2984,10 +3311,74 @@ void tex_release_later(Image& im) {
     if (g_rendus_octets > 2 * RENDUS_ATTENTE_MAX) tex_release_pending(0);
 }
 
+// Rendu par morceaux (2026-11-17). Écrire d'un bloc la source d'une très grosse texture bloquait le fil du GPU : 204 ms
+// pour l'atlas de 171 Mo des changements de scène de la cinématique d'ouverture (≈ 1,2 ms par Mo écrit), 46 à 60 ms
+// pour les textures de 43 Mo (RTX 2070 SUPER, mesure [hitch] du run 20). Au-delà de REL_MORCEAU, la source est rendue
+// par morceaux, sous un seul numéro de rendu (mem_release_part), un ou plusieurs par fin d'image selon le budget.
+// L'empreinte de chaque morceau est relevée au départ (le tout comparé à celle de l'envoi), puis recomparée juste
+// avant de rendre le morceau : une source réécrite entre-temps arrête le rendu, l'image n'est pas marquée comme rendue
+// (les morceaux déjà rendus restent lisibles, relus à l'accès). L'image n'est marquée rendue qu'au dernier morceau.
+// RECOMP_TEX_RELEASE_WHOLE=1 : ancien comportement, la source d'un bloc.
+constexpr uint64_t REL_MORCEAU = 4ull << 20;
+// hash_mem d'un morceau reste sur un seul fil (moins de 8 morceaux de 1 Mo) : pas d'appel imbriqué de ouvriers()
+static_assert(REL_MORCEAU < 8 * HASH_MORCEAU, "hash_mem d'un morceau lancerait les ouvriers depuis un ouvrier");
+struct RenduPartiel {
+    bool actif = false;
+    uint64_t addr = 0, serie = 0, d = 0, f = 0, pos = 0, id = 0;
+    std::vector<uint64_t> h;   // empreinte de chaque morceau, relevée au départ
+};
+RenduPartiel g_partiel;
+uint64_t g_rendus_morceaux = 0, g_rendus_arretes = 0;
+
+// image de la demande (addr, serie) si elle existe encore et n'a pas été renvoyée depuis
+Image* rendu_image(uint64_t addr, uint64_t serie) {
+    auto ba = g.by_addr.find(addr);
+    if (ba == g.by_addr.end()) return nullptr;
+    for (uint64_t k : ba->second) {
+        auto it = g.images.find(k);
+        if (it != g.images.end() && it->second.rel_serie == serie) return &it->second;
+    }
+    return nullptr;
+}
+
+// un morceau du rendu en cours ; faux quand il est fini ou arrêté
+bool rendu_partiel_pas() {
+    RenduPartiel& r = g_partiel;
+    Image* im = rendu_image(r.addr, r.serie);
+    const uint64_t k = (r.pos - r.d) / REL_MORCEAU;
+    const uint64_t n = std::min(REL_MORCEAU, r.f - r.pos);
+    bool ok = im && im->addr == r.addr && im->initialized && plage_engagee(r.pos, n);
+    if (ok) {
+        ok = hash_mem((const uint8_t*)r.pos, n) == r.h[k];
+        if (!ok) g_rendus_changes++;
+    }
+    if (ok) {
+        ok = mem_release_part(r.pos, n, &r.id) == n;
+        g_rendus_morceaux++;
+    }
+    if (!ok) {   // arrêté : l'image ne compte pas comme rendue
+        if (im) im->rel_serie = 0;
+        g_rendus_arretes++;
+        r.actif = false;
+        return false;
+    }
+    r.pos += n;
+    if (r.pos < r.f) return true;
+    im->rel_d = r.d, im->rel_f = r.f, im->rel_id = r.id, im->rel_n++;
+    im->edge_hash = edges_hash(im->addr, im->src_bytes, r.d, r.f);
+    im->rel_serie = 0;
+    g.tex_rel_rendus++;
+    g_rendus_faits++;
+    if (!im->refs) mem_release_vivant(r.d, r.f - r.d, r.id, false);
+    r.actif = false;
+    return false;
+}
+
 // Fin d'image affichée (fil du GPU, verrou pris) : demandes de rendu en attente, budget_us au plus (plus quand la file
 // s'allonge), ou plus longtemps tant que plus de RENDUS_ATTENTE_MAX attendent.
 void tex_release_pending(uint64_t budget_us) {
-    if (g_rendus.empty()) return;
+    if (g_rendus.empty() && !g_partiel.actif) return;
+    static const bool d_un_bloc = getenv("RECOMP_TEX_RELEASE_WHOLE") != nullptr;
     // Windows vient de refuser de la mémoire au jeu (mem_pression), ou le PC en manque : toute la file d'un coup
     static int pression_vue = 0;
     const int pression = mem_pression();
@@ -2996,22 +3387,18 @@ void tex_release_pending(uint64_t budget_us) {
     const uint64_t borne = rendus_attente_max();
     if (budget_us) budget_us += g_rendus_octets * 4000 / RENDUS_ATTENTE_MAX;
     const auto t0 = std::chrono::steady_clock::now();
-    while (!g_rendus.empty()) {
+    for (;;) {
         const auto ecoule = std::chrono::steady_clock::now() - t0;
         if (!tout && g_rendus_octets <= borne && ecoule >= std::chrono::microseconds(budget_us)) break;
+        if (g_partiel.actif) {
+            rendu_partiel_pas();
+            continue;
+        }
+        if (g_rendus.empty()) break;
         const RenduDiffere r = g_rendus.front();
         g_rendus.pop_front();
         g_rendus_octets -= r.octets;
-        Image* im = nullptr;
-        auto ba = g.by_addr.find(r.addr);
-        if (ba != g.by_addr.end())
-            for (uint64_t k : ba->second) {
-                auto it = g.images.find(k);
-                if (it != g.images.end() && it->second.rel_serie == r.serie) {
-                    im = &it->second;
-                    break;
-                }
-            }
+        Image* im = rendu_image(r.addr, r.serie);
         // Source entièrement engagée, sinon oubliée : quand le jeu décharge un niveau puis remappe sa mémoire, la
         // plage redevient « à la demande » ; la relire pour l'empreinte l'engageait (des dizaines de Mo de zéros) et
         // prenait jusqu'à 0,4 s dans une image (partie d'essai du 2026-11-12, à 148 s).
@@ -3020,13 +3407,39 @@ void tex_release_pending(uint64_t budget_us) {
             g_rendus_perdus++;
             continue;
         }
-        im->rel_serie = 0;
-        if (hash_mem((const uint8_t*)im->addr, im->src_bytes) != im->content_hash) {
+        uint64_t d = 0, f = 0;
+        const bool morceaux = !d_un_bloc && tex_release_plage(*im, &d, &f) && f - d > REL_MORCEAU;
+        if (!morceaux) {
+            im->rel_serie = 0;
+            const bool change = hash_mem((const uint8_t*)im->addr, im->src_bytes) != im->content_hash;
+            if (change) {
+                g_rendus_changes++;
+                continue;
+            }
+            tex_release(*im);
+            g_rendus_faits++;
+            continue;
+        }
+        // Gros rendu : empreinte de la source entière (comparée à l'envoi), et de chaque morceau pour la suite.
+        // L'ancien rendu de l'image ne compte plus (la source vient d'être relue en entier).
+        const bool change = hash_mem((const uint8_t*)im->addr, im->src_bytes) != im->content_hash;
+        RenduPartiel& p = g_partiel;
+        p.h.clear();
+        if (!change) {   // morceaux de 4 Mo : en parallèle (hash_mem de chacun reste sur un seul fil)
+            p.h.assign((f - d + REL_MORCEAU - 1) / REL_MORCEAU, 0);
+            const std::function<void(size_t)> fh = [&](size_t k) {
+                const uint64_t a = d + k * REL_MORCEAU;
+                p.h[k] = hash_mem((const uint8_t*)a, std::min(REL_MORCEAU, f - a));
+            };
+            ouvriers().lancer(p.h.size(), fh);
+        }
+        if (change) {
+            im->rel_serie = 0;
             g_rendus_changes++;
             continue;
         }
-        tex_release(*im);
-        g_rendus_faits++;
+        im->rel_d = im->rel_f = im->rel_id = 0;
+        p.actif = true, p.addr = r.addr, p.serie = r.serie, p.d = d, p.f = f, p.pos = d, p.id = 0;
     }
     g_rendus_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -3112,12 +3525,18 @@ void flush_recheck(Image& im) {
     static const bool off = getenv("RECOMP_NO_FLUSH_CHECK") != nullptr;
     if (off) return;
     int cause = flush_last(im.addr, im.addr + im.src_bytes) > im.chk_serial ? 1 : 0;
-    if (!cause && im.refs == 0) {
+    // Source en cours de rendu par morceaux (tex_release_pending) : ni contrôle périodique ni empreinte éparse. Leurs
+    // lectures tombaient sur les morceaux déjà rendus et les restauraient ; le rendu fini n'était plus intact, la
+    // source entière était relue (170 Mo, ≈ 200 ms) puis rendue de nouveau, en boucle (run 21 : gels de 100 à 240 ms
+    // toutes les 0,5 s pendant les chargements, 866 Mo relus par le runtime contre 0 au run 20). Chaque morceau est
+    // recomparé à son empreinte juste avant d'être rendu ; un vidage du jeu (cas 1) reste contrôlé.
+    const bool en_rendu = g_partiel.actif && im.rel_serie && g_partiel.serie == im.rel_serie && g_partiel.addr == im.addr;
+    if (!cause && im.refs == 0 && !en_rendu) {
         if (im.rel_id) cause = mem_released_intact(im.rel_d, im.rel_f - im.rel_d, im.rel_id) ? 0 : 2;
         else if ((g.cur_frame + (im.addr >> 16)) % 30 == 0) cause = 3;
     }
     static const bool sans_revue = getenv("RECOMP_NO_TEX_RECHECK") != nullptr;
-    if (!cause && !sans_revue) {
+    if (!cause && !sans_revue && !en_rendu) {
         if (im.rel_id) {
             if (im.refs && !mem_released_intact(im.rel_d, im.rel_f - im.rel_d, im.rel_id)) cause = 4;
         } else if (im.eparse && g.cur_frame >= im.eparse_due) {
@@ -3213,9 +3632,12 @@ void tex_release_log(uint64_t frame) {
          (unsigned long long)s.n[5], s.octets[5] / 1048576.0, (unsigned long long)g.tex_rel_intactes, s.ns_ecrit / 1e6,
          s.ns_lu / 1e6);
     HLOG("vk", "frame %llu, deferred texture releases: %llu done, %llu skipped (source rewritten), %llu dropped (image "
-               "gone or sent again), %zu waiting (%.0f MB), %.0f ms at frame ends",
+               "gone or sent again), %zu waiting (%.0f MB), %.0f ms at frame ends; %llu pieces of %llu MB, %llu split "
+               "releases stopped",
          (unsigned long long)frame, (unsigned long long)g_rendus_faits, (unsigned long long)g_rendus_changes,
-         (unsigned long long)g_rendus_perdus, g_rendus.size(), g_rendus_octets / 1048576.0, g_rendus_ns / 1e6);
+         (unsigned long long)g_rendus_perdus, g_rendus.size(), g_rendus_octets / 1048576.0, g_rendus_ns / 1e6,
+         (unsigned long long)g_rendus_morceaux, (unsigned long long)(REL_MORCEAU >> 20),
+         (unsigned long long)g_rendus_arretes);
 }
 
 // RECOMP_PERF : temps des étapes d'envoi des textures packagées (ns cumulés) : source (validité, restauration),
@@ -3280,7 +3702,7 @@ bool upload_packaged(Image& im) {
             const uint32_t band = std::max<uint32_t>(8 * v.bh, (uint32_t)((1u << 20) / std::max<uint32_t>(1, v.wbytes)));
             for (uint32_t y = 0; y < v.rows; y += band) jobs.push_back({s, p + dst, v.wbytes, v.rows, v.bh, y, std::min(v.rows, y + band)});
             VkBufferImageCopy r{};
-            r.bufferOffset = dst;
+            r.bufferOffset = st.off + dst;
             r.bufferRowLength = v.wbytes / im.bpu * unit;
             r.bufferImageHeight = v.rows * unit;
             r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, layer, 1};
@@ -3292,6 +3714,27 @@ bool upload_packaged(Image& im) {
     const uint8_t* src0 = (const uint8_t*)im.addr;
     const size_t nm = hash_morceaux(src_total);
     std::vector<uint64_t> hm(nm);
+    static const bool desw_ancien = getenv("RECOMP_DESWIZZLE_OLD") != nullptr;
+    static const unsigned NT = nb_ouvriers();
+    uint64_t hash_source = 0;
+    if (!desw_ancien) {   // ordre de la source, empreinte comprise (envoi_morceau_source)
+        std::vector<RegionBL> rg;
+        for (uint32_t layer = 0; layer < im.layers; layer++)
+            for (const Lv& v : lv)
+                rg.push_back({layer * layer_stride + v.soff, bl_level_size(v.wbytes, v.rows, v.bh), p + layer * doff + v.doff,
+                              v.wbytes, v.rows, v.bh});
+        const size_t nmc = std::max<size_t>(1, nm);
+        if (!nm) hm.resize(1);
+        const std::function<void(size_t)> run = [&](size_t k) {
+            hm[k] = envoi_morceau_source(src0, rg.data(), rg.size(), k * HASH_MORCEAU, std::min(src_total, (k + 1) * HASH_MORCEAU));
+        };
+        if (NT == 1 || nmc < 4) {
+            for (size_t k = 0; k < nmc; k++) run(k);
+        } else {
+            ouvriers().lancer(nmc, run);
+        }
+        hash_source = nm ? hash_combiner(hm.data(), nm, src_total) : hm[0];
+    } else {
     const std::function<void(size_t)> run = [&](size_t k) {
         if (k < jobs.size()) {
             const Job& j = jobs[k];
@@ -3300,11 +3743,11 @@ bool upload_packaged(Image& im) {
             hm[k - jobs.size()] = hash_morceau(src0, src_total, k - jobs.size());
         }
     };
-    static const unsigned NT = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
     if (NT == 1 || jobs.size() + nm < 4 || doff * im.layers < (4u << 20)) {
         for (size_t k = 0; k < jobs.size() + nm; k++) run(k);
     } else {
         ouvriers().lancer(jobs.size() + nm, run);
+    }
     }
     pas(2);
     vkCmdCopyBufferToImage(g.cb, st.b, im.img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)regions.size(), regions.data());
@@ -3315,7 +3758,7 @@ bool upload_packaged(Image& im) {
     g.tex_upload_bytes += src_total;
     im.src_bytes = src_total;
     pas(3);
-    im.content_hash = nm ? hash_combiner(hm.data(), nm, src_total) : hash_bloc(src0, src_total);
+    im.content_hash = !desw_ancien ? hash_source : nm ? hash_combiner(hm.data(), nm, src_total) : hash_bloc(src0, src_total);
     im.up_frame = g.cur_frame;
     pas(4);
     tex_release_later(im);
@@ -3589,7 +4032,11 @@ Image* get_image(uint64_t texkey) {
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
     ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (VkResult ar = vkAllocateMemory(g.dev, &ai, nullptr, &im.mem); ar != VK_SUCCESS) {
+    static const bool sans_blocs = getenv("RECOMP_NO_IMAGE_BLOCKS") != nullptr;
+    if (!sans_blocs && (im.packaged || is_compressed(fi.vk)) && !is_depth(fi.vk) && mr.size <= VRAM_BLOC_IMAGE_MAX &&
+        ai.memoryTypeIndex != UINT32_MAX && vram_prendre(ai.memoryTypeIndex, mr.size, mr.alignment, &im.mem, &im.bloc, &im.moff)) {
+        im.mtaille = mr.size;   // taillée dans un bloc partagé
+    } else if (VkResult ar = vkAllocateMemory(g.dev, &ai, nullptr, &im.mem); ar != VK_SUCCESS) {
         // échec autrefois silencieux : la texture manquait (descripteur factice, icônes en carrés pleins)
         static int nf = 0;
         if (nf++ < 16)
@@ -3598,7 +4045,7 @@ Image* get_image(uint64_t texkey) {
         vkDestroyImage(g.dev, im.img, nullptr);
         return nullptr;
     }
-    vkBindImageMemory(g.dev, im.img, im.mem, 0);
+    vkBindImageMemory(g.dev, im.img, im.mem, im.bloc >= 0 ? im.moff : 0);
     im.bytes = mr.size;
     im.refs = 1;   // l'objet texture qui la crée
     im.last_use = g.cur_frame;
@@ -5328,8 +5775,10 @@ void flush_locked(const char* where) {
 }
 // Entre deux dessins : au-delà de 256 Mo de tampons de transit dans l'enregistrement en cours, il est soumis, le GPU
 // attendu et les tampons rendus (voir free_done_staging). memory_saver = false : comme en 1.0.2, pas de borne.
+// Borne relevée au niveau de mémoire 0 (2026-11-18) : les classes de tampons vont jusqu'à 256 Mo (arrondi à la
+// puissance de 2), et à 256 Mo un chargement de 300 Mo soumettait et attendait le GPU au milieu de son image.
 void borner_transit() {
-    constexpr uint64_t TRANSIT_MAX = 256ull << 20;
+    const uint64_t TRANSIT_MAX = g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? 768ull << 20 : 256ull << 20;
     if (g.staging_bytes <= TRANSIT_MAX || !settings().memory_saver) return;
     flush_locked("texture uploads");
     free_done_staging();
