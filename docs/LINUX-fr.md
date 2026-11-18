@@ -26,6 +26,11 @@ dont seuls les numéros de ligne cités par les messages d'erreur Vulkan (`VKCHK
 | launcher : Win32, Direct2D, DirectWrite, Media Foundation | **même code** : Win32 réalisé sur POSIX/SDL3 (`win32_linux.cpp`), Direct2D/DirectWrite sur cairo/pango (`d2d_cairo.h`), vidéos de fond en MPEG-1 lues par pl_mpeg |
 | sauvegardes `%APPDATA%\SpaceAnimalsRecomp` | `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp` |
 
+La mémoire que le jeu rend (`UnmapPhysicalMemory`) redevient inaccessible, sauf les pages qu'un import Vulkan couvre
+encore : le pilote Linux relit les pages d'un import de mémoire hôte à chaque soumission tant que l'import existe, et une
+plage inaccessible fait échouer la soumission (DEVICE LOST au retour au menu). Ces pages sont seulement vidées
+(`MADV_DONTNEED`, elles se relisent à zéro). `RECOMP_UNMAP_PINNED_OLD=1` : ancien comportement (toute la plage inaccessible).
+
 ## Construire l'AppImage
 
 Sous Linux (ou WSL), avec clang/ld.lld, cmake, ninja, readelf et ffmpeg (extraits du fond), après avoir préparé la

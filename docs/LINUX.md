@@ -27,6 +27,11 @@ the line numbers quoted by Vulkan error messages (`VKCHK`, `__LINE__`) differ.
 | launcher: Win32, Direct2D, DirectWrite, Media Foundation | **same code**: Win32 implemented on POSIX/SDL3 (`win32_linux.cpp`), Direct2D/DirectWrite on cairo/pango (`d2d_cairo.h`), MPEG-1 background videos played by pl_mpeg |
 | saves in `%APPDATA%\SpaceAnimalsRecomp` | `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp` |
 
+Memory the game gives back (`UnmapPhysicalMemory`) is made inaccessible again, except the pages a Vulkan import still
+covers: the Linux driver re-reads the pages of a host memory import at every submission while the import exists, and an
+inaccessible range makes the submission fail (DEVICE LOST when going back to the menu). Those pages are only emptied
+(`MADV_DONTNEED`, they read back as zero). `RECOMP_UNMAP_PINNED_OLD=1`: old behaviour (the whole range inaccessible).
+
 ## Building the AppImage
 
 On Linux (or WSL), with clang/ld.lld, cmake, ninja, readelf and ffmpeg (background clips), after preparing the system

@@ -1571,12 +1571,44 @@ void mem_lazy_stats(uint64_t* blocs, uint64_t* octets, uint64_t* reserves) {
     *reserves = r;
 }
 
+// Pages encore importées par le GPU (mem_epingler) : le pilote Linux (amdgpu) relit les pages d'un import de mémoire
+// hôte à chaque soumission tant que l'objet Vulkan existe ; une plage devenue sans accès fait échouer la soumission
+// (DEVICE LOST au retour au menu, Steam Deck 2026-11-18). Ces pages sont seulement vidées (MADV_DONTNEED : RAM rendue,
+// relues à zéro) et restent accessibles ; le reste de la plage est rendu sans accès comme avant.
+// RECOMP_UNMAP_PINNED_OLD=1 : ancien comportement (toute la plage sans accès).
+static const bool g_unmap_pinned_old = [] {
+    const char* e = getenv("RECOMP_UNMAP_PINNED_OLD");
+    return e && *e && *e != '0';
+}();
+
 void mem_decommit(uint64_t addr, uint64_t size) {
     if (size) {
         const uint64_t a = addr & ~0xfffull, b = (addr + size + 0xfff) & ~0xfffull;
+        std::vector<std::pair<uint64_t, uint64_t>> pins;   // parties importées de [a, b), triées, alignées sur la page
+        if (!g_unmap_pinned_old) {
+            std::lock_guard<std::mutex> lk(g_epingle_mx);
+            for (auto& [k, n] : g_epingles) {
+                const uint64_t s = std::max<uint64_t>(a, k.first & ~0xfffull);
+                const uint64_t e = std::min<uint64_t>(b, (k.second + 0xfff) & ~0xfffull);
+                if (s < e) pins.emplace_back(s, e);
+            }
+        }
+        std::sort(pins.begin(), pins.end());
         std::unique_lock<std::shared_mutex> lk(g_engage_lk);
-        // nouvelle projection anonyme sans accès à la même place : la RAM des pages est rendue, elles se reliront à zéro
-        mmap((void*)a, b - a, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        uint64_t c = a;
+        auto rendre = [](uint64_t s, uint64_t e) {
+            // nouvelle projection anonyme sans accès à la même place : la RAM des pages est rendue, elles se reliront
+            // à zéro
+            if (s < e) mmap((void*)s, e - s, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        };
+        for (auto& [s, e] : pins) {
+            if (e <= c) continue;
+            rendre(c, s);
+            const uint64_t d = std::max(s, c);
+            madvise((void*)d, e - d, MADV_DONTNEED);
+            c = e;
+        }
+        rendre(c, b);
         engage_retirer(a, b);
     }
     g_mem_gen++;
