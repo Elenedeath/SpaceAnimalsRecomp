@@ -1553,6 +1553,8 @@ void mem_census_init() {}
 void mem_vides_init() {}
 void mem_noyau_debut() {}
 void mem_noyau_fin() {}
+bool mem_noyau_essayer() { return true; }   // garde du noyau sans objet sous Linux (comme mem_noyau_debut)
+void mem_noyau_liberer() {}
 void mem_epingler(uint64_t addr, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_epingle_mx);
     g_epingles[{addr, addr + size}]++;
