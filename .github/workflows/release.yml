@@ -1,0 +1,200 @@
+# Releases of this fork.
+#
+#   Windows: run this workflow by hand (Actions > Release > Run workflow, platform "windows"), or push a tag
+#            "v<version>" (for example v1.1.0.1). Built from the "shaders" branch.
+#   Linux:   run this workflow by hand with platform "linux": the AppImage is built from the "linux" branch with
+#            the "shaders" branch merged in, and published under the tag "linux-v<version>" (not marked as the
+#            latest release, so the Windows launcher's update check keeps finding the Windows release).
+#
+# Branches: the first one is checked out, the others are merged into it for the build only (nothing is pushed).
+# The release tag points at the head of the first branch; the notes list the commit of every branch.
+#
+# The launcher background videos are not in git (.gitignore): they are taken from this repository's "extraits"
+# release (assets extrait_*.mp4).
+#
+# Changed in the build only, never committed:
+#   recomp/VERSION                  set to the released version (the launcher compares it with the latest release)
+#   recomp/launcher/maj.py DEPOT    this repository, so the launcher updates from this fork's releases
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "windows (zip) or linux (AppImage)"
+        type: choice
+        options: [windows, linux]
+        default: windows
+      version:
+        description: "Version number without the v, for example 1.1.0.1"
+        required: true
+      branches:
+        description: "Branches to build, the others merged into the first (empty: 'shaders' for windows, 'linux shaders' for linux)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  EXTRAITS_TAG: extraits
+  PYTHONUTF8: "1"
+
+jobs:
+  windows:
+    if: github.event_name == 'push' || inputs.platform == 'windows'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Version and tag
+        id: v
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_BRANCHES: ${{ inputs.branches }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag="$GITHUB_REF_NAME"; version="${tag#v}"
+          else
+            version="$IN_VERSION"; tag="v$version"
+          fi
+          branches="${IN_BRANCHES:-shaders}"; ref="${branches%% *}"
+          echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+)+$' || { echo "::error::bad version: $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "branches=$branches" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.v.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Merge the other branches (build only)
+        id: m
+        run: |
+          git config user.name "release workflow"
+          git config user.email "release-workflow@users.noreply.github.com"
+          echo "target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          notes="$(echo ${{ steps.v.outputs.branches }} | cut -d' ' -f1) $(git rev-parse --short HEAD)"
+          for b in $(echo ${{ steps.v.outputs.branches }} | cut -s -d' ' -f2-); do
+            git merge --no-edit "origin/$b" || { echo "::error::$b does not merge cleanly"; exit 1; }
+            notes="$notes, $b $(git rev-parse --short origin/$b)"
+          done
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Launcher background videos
+        run: |
+          gh release download "$EXTRAITS_TAG" -R "$GITHUB_REPOSITORY" --pattern 'extrait_*.mp4' --dir recomp/launcher/extraits
+          ls -l recomp/launcher/extraits
+
+      - name: Version and update source (build only)
+        run: |
+          printf '%s' "${{ steps.v.outputs.version }}" > recomp/VERSION
+          sed -i "s|^DEPOT = \".*\"|DEPOT = \"$GITHUB_REPOSITORY\"|" recomp/launcher/maj.py
+          grep -q "^DEPOT = \"$GITHUB_REPOSITORY\"$" recomp/launcher/maj.py || { echo "::error::DEPOT not replaced in maj.py"; exit 1; }
+
+      - name: Build tools cache
+        uses: actions/cache@v4
+        with:
+          path: recomp/outils/_archives
+          key: outils-windows-${{ hashFiles('recomp/launcher/outils.py') }}
+
+      - name: Build tools (outils.py)
+        run: python recomp/launcher/outils.py --garder-archives
+
+      - name: Launcher (construire.py)
+        run: python recomp/launcher/construire.py
+
+      - name: Package (paquet.py)
+        run: python recomp/launcher/paquet.py dist --version "${{ steps.v.outputs.version }}"
+
+      - name: Publish the release
+        run: |
+          ls -l dist
+          gh release create "${{ steps.v.outputs.tag }}" dist/*.zip dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
+            --target "${{ steps.m.outputs.target }}" --latest \
+            --title "SpaceAnimalsRecomp ${{ steps.v.outputs.version }}" \
+            --notes "Windows build. Branches: ${{ steps.m.outputs.notes }}."
+
+  linux:
+    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'linux'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Version and tag
+        id: v
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_BRANCHES: ${{ inputs.branches }}
+        run: |
+          version="$IN_VERSION"; tag="linux-v$version"
+          branches="${IN_BRANCHES:-linux shaders}"; ref="${branches%% *}"
+          echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+)+$' || { echo "::error::bad version: $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "branches=$branches" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.v.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Merge the other branches (build only)
+        id: m
+        run: |
+          git config user.name "release workflow"
+          git config user.email "release-workflow@users.noreply.github.com"
+          echo "target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          notes="$(echo ${{ steps.v.outputs.branches }} | cut -d' ' -f1) $(git rev-parse --short HEAD)"
+          for b in $(echo ${{ steps.v.outputs.branches }} | cut -s -d' ' -f2-); do
+            git merge --no-edit "origin/$b" || { echo "::error::$b does not merge cleanly"; exit 1; }
+            notes="$notes, $b $(git rev-parse --short origin/$b)"
+          done
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld cmake ninja-build pkg-config binutils ffmpeg
+
+      - name: Launcher background videos
+        run: |
+          gh release download "$EXTRAITS_TAG" -R "$GITHUB_REPOSITORY" --pattern 'extrait_*.mp4' --dir "$HOME/extraits"
+          ls -l "$HOME/extraits"
+
+      - name: Version (build only)
+        run: printf '%s' "${{ steps.v.outputs.version }}" > recomp/VERSION
+
+      - name: System root cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/sysroot
+            ~/sysroot.cache
+          key: sysroot-${{ hashFiles('recomp/launcher/sysroot_linux.py') }}
+
+      - name: System root (sysroot_linux.py)
+        run: python3 recomp/launcher/sysroot_linux.py "$HOME/sysroot" --cache "$HOME/sysroot.cache"
+
+      - name: AppImage (paquet_linux.py)
+        run: |
+          python3 recomp/launcher/paquet_linux.py dist --sysroot "$HOME/sysroot" --extraits "$HOME/extraits" \
+            --version "${{ steps.v.outputs.version }}"
+          cd dist && sha256sum *.AppImage > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Publish the release
+        run: |
+          gh release create "${{ steps.v.outputs.tag }}" dist/*.AppImage dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
+            --target "${{ steps.m.outputs.target }}" --latest=false \
+            --title "SpaceAnimalsRecomp ${{ steps.v.outputs.version }} (Linux)" \
+            --notes "Linux AppImage (Steam Deck and desktop Linux). Branches: ${{ steps.m.outputs.notes }}."
