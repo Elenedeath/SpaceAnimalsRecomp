@@ -5,6 +5,9 @@
 #   Linux:   run this workflow by hand with platform "linux": the AppImage is built from the "linux" branch with
 #            the "shaders" branch merged in, and published under the tag "linux-v<version>" (not marked as the
 #            latest release, so the Windows launcher's update check keeps finding the Windows release).
+#   All:     platform "all" (the default by hand): both builds run side by side and one release "v<version>",
+#            marked as the latest, gets the Windows zips, the AppImage and a common SHA256SUMS.txt. The Windows
+#            launcher's update check only looks for the "-update.zip" asset, so the AppImage next to it is harmless.
 #
 # Branches: the first one is checked out, the others are merged into it for the build only (nothing is pushed).
 # The release tag points at the head of the first branch; the notes list the commit of every branch.
@@ -24,10 +27,10 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: "windows (zip) or linux (AppImage)"
+        description: "all (one release: Windows zips and Linux AppImage), windows (zip) or linux (AppImage)"
         type: choice
-        options: [windows, linux]
-        default: windows
+        options: [all, windows, linux]
+        default: all
       version:
         description: "Version number without the v, for example 1.1.0.1"
         required: true
@@ -46,8 +49,13 @@ env:
 
 jobs:
   windows:
-    if: github.event_name == 'push' || inputs.platform == 'windows'
+    if: github.event_name == 'push' || inputs.platform == 'windows' || inputs.platform == 'all'
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      target: ${{ steps.m.outputs.target }}
+      notes: ${{ steps.m.outputs.notes }}
     defaults:
       run:
         shell: bash
@@ -118,7 +126,19 @@ jobs:
       - name: Package (paquet.py)
         run: python recomp/launcher/paquet.py dist --version "${{ steps.v.outputs.version }}"
 
+      - name: Keep the packages for the common release
+        if: inputs.platform == 'all'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          compression-level: 0
+          retention-days: 1
+
       - name: Publish the release
+        if: inputs.platform != 'all'
         run: |
           ls -l dist
           gh release create "${{ steps.v.outputs.tag }}" dist/*.zip dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
@@ -127,7 +147,7 @@ jobs:
             --notes "Windows build. Branches: ${{ steps.m.outputs.notes }}."
 
   linux:
-    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'linux'
+    if: github.event_name == 'workflow_dispatch' && (inputs.platform == 'linux' || inputs.platform == 'all')
     runs-on: ubuntu-24.04
     steps:
       - name: Version and tag
@@ -164,7 +184,8 @@ jobs:
 
       - name: Build packages
         run: |
-          sudo apt-get update
+          # apt-get update has hung for 4 to 15 minutes on some runners: 3 tries of 3 minutes at most
+          for i in 1 2 3; do timeout 180 sudo apt-get update && break; echo "::warning::apt-get update try $i failed"; done
           sudo apt-get install -y --no-install-recommends clang lld cmake ninja-build pkg-config binutils ffmpeg
 
       - name: Launcher background videos
@@ -192,9 +213,43 @@ jobs:
             --version "${{ steps.v.outputs.version }}"
           cd dist && sha256sum *.AppImage > SHA256SUMS.txt && cat SHA256SUMS.txt
 
+      - name: Keep the package for the common release
+        if: inputs.platform == 'all'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.AppImage
+            dist/SHA256SUMS.txt
+          compression-level: 0
+          retention-days: 1
+
       - name: Publish the release
+        if: inputs.platform != 'all'
         run: |
           gh release create "${{ steps.v.outputs.tag }}" dist/*.AppImage dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
             --target "${{ steps.m.outputs.target }}" --latest=false \
             --title "SpaceAnimalsRecomp ${{ steps.v.outputs.version }} (Linux)" \
             --notes "Linux AppImage (Steam Deck and desktop Linux). Branches: ${{ steps.m.outputs.notes }}."
+
+  # platform "all": one release with both packages (tag v<version>, latest)
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'all'
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: paquets
+
+      - name: Publish the release
+        run: |
+          ls -lR paquets
+          mkdir dist
+          mv paquets/windows/*.zip paquets/linux/*.AppImage dist/
+          cat paquets/windows/SHA256SUMS.txt paquets/linux/SHA256SUMS.txt | tr -d '\r' > dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+          gh release create "${{ needs.windows.outputs.tag }}" dist/* -R "$GITHUB_REPOSITORY" \
+            --target "${{ needs.windows.outputs.target }}" --latest \
+            --title "SpaceAnimalsRecomp ${{ needs.windows.outputs.version }}" \
+            --notes "Windows (zip, update zip) and Linux (AppImage: Steam Deck and desktop Linux). Branches: ${{ needs.windows.outputs.notes }}."
