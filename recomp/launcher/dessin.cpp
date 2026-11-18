@@ -1703,6 +1703,42 @@ void dessin_redim() {
 #endif
 }
 
+bool zone_presente(int id) {
+    for (const ZoneR& z : g_zones_prec)
+        if (z.id == id) return true;
+    return false;
+}
+int zone_premiere() { return g_zones_prec.empty() ? Z_AUCUNE : g_zones_prec.front().id; }
+
+// Navigation à la manette : centre de la zone de départ, puis, parmi les zones situées dans la direction voulue, la
+// plus proche ; l'écart sur l'autre axe compte double (rester sur la même ligne ou la même colonne), nul quand les
+// zones se recouvrent sur cet axe
+int zone_voisine(int depuis, int dx, int dy) {
+    const ZoneR* a = nullptr;
+    for (const ZoneR& z : g_zones_prec)
+        if (z.id == depuis) a = &z;
+    if (!a) return Z_AUCUNE;
+    const float ax = (a->r.left + a->r.right) / 2, ay = (a->r.top + a->r.bottom) / 2;
+    int best = Z_AUCUNE;
+    float best_s = 1e30f;
+    for (const ZoneR& z : g_zones_prec) {
+        if (z.id == depuis) continue;
+        const float cx = (z.r.left + z.r.right) / 2, cy = (z.r.top + z.r.bottom) / 2;
+        float d, s;
+        if (dx) {
+            d = (cx - ax) * dx;
+            s = (z.r.bottom > a->r.top && z.r.top < a->r.bottom) ? 0.f : std::fabs(cy - ay);
+        } else {
+            d = (cy - ay) * dy;
+            s = (z.r.right > a->r.left && z.r.left < a->r.right) ? 0.f : std::fabs(cx - ax);
+        }
+        if (d <= 2.f) continue;
+        const float score = d + 2.f * s;
+        if (score < best_s) best_s = score, best = z.id;
+    }
+    return best;
+}
+
 int zone_sous(float x, float y) {
     for (auto it = g_zones_prec.rbegin(); it != g_zones_prec.rend(); ++it)
         if (x >= it->r.left && x < it->r.right && y >= it->r.top && y < it->r.bottom) return it->id;
@@ -1734,6 +1770,12 @@ void dessin_image() {
     bandeau(t);
     barre_haut();
     cadre(0, 0, LARGEUR, HAUTEUR, VERT, 0.45f);
+    if (g.pad_nav)   // sélection à la manette : un cadre autour de la zone choisie (la souris, elle, la survole)
+        for (const ZoneR& z : g_zones)
+            if (z.id == g.zone_survol) {
+                cadre(z.r.left - 3, z.r.top - 3, z.r.right + 3, z.r.bottom + 3, BLANC, 0.85f, 1.5f);
+                break;
+            }
     HRESULT hr = g_dc->EndDraw();
     g_zones_prec.swap(g_zones);
     if (hr == D2DERR_RECREATE_TARGET) {

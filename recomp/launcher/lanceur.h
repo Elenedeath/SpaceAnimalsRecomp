@@ -188,6 +188,7 @@ struct App {
     bool onglet_manette = false;   // page Contrôles : onglet Manette (sinon Clavier)
     int capture_pad = -1;          // onglet Manette : bouton de la Switch qui attend un appui sur la manette ; -1 : aucun
     uint32_t pad_tenues = 0;       // entrées déjà appuyées quand l'attente a commencé (ne comptent qu'une fois relâchées)
+    bool pad_nav = false;          // sélection menée par la manette (zone_survol) : cadre dessiné, souris ignorée
     // chemins
     std::wstring dossier_exe, recomp, jeu, extraits, ini, copie;
     bool copie_ok = false;
@@ -245,6 +246,11 @@ void dessin_redim();
 void dessin_image();          // une image complète ; met à jour g.zone_survol
 void dessin_liberer();
 int zone_sous(float x, float y);   // zone cliquable sous le point (DIP), d'après la dernière image
+bool zone_presente(int id);         // la zone était-elle dans la dernière image ?
+int zone_premiere();                // première zone de la dernière image (Z_AUCUNE : aucune)
+// zone la plus proche de `depuis` dans la direction (dx, dy) (une seule composante non nulle), d'après la dernière
+// image ; Z_AUCUNE s'il n'y en a pas
+int zone_voisine(int depuis, int dx, int dy);
 
 // lanceur.cpp
 std::string utf8(const std::wstring& w);
@@ -262,7 +268,7 @@ std::wstring nom_carte(const std::string& nom);   // nom affiché : sans (TM) ni
 int raccourci_etat();
 
 // manette.cpp
-void manettes_lire();                 // une fois par image sur l'onglet Manette : charge SDL3 la première fois
+void manettes_lire();                 // une fois par image hors partie : charge SDL3 la première fois
 void manettes_fermer();               // rend les manettes et SDL (onglet quitté, jeu lancé)
 const EtatManettes& manettes();       // dernier état lu
 std::wstring nom_entree(int entree, int famille);   // « B / ○ » (famille 0), « ○ » (PlayStation)…
