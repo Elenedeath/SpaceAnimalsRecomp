@@ -182,11 +182,45 @@ jobs:
           done
           echo "notes=$notes" >> "$GITHUB_OUTPUT"
 
-      - name: Build packages
+      # The Ubuntu mirrors of the runners can be very slow (apt took 10 to 20 minutes, ffmpeg alone pulls dozens of
+      # libraries): clang, lld, cmake, ninja, pkg-config and readelf come from the runner image, apt only installs
+      # what is missing, and ffmpeg is a static build from GitHub, kept in the cache.
+      - name: Build tools (runner image)
         run: |
-          # apt-get update has hung for 4 to 15 minutes on some runners: 3 tries of 3 minutes at most
-          for i in 1 2 3; do timeout 180 sudo apt-get update && break; echo "::warning::apt-get update try $i failed"; done
-          sudo apt-get install -y --no-install-recommends clang lld cmake ninja-build pkg-config binutils ffmpeg
+          mkdir -p "$HOME/bin" && echo "$HOME/bin" >> "$GITHUB_PATH" && export PATH="$HOME/bin:$PATH"
+          # clang-18, ld.lld-18… without the plain name: link the newest version
+          for t in clang clang++ ld.lld; do
+            command -v "$t" >/dev/null && continue
+            v=$(ls /usr/bin/"$t"-[0-9]* 2>/dev/null | sort -V | tail -1)
+            [ -n "$v" ] && ln -sf "$v" "$HOME/bin/$t"
+          done
+          manque=""
+          for t in clang:clang clang++:clang ld.lld:lld cmake:cmake ninja:ninja-build pkg-config:pkg-config readelf:binutils; do
+            command -v "${t%%:*}" >/dev/null || manque="$manque ${t#*:}"
+          done
+          if [ -n "$manque" ]; then
+            echo "::warning::not on the runner image, installed with apt:$manque"
+            for i in 1 2 3; do timeout 180 sudo apt-get update && break; done
+            timeout 900 sudo apt-get install -y --no-install-recommends $manque
+          fi
+          clang --version | head -1; ld.lld --version; cmake --version | head -1; ninja --version
+
+      - name: ffmpeg cache
+        id: ffc
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg
+          key: ffmpeg-btbn-lgpl-1
+
+      - name: ffmpeg (static build, BtbN/FFmpeg-Builds)
+        run: |
+          if [ ! -x "$HOME/ffmpeg/ffmpeg" ]; then
+            mkdir -p "$HOME/ffmpeg"
+            curl -fsSL --retry 3 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz \
+              | tar -xJ -C "$HOME/ffmpeg" --strip-components=2 --wildcards '*/bin/ffmpeg'
+          fi
+          "$HOME/ffmpeg/ffmpeg" -hide_banner -version | head -1
+          echo "FFMPEG=$HOME/ffmpeg/ffmpeg" >> "$GITHUB_ENV"
 
       - name: Launcher background videos
         run: |
