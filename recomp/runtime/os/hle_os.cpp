@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #include <utility>
 #include <mutex>
 #include <unordered_map>
@@ -252,7 +253,69 @@ int stub_namespace(const char* prefix, const char* why) {
     return n;
 }
 
+// ---------------------------------------------------------------- memmove / memcpy / strcmp du SDK
+// Le profil d'une cinématique chargée (2026-11-17) mettait sdk!memmove parmi les premières fonctions des threads de
+// travail du jeu : la copie octet par octet ou mot par mot du code recompilé coûte bien plus que celle de la
+// bibliothèque C de l'hôte (UCRT sous Windows, glibc sous Linux : C standard, même source). Les appels qui passent
+// par le dispatch (imports de main, PLT du SDK) arrivent ici ; les appels directs internes au SDK restent recompilés.
+// Mémoire invitée = mémoire hôte : les fautes (pages engagées à la demande, textures rendues, VB_VRAM) sont
+// traitées par le gestionnaire d'exceptions quel que soit le code qui les provoque. RECOMP_NO_HOST_LIBC=1 : désactivé.
+namespace {
+// GPTR de cpu.h, que <windows.h> redéfinit (GMEM_FIXED | GMEM_ZEROINIT) dans ce fichier
+inline void* gmem(uint64_t a) { return (void*)(uintptr_t)(a + (uint64_t)RECOMP_MEM_OFFSET); }
+// memmove(dst, src, n) → dst : x0 n'est pas modifié (comme le code du SDK)
+void host_memmove(CPUState* ctx) {
+    if (ctx->x[2]) memmove(gmem(ctx->x[0]), gmem(ctx->x[1]), (size_t)ctx->x[2]);
+}
+// strcmp : même résultat que sdk!strcmp au bit près (différence des premiers octets non signés qui diffèrent ou
+// fin de la première chaîne, sur 32 bits) et mêmes lectures (mots de 8 octets alignés seulement quand les deux
+// chaînes ont le même alignement) : pas de lecture au-delà de ce que lit le code du SDK.
+void host_strcmp(CPUState* ctx) {
+    const uint8_t* a = (const uint8_t*)gmem(ctx->x[0]);
+    const uint8_t* b = (const uint8_t*)gmem(ctx->x[1]);
+    if ((((uintptr_t)a ^ (uintptr_t)b) & 7) == 0) {
+        for (; (uintptr_t)a & 7; a++, b++)
+            if (!*a || *a != *b) goto fin;
+        for (;; a += 8, b += 8) {
+            uint64_t x, y;
+            memcpy(&x, a, 8);
+            memcpy(&y, b, 8);
+            const uint64_t marque = (((x - 0x0101010101010101ull) & ~x) & 0x8080808080808080ull) | (x ^ y);
+            if (marque) {
+                const unsigned d = (unsigned)__builtin_ctzll(marque) & 0x38;
+                ctx->x[0] = (uint32_t)((uint32_t)((x >> d) & 0xff) - (uint32_t)((y >> d) & 0xff));
+                return;
+            }
+        }
+    }
+    while (*a && *a == *b) a++, b++;
+fin:
+    ctx->x[0] = (uint32_t)((uint32_t)*a - (uint32_t)*b);
+}
+
+int replace_libc() {
+    if (const char* e = getenv("RECOMP_NO_HOST_LIBC"); e && *e && *e != '0') {
+        HLOG("hle", "memmove / memcpy / strcmp: recompiled SDK code kept (RECOMP_NO_HOST_LIBC)");
+        return 0;
+    }
+    // memcpy du SDK = saut vers __memcpy_aarch64 (par la PLT) ; memmove de l'hôte couvre aussi les recouvrements
+    const std::pair<const char*, RecompFn> fns[] = {
+        {"memmove", host_memmove}, {"memcpy", host_memmove}, {"__memcpy_aarch64", host_memmove}, {"strcmp", host_strcmp}};
+    int n = 0;
+    for (auto& [nom, fn] : fns) {
+        uint64_t a = find_export(nom);
+        if (!a) continue;
+        RecompFn f = fn;
+        rt_register_functions(&a, &f, 1);
+        n++;
+    }
+    HLOG("hle", "memmove / memcpy / strcmp → host C library (%d functions replaced; RECOMP_NO_HOST_LIBC=1 to keep the SDK's)", n);
+    return n;
+}
+}  // namespace
+
 void hle_os_init() {
+    replace_libc();
     int n = 0;
     n += override_export("_ZN2nn2os15InitializeFiberEPNS0_9FiberTypeEPFS2_PvES3_S3_mi", init_fiber);
     n += override_export("_ZN2nn2os13FinalizeFiberEPNS0_9FiberTypeE", finalize_fiber);
