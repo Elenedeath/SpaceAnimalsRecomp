@@ -1453,6 +1453,7 @@ void mem_decommit(uint64_t addr, uint64_t size) {
             rel_retirer(addr & ~0xfffull, (addr + size + 0xfff) & ~0xfffull);
             vides_retirer(addr & ~0xfffull, (addr + size + 0xfff) & ~0xfffull);
         }
+        g_mem_gen++;   // avant le retrait aussi : mem_valid peut avoir lu la plage à la demande juste avant
         AcquireSRWLockExclusive(&g_lazy_lock);
         lazy_retirer(addr, size);
         ReleaseSRWLockExclusive(&g_lazy_lock);
@@ -1528,13 +1529,55 @@ uint64_t mem_find_free(uint64_t base, uint64_t end, uint64_t size, uint64_t alig
 
 // VirtualQuery coûte ≈ 25 µs ici (grand espace réservé) : cache par thread des dernières zones
 // engagées trouvées, invalidé par g_mem_gen (l'engagement ne fait qu'ajouter des zones valides).
+static bool mem_valid_lent(uint64_t addr, uint64_t size, uint64_t gen, bool* ajout, uint64_t* zs_out, uint64_t* ze_out);
 bool mem_valid(uint64_t addr, uint64_t size) {
     struct Zone { uint64_t gen = 0, s = 0, e = 0; };
     thread_local Zone cache[8];
     thread_local unsigned next = 0;
     uint64_t gen = g_mem_gen.load(std::memory_order_acquire), end = addr + size;
+    // taille nulle : vrai, comme avant, mais sans retenir de zone (l'ancien chemin retenait [0, addr) comme valide)
+    if (!size) return true;
+    if (end < addr) return false;
     for (auto& z : cache)
         if (z.gen == gen && addr >= z.s && end <= z.e) return true;
+    bool ajout = false;
+    uint64_t zs = 0, ze = 0;
+    const bool ok = mem_valid_lent(addr, size, gen, &ajout, &zs, &ze);
+    if (ajout) cache[next++ % 8] = Zone{gen, zs, ze};
+    return ok;
+}
+// Plages à la demande (memory_saver) : valides en entier, quel que soit l'état de leurs pages pour Windows. Une page
+// pas encore touchée, rendue vide, rangée dans le fichier temporaire ou dont la texture a été rendue est désengagée,
+// et mem_fault la rétablit au premier accès ; une page engagée y est en lecture-écriture, ou en lecture seule le temps
+// d'un rendu ou du suivi des tampons de sommets (VB_VRAM) : lisible. Aucune n'est mise en PAGE_NOACCESS.
+// Mesuré le 2026-11-17 (run 14, RTX 2070 SUPER) : ces mécanismes découpent les plages en milliers de régions Windows
+// de 64 Ko. Le cache, qui retenait la région rendue par VirtualQuery, échouait sur 20 à 35 % des appels, et chaque
+// échec coûtait un VirtualQuery de 17 à 42 µs : jusqu'à 36 ms de processeur par image sur les fils de rendu, au même
+// rythme que BindTextures et que les creux à 38-45 images/s. Ici la zone retenue est la plage à la demande entière
+// (2 Mo à 1 Go), lue dans g_lazy sans appel à Windows ; le reste (modules, mémoire engagée d'avance) passe toujours
+// par VirtualQuery. RECOMP_MEMVALID_VQ=1 : tout par VirtualQuery, comme avant, pour comparer.
+static bool mem_valid_lent(uint64_t addr, uint64_t size, uint64_t gen, bool* ajout, uint64_t* zs_out, uint64_t* ze_out) {
+    (void)gen;
+    const uint64_t end = addr + size;
+    static const bool vq_seul = [] {
+        const char* e = getenv("RECOMP_MEMVALID_VQ");
+        return e && *e && *e != '0';
+    }();
+    if (!vq_seul) {
+        uint64_t a = addr, zs = 0;
+        AcquireSRWLockShared(&g_lazy_lock);
+        while (a < end) {
+            const auto [ls, le] = lazy_plage(a);
+            if (!le) break;
+            if (!zs) zs = ls;
+            a = le;   // plage suivante accolée : reprise à sa première adresse
+        }
+        ReleaseSRWLockShared(&g_lazy_lock);
+        if (a >= end) {
+            *ajout = true, *zs_out = zs, *ze_out = a;
+            return true;
+        }
+    }
     uint64_t a = addr & ~0xfffull;
     uint64_t zs = 0;
     while (a < end) {
@@ -1555,7 +1598,7 @@ bool mem_valid(uint64_t addr, uint64_t size) {
         if (!zs) zs = (uint64_t)mbi.BaseAddress;
         a = fin_region;
     }
-    cache[next++ % 8] = Zone{gen, zs, a};
+    *ajout = true, *zs_out = zs, *ze_out = a;
     return true;
 }
 

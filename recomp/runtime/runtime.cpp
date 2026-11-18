@@ -14,6 +14,9 @@
 #include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <xmmintrin.h>
+#ifdef __SSE4_2__
+#include <nmmintrin.h>   // crc32 (crc32_update)
+#endif
 #endif
 
 namespace {
@@ -321,13 +324,61 @@ uint64_t rt_cntvct() {
 #endif
 }
 
-uint32_t crc32_update(uint32_t crc, uint64_t data, int bytes, bool castagnoli) {
-    const uint32_t poly = castagnoli ? 0x82F63B78u : 0xEDB88320u;
-    for (int i = 0; i < bytes; i++) {
-        crc ^= (uint8_t)(data >> (8 * i));
-        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (poly & (0u - (crc & 1)));
+// CRC32 / CRC32C d'AArch64 (polynôme réfléchi, sans inversion avant ni après). Le profil d'une cinématique
+// chargée (2026-11-17) y mettait ≈ 4,6 % du temps des threads de travail du jeu avec le calcul bit à bit
+// (64 tours pour 8 octets). CRC32C : instruction crc32 de SSE4.2 (même définition que celle d'AArch64 ; déjà
+// permise par -march=x86-64-v3). CRC32 : tables « slicing-by-8 » calculées à la compilation, en C pur.
+// Résultat identique au bit près à l'ancien calcul (vérifié sur des millions de valeurs, chaque taille).
+namespace {
+struct CrcTables {
+    uint32_t t[8][256];
+};
+constexpr CrcTables crc_tables(uint32_t poly) {
+    CrcTables r{};
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (poly & (0u - (c & 1)));
+        r.t[0][i] = c;
     }
+    for (int s = 1; s < 8; s++)
+        for (uint32_t i = 0; i < 256; i++) r.t[s][i] = (r.t[s - 1][i] >> 8) ^ r.t[0][r.t[s - 1][i] & 0xff];
+    return r;
+}
+constexpr CrcTables kCrc32 = crc_tables(0xEDB88320u);
+#ifndef __SSE4_2__
+constexpr CrcTables kCrc32c = crc_tables(0x82F63B78u);
+#endif
+
+inline uint32_t crc_tab(const CrcTables& T, uint32_t crc, uint64_t data, int bytes) {
+    if (bytes == 8) {
+        const uint32_t lo = crc ^ (uint32_t)data, hi = (uint32_t)(data >> 32);
+        return T.t[7][lo & 0xff] ^ T.t[6][(lo >> 8) & 0xff] ^ T.t[5][(lo >> 16) & 0xff] ^ T.t[4][lo >> 24] ^
+               T.t[3][hi & 0xff] ^ T.t[2][(hi >> 8) & 0xff] ^ T.t[1][(hi >> 16) & 0xff] ^ T.t[0][hi >> 24];
+    }
+    if (bytes == 4) {
+        const uint32_t v = crc ^ (uint32_t)data;
+        return T.t[3][v & 0xff] ^ T.t[2][(v >> 8) & 0xff] ^ T.t[1][(v >> 16) & 0xff] ^ T.t[0][v >> 24];
+    }
+    for (int i = 0; i < bytes; i++) crc = T.t[0][(crc ^ (uint8_t)(data >> (8 * i))) & 0xff] ^ (crc >> 8);
     return crc;
+}
+}  // namespace
+
+uint32_t crc32_update(uint32_t crc, uint64_t data, int bytes, bool castagnoli) {
+    if (!castagnoli) return crc_tab(kCrc32, crc, data, bytes);
+#ifdef __SSE4_2__
+    switch (bytes) {
+    case 1: return _mm_crc32_u8(crc, (uint8_t)data);
+    case 2: return _mm_crc32_u16(crc, (uint16_t)data);
+    case 4: return _mm_crc32_u32(crc, (uint32_t)data);
+    case 8: return (uint32_t)_mm_crc32_u64(crc, data);
+    default:
+        for (int i = 0; i < bytes; i++) crc = _mm_crc32_u8(crc, (uint8_t)(data >> (8 * i)));
+        return crc;
+    }
+#else
+    return crc_tab(kCrc32c, crc, data, bytes);
+#endif
 }
 
 // ------------------------------------------------------------------------------------------
