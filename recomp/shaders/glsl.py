@@ -1171,16 +1171,22 @@ class Emitter:
                 cnt = {4: 1, 5: 2, 6: 4, 7: 4}[t]
                 if cnt == 1:
                     return self.setr(i.dst, f"gld({a})")
-                out = ["{ uint64_t ga = " + a + ";"]
-                out += [self.setr(self.rn(i.dst, k), f"gld(ga + {4 * k}ul)") for k in range(cnt)]
-                return " ".join(out) + " }"
+                # Vecteur (2 ou 4 mots, aligné sur sa taille par le matériel) : une seule traduction. Les fenêtres
+                # importées commencent et finissent sur l'alignement d'import de l'hôte (4 Ko ou plus, find_import) :
+                # un vecteur n'en chevauche jamais deux, et hors de toute fenêtre il se lit à zéro comme mot par
+                # mot. Chaque traduction est une copie de gxl() dans le shader : traduire les mots un par un
+                # multipliait ces copies, et c'est leur nombre qui faisait la pression sur les registres (brouillard,
+                # dcf771efb55667e4, sur le Steam Deck : 240 → 144 VGPR, débit estimé ÷ 3,4).
+                vite = [self.setr(self.rn(i.dst, k), f"GW(gd + {4 * k}ul).v") for k in range(cnt)]
+                zero = [self.setr(self.rn(i.dst, k), "0u") for k in range(cnt)]
+                return (f"{{ uint64_t gd = gxln({a}, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} "
+                        f"else {{ {' '.join(zero)} }} }}")
             data = i.srcs[2]
             if t <= 3:
                 return f"gst{8 if t <= 1 else 16}({a}, {self.u(data)});"
             cnt = {4: 1, 5: 2, 6: 4, 7: 4}[t]
-            out = ["{ uint64_t ga = " + a + ";"]
-            out += [f"gst(ga + {4 * k}ul, {self.u(self.rn(data, k))});" for k in range(cnt)]
-            return " ".join(out) + " }"
+            vite = [f"GW(gd + {4 * k}ul).v = {self.u(self.rn(data, k))};" for k in range(cnt)]
+            return f"{{ uint64_t gd = gxln({a}, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} }}"
         # ATOMG / RED : 32 bits (types 0 non signé, 1 signé), addition flottante (type 3)
         self.uses.add("gatomic")
         op = m["op"]
@@ -1211,14 +1217,12 @@ class Emitter:
         g = self.GTAB_WORD
         L = [f"layout(buffer_reference, std430, buffer_reference_align = 4) {coh}buffer GW {{ uint v; }};",
              f"layout(buffer_reference, std430, buffer_reference_align = 4) {coh}buffer GI {{ int v; }};",
-             # dernier pool trouvé essayé d'abord (les accès d'un shader visent presque tous le même pool)
-             "uint gxl_last = 0u;",
-             "uint64_t gxl_try(uint k, uint64_t a) {",
-             f"  uint b = {g + 4}u + 8u * k;",
-             f"  uint64_t o = a - packUint2x32(uvec2({cb}[b], {cb}[b + 1u]));",
-             f"  uint64_t sz = packUint2x32(uvec2({cb}[b + 4u], {cb}[b + 5u]));",
-             f"  return (o < sz && sz - o >= 4ul) ? packUint2x32(uvec2({cb}[b + 2u], {cb}[b + 3u])) + o : 0ul;",
-             "}",
+             # Dernière fenêtre trouvée gardée en registres (base invitée, taille, adresse Vulkan ; taille 0 : aucune) :
+             # les accès d'un shader visent presque tous le même pool, et un accès qui y retombe ne relit plus la
+             # table dans le tampon uniforme. Avant, chaque accès relisait au moins une entrée (6 mots) : le shader de
+             # la lumière du brouillard (dcf771efb55667e4, ~220 accès dans ses boucles) en faisait 6 lectures de table
+             # par mot utile.
+             "uint64_t gxl_b = 0ul, gxl_s = 0ul, gxl_d = 0ul;",
              # Adresse absente de la table : notée dans le tampon de retour du runtime (son adresse GPU est dans la table,
              # mots g + 2 et g + 3 ; 0 : pas de tampon), qui importera sa fenêtre pour les calculs suivants
              # (vk_render.cpp, glob_retour). Depuis la 1.0.3, la mémoire du jeu n'est plus importée en entier.
@@ -1231,16 +1235,24 @@ class Emitter:
              "  uint i = atomicAdd(fb.n, 1u);",
              "  if (i < 255u) fb.a[i] = a;",
              "}",
-             "uint64_t gxl(uint64_t a) {",
-             f"  uint n = min({cb}[{g}u], 78u);",
-             "  if (gxl_last < n) { uint64_t d = gxl_try(gxl_last, a); if (d != 0ul) return d; }",
-             "  for (uint k = 0u; k < n; k++) {",
-             "    uint64_t d = gxl_try(k, a);",
-             "    if (d != 0ul) { gxl_last = k; return d; }",
+             "uint64_t gxln(uint64_t a, uint64_t n) {",   # adresse Vulkan de [a, a + n), ou 0
+             "  uint64_t o = a - gxl_b;",
+             "  if (o < gxl_s && gxl_s - o >= n) return gxl_d + o;",
+             f"  uint c = min({cb}[{g}u], 78u);",
+             "  for (uint k = 0u; k < c; k++) {",
+             f"    uint b = {g + 4}u + 8u * k;",
+             f"    uint64_t base = packUint2x32(uvec2({cb}[b], {cb}[b + 1u]));",
+             f"    uint64_t sz = packUint2x32(uvec2({cb}[b + 4u], {cb}[b + 5u]));",
+             "    uint64_t p = a - base;",
+             "    if (p < sz && sz - p >= n) {",
+             f"      gxl_b = base; gxl_s = sz; gxl_d = packUint2x32(uvec2({cb}[b + 2u], {cb}[b + 3u]));",
+             "      return gxl_d + p;",
+             "    }",
              "  }",
              "  gxl_miss(a);",
              "  return 0ul;",
              "}",
+             "uint64_t gxl(uint64_t a) { return gxln(a, 4ul); }",
              "uint gld(uint64_t a) { uint64_t d = gxl(a & ~3ul); return d != 0ul ? GW(d).v : 0u; }",
              "void gst(uint64_t a, uint v) { uint64_t d = gxl(a & ~3ul); if (d != 0ul) GW(d).v = v; }",
              "uint gld8(uint64_t a) { return (gld(a) >> (uint(a & 3ul) * 8u)) & 0xffu; }",
@@ -1348,9 +1360,64 @@ class Emitter:
         raise Unsupported(f"global memory ({n})")
 
     # ---------------------------------------------------------------- programme
+    def cibles_brx(self, brx, words):
+        """Cibles exactes d'un BRX d'aiguillage (switch), ou None si le motif n'est pas reconnu.
+
+        Le compilateur de la console borne l'indice avant de lire la table : IMNMX non signé (min avec une constante
+        K), décalage à gauche de 2, LDC dans la banque 1, puis BRX sur la valeur lue (voir le shader du matériau
+        principal, 4f420df06d6a73e1, en 0x1700-0x1750). Seules les entrées 0..K sont alors lisibles ; le reste de la
+        banque (souvent des zéros, qui donneraient le début du shader) ne peut pas être une cible. Les instructions
+        du motif doivent se suivre dans un même bloc (aucune cible de saut entre elles), sans prédicat, et aucun autre
+        écrit ne doit toucher les registres en jeu entre la borne et le BRX. Renvoie (adresse de la borne, cibles) :
+        translate() écarte le motif si une cible de saut tombe après la borne (elle serait contournée)."""
+        k = self.insns.index(brx)
+        if not brx.guard.true or (brx.psrc and not brx.psrc[0].true) or not isinstance(brx.srcs[0], Reg):
+            return None
+        val, idx, decale, borne, ecrits = brx.srcs[0].n, None, False, None, set()
+        for j in range(k - 1, max(-1, k - 12), -1):
+            i = self.insns[j]
+            if i.name in ("bra", "brx", "retr", "call", "ret", "exit") or not i.guard.true:
+                return None
+            dsts = i.dst if isinstance(i.dst, list) else [i.dst] if i.dst is not None else []
+            nums = {d.n for d in dsts if isinstance(d, Reg) and not d.uni}
+            if idx is None:
+                if val in nums:
+                    if (i.name != "ldc" or i.mods.get("type") != 4 or i.mods.get("mode") != 0
+                            or not isinstance(i.srcs[0], CBuf) or i.srcs[0].bank != 1 or i.srcs[0].ubank is not None
+                            or len(i.srcs) < 2 or not isinstance(i.srcs[1], Reg) or i.srcs[1].uni):
+                        return None
+                    off, idx = i.srcs[0].off, i.srcs[1].n
+                continue
+            if idx in nums:
+                if (not decale and i.name == "shf" and not i.mods.get("right") and not i.mods.get("hi")
+                        and i.mods.get("type") == "u32" and isinstance(i.srcs[0], Reg) and i.srcs[0].n == idx
+                        and isinstance(i.srcs[1], Imm) and i.srcs[1].v == 2
+                        and isinstance(i.srcs[2], Reg) and i.srcs[2].zero):
+                    decale = True
+                    continue
+                if (decale and i.name == "imnmx" and not i.mods.get("signed") and i.psrc and i.psrc[0].true
+                        and isinstance(i.srcs[0], Reg) and i.srcs[0].n == idx and isinstance(i.srcs[1], Imm)):
+                    borne, debut = i.srcs[1].v, i.pc
+                    break
+                return None
+            ecrits |= nums
+        if borne is None or idx in ecrits or val in ecrits or off % 4 or borne > 255:
+            return None
+        cibles = set()
+        for e in range(borne + 1):
+            w = off // 4 + e
+            if w >= len(words):
+                return None
+            t = brx.mods["base"] + words[w]
+            if t % 16 or not 0 <= t < len(self.insns) * 16:
+                return None
+            cibles.add(t)
+        return debut, cibles
+
     def translate(self):
         targets = {0}
         calls = False
+        self.brx_cibles = {}   # BRX d'aiguillage dont les cibles sont connues exactement (cibles_brx)
         for i in self.insns:
             if i.target is not None and i.name in ("bra", "call") and i.target < len(self.insns) * 16:
                 targets.add(i.target)
@@ -1371,6 +1438,14 @@ class Emitter:
                     t = base + v
                     if t % 16 == 0 and 0 <= t < len(self.insns) * 16:
                         targets.add(t)
+                bornees = self.cibles_brx(i, words)
+                if bornees is not None:
+                    self.brx_cibles[i.pc] = bornees
+        for pc, (debut, cibles) in list(self.brx_cibles.items()):   # un saut au milieu du motif contournerait la borne
+            if any(debut < t <= pc for t in targets):
+                del self.brx_cibles[pc]
+            else:
+                self.brx_cibles[pc] = cibles
         body = []
         for i in self.insns:
             if i.pc in targets:
@@ -1552,12 +1627,12 @@ class Emitter:
             L.append("    return;")
             L.append("  }")
         else:
-            L += en_chaine(body, loops)
+            L += en_chaine(body, loops, self.brx_cibles)
         L.append("}")
         return "\n".join(L) + "\n"
 
 
-def en_chaine(body, boucle):
+def en_chaine(body, boucle, brx_cibles=None):
     """Corps de main() à partir des blocs `case N:` de l'émetteur, sans boucle de répartition.
 
     Jusqu'à la 1.0.2 : `while (true) { switch (pc) { case N: … pc = M; continue; … default: return; } return; }`.
@@ -1584,8 +1659,10 @@ def en_chaine(body, boucle):
             cur[1].append(l)
     etiquettes = [pc for pc, _ in blocs]
     garde = boucle   # (le compteur `guard` n'est déclaré que pour les shaders qui bouclent)
-    if etiquettes != sorted(etiquettes) or len(set(etiquettes)) != len(etiquettes):
+    ordonnes = etiquettes == sorted(etiquettes) and len(set(etiquettes)) == len(etiquettes)
+    if not ordonnes:
         boucle = True
+    regions, calcule = [], False   # sauts arrière constants (cible, bloc du saut) ; saut calculé
     for pc, corps in blocs:
         for l in corps:
             code = l.split("  //")[0]
@@ -1593,8 +1670,19 @@ def en_chaine(body, boucle):
                 raise Unsupported("break in a block")
             for cible in re.findall(r"\bpc = ([^;]+);", code):   # saut constant vers l'arrière, ou saut calculé
                 cible = cible.strip()
-                if not re.fullmatch(r"\d+u", cible) or int(cible[:-1]) <= pc:
+                if not re.fullmatch(r"\d+u", cible):
                     boucle = True
+                    m = re.search(r"  // brx ([0-9a-f]+)$", l)
+                    connues = (brx_cibles or {}).get(int(m.group(1), 16)) if m else None
+                    if connues is None:   # retour (RET.NODEC) ou table non bornée : forme d'avant
+                        calcule = True
+                    else:   # aiguillage borné : ses sauts arrière font des boucles comme les sauts constants
+                        regions += [[t, pc] for t in connues if t <= pc]
+                elif int(cible[:-1]) <= pc:
+                    boucle = True
+                    regions.append([int(cible[:-1]), pc])
+    if boucle and garde and ordonnes and not calcule and not os.environ.get("RECOMP_SHADER_UNE_BOUCLE"):
+        return boucles_structurees(blocs, regions)
     out, ind = [], "  "
     if boucle:
         out.append("  while (true) {")
@@ -1618,6 +1706,68 @@ def en_chaine(body, boucle):
     if boucle:
         out.append("    if (!passe) return;")
         out.append("  }")
+    return out
+
+
+def boucles_structurees(blocs, regions):
+    """Corps de main() quand le shader a des sauts arrière constants, sans saut calculé : seules les boucles bouclent.
+
+    Avant (en_chaine, forme « boucle ») : toute la chaîne des blocs dans un seul `while (true)`, reparcourue à chaque
+    tour d'une boucle du shader (boucle sur les lumières, par exemple) ; le compilateur du pilote voyait une seule
+    boucle couvrant tout le shader. Mesuré sur la vitre du cockpit de l'Arwing (d45f1d93e1b82a39, 6 boucles couvrant les
+    trois quarts du code) : RADV (Steam Deck) estime la latence et le débit à −46 % sous la forme structurée, Mesa Intel
+    −21 % de cycles et −45 % de débordements de registres ; NVIDIA, inchangé (son compilateur retrouvait les boucles).
+
+    Chaque région [cible .. bloc du saut arrière] devient un `while (true)` ; celles qui se chevauchent sans s'emboîter
+    sont réunies, celles de même cible aussi (la plus longue), les autres s'emboîtent. En fin de région, on ressort quand
+    pc n'est plus un bloc de la région : saut vers l'avant au-delà (ou fin du shader, 0xffffffff), ou saut arrière vers
+    une région englobante, qui le reprend à son propre tour. Tout saut arrière est dans une région qui contient sa
+    cible : il ne peut viser un bloc déjà passé hors de toute boucle. Un saut vers l'avant entre au milieu d'une région
+    comme avant (les blocs précédents ne correspondent pas à pc). RECOMP_SHADER_UNE_BOUCLE=1 : forme d'avant."""
+    regions = sorted({(a, b) for a, b in regions})
+    change = True
+    while change:   # chevauchement sans emboîtement, ou même cible : une seule région
+        change = False
+        for i, (a0, a1) in enumerate(regions):
+            for j, (b0, b1) in enumerate(regions):
+                if i != j and (a0 < b0 <= a1 < b1 or (a0 == b0 and a1 <= b1 and i < j)):
+                    regions[i] = (a0, max(a1, b1))
+                    del regions[j]
+                    change = True
+                    break
+            if change:
+                break
+    regions.sort(key=lambda r: (r[0], -r[1]))
+    out, ouvertes = [], []
+
+    def fermer():
+        a, b = ouvertes.pop()
+        ind = "  " + "  " * len(ouvertes)
+        out.append(f"{ind}  if (pc < {a}u || pc > {b}u) break;")
+        out.append(f"{ind}}}")
+
+    for k, (pc, corps) in enumerate(blocs):
+        while ouvertes and pc > ouvertes[-1][1]:
+            fermer()
+        for r in regions:
+            if r[0] == pc:
+                ind = "  " + "  " * len(ouvertes)
+                out.append(f"{ind}while (true) {{   // boucle {r[0]} .. {r[1]}")
+                out.append(f"{ind}  if (++guard > 1000000u) return;")
+                ouvertes.append(r)
+        ind = "  " + "  " * len(ouvertes)
+        out.append(f"{ind}if (pc == {pc}u) do {{")
+        dernier = ""
+        for l in corps:
+            out.append(ind[2:] + re.sub(r"\bcontinue;", "break;", l))
+            code = l.split("  //")[0].strip()
+            if code:
+                dernier = code
+        if not re.fullmatch(r"(pc = [^;]*; )?(continue|return);", dernier):   # le bloc tombait dans le suivant
+            out.append(f"{ind}  pc = {blocs[k + 1][0] if k + 1 < len(blocs) else 0xffffffff}u;")
+        out.append(f"{ind}}} while (false);")
+    while ouvertes:
+        fermer()
     return out
 
 
