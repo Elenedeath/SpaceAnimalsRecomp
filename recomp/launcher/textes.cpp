@@ -317,6 +317,7 @@ const Texte TEXTES[] = {
     {"pas_de_python", L"Python 3 introuvable : installez-le (python3), ou placez-le dans outils/python.",
      L"Python 3 not found: install it (python3), or put it in outils/python."},
     {"desinst_echec", L"Désinstallation incomplète : ", L"Uninstall incomplete: "},
+    {"desinst_en_cours", L"Désinstallation en cours…", L"Uninstalling…"},
 #endif
     {"pas_de_copie", L"Choisissez d'abord votre copie du jeu.", L"Choose your game copy first."},
     {"filtre_nup", L"Copie de Star Fox (*.nup)", L"Star Fox copy (*.nup)"},

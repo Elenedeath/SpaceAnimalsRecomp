@@ -25,6 +25,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <thread>
 
 // en-têtes Vulkan du moteur (runtime/third_party, construire.py) ; vulkan-1.dll est chargé à l'exécution
@@ -107,7 +108,12 @@ void jlog(const wchar_t* fmt, ...) {
 namespace {
 
 constexpr UINT WM_JEU_FINI = WM_APP + 1, WM_CONS_FINIE = WM_APP + 2, WM_RAPPORT_FINI = WM_APP + 3, WM_REFAIRE = WM_APP + 4,
-               WM_MAJ_DISPO = WM_APP + 5;
+               WM_MAJ_DISPO = WM_APP + 5, WM_DESINSTALLE = WM_APP + 6;
+#ifndef _WIN32
+std::atomic<bool> g_desinstallation{false};   // desinstaller_linux.py tourne (fil à part) : ni jeu, ni tâche, ni fermeture
+#else
+constexpr bool g_desinstallation = false;
+#endif
 constexpr UINT_PTR MINUTEUR_MAJ = 1;
 
 // Une seule instance par classe de fenêtre. Version d'essai (construire.py --classe) : une autre classe, pour tourner à
@@ -969,7 +975,7 @@ std::wstring commande_python(const std::wstring& script) {
 }
 
 void lancer_construction(bool forcer) {
-    if (g.cons.active) return;
+    if (g.cons.active || g_desinstallation) return;
     g.page = Page::Construction;
     auto echec = [](const std::wstring& m) {
         std::lock_guard<std::mutex> l(g.cons.lk);
@@ -1085,8 +1091,9 @@ void fond_relancer();
 void desinstaller() {
 #ifndef _WIN32
     // Linux (AppImage) : desinstaller_linux.py supprime tout pendant que le launcher tourne (un fichier ouvert peut
-    // être supprimé) ; le launcher attend sa fin, car ce Python est dans l'image montée, qui disparaît avec lui
-    if (!_wgetenv(L"APPIMAGE") || g.cons.active || g.jeu_lance) return;
+    // être supprimé) ; le launcher attend sa fin, car ce Python est dans l'image montée, qui disparaît avec lui. Attente
+    // dans un fil à part (WM_DESINSTALLE à la fin) : sur le fil de la fenêtre, elle la figeait jusqu'à 5 minutes.
+    if (!_wgetenv(L"APPIMAGE") || g.cons.active || g.jeu_lance || g_desinstallation) return;
     if (MessageBoxW(g.hwnd, T("desinst_question"), NOM, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     const bool sauv =
         MessageBoxW(g.hwnd, T("desinst_sauvegardes"), NOM, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
@@ -1099,16 +1106,11 @@ void desinstaller() {
          entre_guillemets(_wgetenv(L"APPIMAGE")) + (sauv ? L" --sauvegardes" : L"");
     jlog(L"uninstall requested (saves %ls)", sauv ? L"deleted too" : L"kept");
     video_arreter();
-    const std::string sortie = sortie_commande(c, 300000);
-    const std::string fini = apres_marque(sortie, "@fini ");
-    if (fini.empty()) {   // rien ou pas tout : le launcher reste ouvert, avec la raison
-        const std::string e = apres_marque(sortie, "@erreur ");
-        g.statut_jeu = std::wstring(T("desinst_echec")) + (e.empty() ? L"desinstaller_linux.py" : wide(e));
-        fond_relancer();
-        return;
-    }
-    g.quitter_sans_question = true;
-    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+    g_desinstallation = true;
+    g.statut_jeu = T("desinst_en_cours");
+    std::thread([c] {
+        PostMessageW(g.hwnd, WM_DESINSTALLE, 0, (LPARAM) new std::string(sortie_commande(c, 300000)));
+    }).detach();
     return;
 #endif
     if (!g.paquet || g.cons.active || g.jeu_lance) return;
@@ -1362,6 +1364,7 @@ void lancer_jeu();
 // JOUER : d'abord les shaders compilés pour ce GPU (au premier lancement, après une mise à jour ou un nouveau pilote ;
 // sinon fini en une fraction de seconde), puis le jeu
 void jouer() {
+    if (g_desinstallation) return;
     manettes_fermer();   // les manettes sont au jeu (onglet Manette ouvert : SDL arrêté dans le launcher)
     // Le jeu engage environ 12 Go de mémoire validable (RAM + fichier d'échange ; 12,06 Go mesurés après 3 min 30 de
     // partie le 2026-11-11). S'il en reste moins de 13, il s'arrêterait
@@ -1965,6 +1968,23 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         break;
+#ifndef _WIN32
+    case WM_DESINSTALLE: {   // fin de desinstaller_linux.py (desinstaller) : sortie complète
+        std::string* sortie = (std::string*)l;
+        g_desinstallation = false;
+        const std::string fini = apres_marque(*sortie, "@fini ");
+        if (fini.empty()) {   // rien ou pas tout : le launcher reste ouvert, avec la raison
+            const std::string e = apres_marque(*sortie, "@erreur ");
+            g.statut_jeu = std::wstring(T("desinst_echec")) + (e.empty() ? L"desinstaller_linux.py" : wide(e));
+            fond_relancer();
+        } else {
+            g.quitter_sans_question = true;
+            PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+        }
+        delete sortie;
+        return 0;
+    }
+#endif
     case WM_REFAIRE: {   // preparer.py --a-refaire : des étapes de la construction sont à refaire
         std::wstring* v = (std::wstring*)l;
         if (g.jeu_pret && !g.cons.active && !g.jeu_lance) {
@@ -1995,6 +2015,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        if (g_desinstallation) return 0;   // le Python de la désinstallation est dans l'image, démontée à la fermeture
         if (g.cons.active && !_wgetenv(L"LANCEUR_CAPTURE_QUITTER") && !g.quitter_sans_question) {
             const wchar_t* q = g.langue == Langue::Fr ? L"Une tâche est en cours (construction, shaders, mise à jour ou déplacement). L'arrêter et quitter ?"
                                                       : L"A task is running (build, shaders, update or move). Stop it and quit?";
