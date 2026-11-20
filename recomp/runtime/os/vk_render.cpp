@@ -6646,7 +6646,17 @@ struct VbIdx { uint32_t count = 0, isz = 0; uint64_t gsum = 0; uint32_t mn = 0, 
 std::unordered_map<uint64_t, VbIdx> g_vbw_idx;
 
 bool vbv_actif() {
+#ifdef _WIN32
     static const bool on = getenv("RECOMP_VB_VRAM") && atoi(getenv("RECOMP_VB_VRAM")) != 0;
+#else
+    // Linux : toujours désactivé. Le suivi protège les morceaux en écriture et compte sur le gestionnaire de fautes
+    // pour les rendre ; celui de Linux ne le fait pas, et la première écriture du jeu plantait à l'écran titre.
+    static const bool on = [] {
+        if (getenv("RECOMP_VB_VRAM") && atoi(getenv("RECOMP_VB_VRAM")) != 0)
+            HLOG("vk", "RECOMP_VB_VRAM ignored: not supported on Linux");
+        return false;
+    }();
+#endif
     return on;
 }
 
