@@ -842,6 +842,7 @@ BOOL SetWindowPos(HWND, HWND, int x, int y, int w, int h, UINT) {
 }
 BOOL IsIconic(HWND) { return g_win && (SDL_GetWindowFlags(g_win) & SDL_WINDOW_MINIMIZED); }
 BOOL IsWindowVisible(HWND) { return g_win && !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_HIDDEN); }
+HWND GetForegroundWindow() { return g_win && (SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS) ? (HWND)g_win : nullptr; }
 BOOL IsWindowEnabled(HWND) { return !g_question.load(); }
 BOOL GetClientRect(HWND, RECT* r) {
     int w = 0, h = 0;
