@@ -1770,6 +1770,33 @@ int zone_sous(float x, float y) {
     return Z_AUCUNE;
 }
 
+// Question à l'écran (lanceur.cpp, demander) : par-dessus tout, seules ses zones restent cliquables
+void boite_question() {
+    const Question& q = g.question;
+    g_zones.clear();
+    g_sels.clear();
+    g_onglets.clear();
+    rect(0, 0, LARGEUR, HAUTEUR, NOIR, 0.62f);
+    const float w = 540, x0 = (LARGEUR - w) / 2, x1 = x0 + w;
+    IDWriteTextLayout* l = mise(q.texte, F_CORPS, w - 56, 0.f, true);
+    const float ht = std::min(hauteur_texte(l), 300.f);
+    const float h = 60 + ht + 24 + 30 + 24, y0 = (HAUTEUR - h) / 2, y1 = y0 + h;
+    const uint32_t c = q.attention ? AMBRE : VERT;
+    rect(x0, y0, x1, y1, 0x010402, 0.97f);
+    cadre(x0, y0, x1, y1, c, 0.3f);
+    equerres(x0 - 1, y0 - 1, x1 + 1, y1 + 1, 18, c, 0.9f);
+    texte(NOM, F_PETIT, x0 + 28, y0 + 20, c, 1.f, 2.f);
+    ligne(x0 + 28, y0 + 44, x1 - 28, y0 + 44, c, 0.18f);
+    if (l) g_dc->DrawTextLayout(D2D1::Point2F(x0 + 28, y0 + 60), l, pinceau(TEXTE, 1.f), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    const float by = y1 - 24 - 30, cx = (x0 + x1) / 2;
+    if (q.oui_non) {
+        bouton_contour(cx - 150, by, cx - 10, by + 30, T("q_oui"), Z_Q_OUI);
+        bouton_contour(cx + 10, by, cx + 150, by + 30, T("q_non"), Z_Q_NON);
+    } else {
+        bouton_contour(cx - 70, by, cx + 70, by + 30, T("q_ok"), Z_Q_OUI);
+    }
+}
+
 void dessin_image() {
     if (!g_dc || !g_cible) return;
     const float t = (GetTickCount64() - g.t0) / 1000.f;
@@ -1796,6 +1823,7 @@ void dessin_image() {
     else if (g.page == Page::Graphismes) page_graphismes();
     bandeau(t);
     barre_haut();
+    if (g.question.active) boite_question();
     cadre(0, 0, LARGEUR, HAUTEUR, VERT, 0.45f);
     if (g.pad_nav)   // sélection à la manette : un cadre autour de la zone choisie (la souris, elle, la survole)
         for (const ZoneR& z : g_zones)
