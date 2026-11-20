@@ -50,6 +50,12 @@ HWND g_hwnd = nullptr;
 
 struct ZoneR { D2D1_RECT_F r; int id; };
 std::vector<ZoneR> g_zones, g_zones_prec;
+// Navigation à la manette : sélecteurs ‹ › et onglets, déclarés par le dessin à chaque image comme les zones (un
+// réglage ou un onglet ajouté est navigable sans liste à tenir à jour)
+struct SelR { int zg, zd, ligne; };   // zones ‹ et ›, et la ligne entière quand elle est cliquable (onglet Manette)
+std::vector<SelR> g_sels, g_sels_prec;
+struct OngletR { int id; bool ouvert; };
+std::vector<OngletR> g_onglets, g_onglets_prec;
 
 enum Fmt { F_TITRE, F_SOUS, F_VERSION, F_BOUTON, F_MENU, F_PETIT, F_CORPS, F_BANDEAU, F_PANNEAU, F_VALEUR, F_MONO,
            F_ETAPE, F_GRAS, F_NB };
@@ -651,6 +657,7 @@ void selecteur(float y, const wchar_t* valeur, int zg, int zd, bool actif = true
         texte(L"›", F_VALEUR, x1 - 14, y + 2, survol(zd) ? BLANC : VERT, 1.f, 0.f, 1);
         zone(D2D1::RectF(x0, y, (x0 + x1) / 2, y + h), zg);
         zone(D2D1::RectF((x0 + x1) / 2, y, x1, y + h), zd);
+        g_sels.push_back({zg, zd, Z_AUCUNE});
     }
     texte(valeur, F_VALEUR, (x0 + x1) / 2, y + 4, actif ? BLANC : GRIS, 1.f, 0.5f, 1, x1 - x0 - 70);
 }
@@ -862,6 +869,7 @@ void onglets_controles() {
         const float w = texte(T(k ? "ong_manette" : "ong_clavier"), F_PETIT, x, y, ouvert ? VERT : survol(id) ? BLANC : GRIS, 1.f, 2.f);
         if (ouvert) ligne(x, y + 17, x + w - 2, y + 17, VERT, 1.f, 1.f);
         zone(D2D1::RectF(x - 6, y - 5, x + w + 6, y + 21), id);
+        g_onglets.push_back({id, ouvert});
         x += w + 26;
     }
 }
@@ -1327,6 +1335,7 @@ void page_manette() {
         zone(D2D1::RectF(b0, y, b0 + 18, y + 19), Z_PADG0 + i);
         zone(D2D1::RectF(b1 - 18, y, b1, y + 19), Z_PADD0 + i);
         zone(D2D1::RectF(b0 + 18, y, b1 - 18, y + 19), Z_PAD0 + i);
+        g_sels.push_back({Z_PADG0 + i, Z_PADD0 + i, Z_PAD0 + i});
         texte(attente ? L"…" : nom_entree(g.reglages.manette[i], e.famille), F_PETIT, (b0 + b1) / 2, y + 3,
               attente ? AMBRE : appui ? BLANC : VERT_PALE, 1.f, 0.f, 1, b1 - b0 - 40);
     }
@@ -1607,6 +1616,22 @@ bool zone_presente(int id) {
 }
 int zone_premiere() { return g_zones_prec.empty() ? Z_AUCUNE : g_zones_prec.front().id; }
 
+bool selecteur_de(int z, int* zg, int* zd, bool* ligne) {
+    for (const SelR& s : g_sels_prec)
+        if (z == s.zg || z == s.zd || (s.ligne != Z_AUCUNE && z == s.ligne)) {
+            *zg = s.zg, *zd = s.zd, *ligne = z == s.ligne;
+            return true;
+        }
+    return false;
+}
+
+int onglet_voisin(int sens) {
+    const int n = (int)g_onglets_prec.size();
+    for (int i = 0; i < n; i++)
+        if (g_onglets_prec[i].ouvert) return g_onglets_prec[((i + sens) % n + n) % n].id;
+    return Z_AUCUNE;
+}
+
 // Navigation à la manette : centre de la zone de départ, puis, parmi les zones situées dans la direction voulue, la
 // plus proche ; l'écart sur l'autre axe compte double (rester sur la même ligne ou la même colonne), nul quand les
 // zones se recouvrent sur cet axe
@@ -1646,6 +1671,8 @@ void dessin_image() {
     if (!g_dc || !g_cible) return;
     const float t = (GetTickCount64() - g.t0) / 1000.f;
     g_zones.clear();
+    g_sels.clear();
+    g_onglets.clear();
     titre_lueur();   // avant BeginDraw : il dessine dans sa propre image (imbriqué, il faisait échouer la première image)
     g_dc->BeginDraw();
     g_dc->SetTransform(D2D1::IdentityMatrix());
@@ -1675,6 +1702,8 @@ void dessin_image() {
             }
     HRESULT hr = g_dc->EndDraw();
     g_zones_prec.swap(g_zones);
+    g_sels_prec.swap(g_sels);
+    g_onglets_prec.swap(g_onglets);
     if (hr == D2DERR_RECREATE_TARGET) {
         dessin_redim();
         return;

@@ -1606,24 +1606,6 @@ float dip(int px) { return px * 96.f / g.dpi; }
 // Start « JOUER » ; ← → changent directement un sélecteur ‹ › ; LB / RB passent d'un onglet à l'autre (Contrôles).
 // Rien pendant une attente d'appui de l'onglet Manette : l'appui est pour le bouton choisi (pad_suivre_capture).
 namespace {
-// sélecteurs ‹ › : zone de gauche (celle de droite la suit)
-const int SELECTEURS_G[] = {Z_RES_G,  Z_HZ_G,  Z_NATIF_G, Z_AFF_G,  Z_VOL_G,   Z_FOND_G, Z_FILS_G, Z_LANGUE_G, Z_MAJ_AUTO_G,
-                            Z_VIB_G,  Z_PRESET_G, Z_DLSS_G, Z_DLSSM_G, Z_FSR_G, Z_FSRV_G, Z_GPU_G};
-// zone ‹ et zone › du sélecteur qui contient z ; faux si z n'en est pas un
-bool selecteur_de(int z, int* zg, int* zd) {
-    for (int s : SELECTEURS_G)
-        if (z == s || z == s + 1) {
-            *zg = s, *zd = s + 1;
-            return true;
-        }
-    int i = -1;
-    if (z >= Z_PAD0 && z <= Z_PAD_FIN) i = z - Z_PAD0;   // onglet Manette : ligne d'un bouton de la Switch
-    else if (z >= Z_PADG0 && z <= Z_PADG_FIN) i = z - Z_PADG0;
-    else if (z >= Z_PADD0 && z <= Z_PADD_FIN) i = z - Z_PADD0;
-    if (i < 0) return false;
-    *zg = Z_PADG0 + i, *zd = Z_PADD0 + i;
-    return true;
-}
 // même effet qu'un clic sur la zone (WM_LBUTTONUP)
 void cliquer(int z) {
     const int attente = g.capture;
@@ -1667,11 +1649,13 @@ void manette_naviguer() {
             z = zone_presente(Z_PRINCIPAL) ? Z_PRINCIPAL : zone_premiere();
         } else {
             int zg, zd;
+            bool ligne = false;
             const bool horiz = dir == P_GAUCHE || dir == P_DROITE;
-            if (horiz && selecteur_de(z, &zg, &zd)) {   // sélecteur : la valeur change, la sélection reste sur la ligne
+            // sélecteur (déclaré par le dessin, dessin.cpp) : la valeur change, la sélection reste sur la ligne
+            if (horiz && selecteur_de(z, &zg, &zd, &ligne)) {
                 const int c = dir == P_GAUCHE ? zg : zd;
                 action(c);
-                if (!(z >= Z_PAD0 && z <= Z_PAD_FIN)) z = c;
+                if (!ligne) z = c;
             } else {
                 const int v = zone_voisine(z, dir == P_GAUCHE ? -1 : dir == P_DROITE ? 1 : 0,
                                            dir == P_HAUT ? -1 : dir == P_BAS ? 1 : 0);
@@ -1688,8 +1672,10 @@ void manette_naviguer() {
         else g.page = Page::Aucune;
     }
     if (appui(P_START) && g.capture < 0) action(Z_PRINCIPAL);   // comme Entrée
-    if ((appui(P_EPAULE_G) || appui(P_EPAULE_D)) && g.page == Page::Controles && g.capture < 0)
-        g.onglet_manette = !g.onglet_manette;
+    if ((appui(P_EPAULE_G) || appui(P_EPAULE_D)) && g.capture < 0) {   // onglets dessinés sur la page ouverte
+        const int o = onglet_voisin(appui(P_EPAULE_G) ? -1 : 1);
+        if (o != Z_AUCUNE) action(o);
+    }
 }
 
 float dpi_fenetre(float dpi_ecran, const RECT& zone) {
