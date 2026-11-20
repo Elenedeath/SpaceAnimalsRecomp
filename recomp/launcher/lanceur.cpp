@@ -1460,13 +1460,43 @@ std::wstring raccourci_chemin() {
     else bureau = plat_bureau();
     return bureau.empty() ? bureau : bureau + L"/" + NOM + L".desktop";
 }
+// Valeurs d'un fichier .desktop, selon la spécification Desktop Entry (comme AppRun et present.cpp). Deux niveaux :
+// la chaîne (\\ pour \), puis, dans les guillemets d'Exec, \" \` \$ \\ ; % s'écrit %%. Sans échappement, un chemin
+// contenant " $ ` \ ou % donnait un raccourci qui ne lançait rien.
+std::string desktop_chaine(const std::string& v) {   // niveau chaîne (Path=, Icon=)
+    std::string r;
+    for (char c : v) r += c == '\\' ? std::string("\\\\") : std::string(1, c);
+    return r;
+}
+std::string desktop_exec(const std::string& chemin) {   // Exec= : chemin entre guillemets
+    std::string r = "\"";
+    for (char c : chemin) {
+        if (c == '\\') r += "\\\\\\\\";
+        else if (c == '"' || c == '`' || c == '$') r += "\\\\", r += c;
+        else if (c == '%') r += "%%";
+        else r += c;
+    }
+    return r + "\"";
+}
+std::string desktop_exec_lu(const std::string& v) {   // inverse de desktop_exec (aussi les anciens raccourcis, non échappés)
+    std::string s;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i] == '\\' && i + 1 < v.size() && strchr("\\sntr", v[i + 1])) {
+            const char n = v[++i];
+            s += n == 's' ? ' ' : n == 'n' ? '\n' : n == 't' ? '\t' : n == 'r' ? '\r' : '\\';
+        } else s += v[i];
+    if (s.empty() || s[0] != '"') return s.substr(0, s.find(' '));
+    std::string r;
+    for (size_t i = 1; i < s.size() && s[i] != '"'; i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) r += s[++i];
+        else if (s[i] == '%' && i + 1 < s.size() && s[i + 1] == '%') r += '%', i++;
+        else r += s[i];
+    }
+    return r;
+}
 std::wstring raccourci_cible(const std::wstring& lnk) {
     for (const std::string& l : lignes_fichier(lnk))
-        if (l.rfind("Exec=", 0) == 0) {
-            std::string c = l.substr(5);
-            if (c.size() >= 2 && c.front() == '"') c = c.substr(1, c.find('"', 1) - 1);
-            return wide(c);
-        }
+        if (l.rfind("Exec=", 0) == 0) return wide(desktop_exec_lu(l.substr(5)));
     return {};
 }
 bool raccourci_creer() {
@@ -1475,9 +1505,9 @@ bool raccourci_creer() {
     FILE* f = _wfopen(lnk.c_str(), L"wb");
     if (!f) return false;
     const std::wstring icone = g.dossier_exe + L"/lanceur.png";
-    fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\nExec=\"%s\"\nPath=%s\n%s%sCategories=Game;\nTerminal=false\n",
-            utf8(NOM).c_str(), utf8(exe).c_str(), utf8(parent(exe)).c_str(), existe(icone) ? "Icon=" : "",
-            existe(icone) ? (utf8(icone) + "\n").c_str() : "");
+    fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nPath=%s\n%s%sCategories=Game;\nTerminal=false\n",
+            utf8(NOM).c_str(), desktop_exec(utf8(exe)).c_str(), desktop_chaine(utf8(parent(exe))).c_str(),
+            existe(icone) ? "Icon=" : "", existe(icone) ? (desktop_chaine(utf8(icone)) + "\n").c_str() : "");
     fclose(f);
     chmod(plat_chemin(lnk).c_str(), 0755);   // (un bureau n'ouvre qu'un lanceur exécutable)
     return true;

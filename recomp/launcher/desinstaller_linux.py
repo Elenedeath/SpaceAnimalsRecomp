@@ -112,12 +112,41 @@ def bureau():
     return os.path.join(home, "Desktop")
 
 
+def exec_lu(v):
+    """Chemin d'une ligne Exec= (sans « Exec= ») écrite par le launcher : chaîne échappée selon la spécification
+    Desktop Entry (\\\\ pour \\, puis \\" \\` \\$ \\\\ dans les guillemets, %% pour %), comme raccourci_creer (lanceur.cpp).
+    Les anciens raccourcis, non échappés, se lisent pareil."""
+    s, i = [], 0
+    while i < len(v):
+        if v[i] == "\\" and i + 1 < len(v) and v[i + 1] in "\\sntr":
+            s.append({"s": " ", "n": "\n", "t": "\t", "r": "\r"}.get(v[i + 1], "\\"))
+            i += 2
+        else:
+            s.append(v[i])
+            i += 1
+    s = "".join(s).strip()
+    if not s.startswith('"'):
+        return s.split(" ")[0]
+    r, i = [], 1
+    while i < len(s) and s[i] != '"':
+        if s[i] == "\\" and i + 1 < len(s):
+            r.append(s[i + 1])
+            i += 2
+        elif s.startswith("%%", i):
+            r.append("%")
+            i += 2
+        else:
+            r.append(s[i])
+            i += 1
+    return "".join(r)
+
+
 def raccourci_bureau(racine, appimage):
     """Raccourci du launcher (page Réglages), s'il mène à cette installation ou à cette AppImage."""
     p = os.path.join(bureau(), NOM_RACCOURCI)
     try:
         with open(p, encoding="utf-8", errors="replace") as f:
-            exec_ = next((l[5:].strip().strip('"') for l in f if l.startswith("Exec=")), "")
+            exec_ = next((exec_lu(l[5:].rstrip("\n")) for l in f if l.startswith("Exec=")), "")
     except OSError:
         return []
     cibles = {os.path.join(os.path.abspath(racine), "lanceur")}
