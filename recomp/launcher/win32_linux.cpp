@@ -662,13 +662,21 @@ BOOL TerminateJobObject(HANDLE job, UINT) {
     return TRUE;
 }
 
-// programme du bureau (xdg-open), détaché (l'AppImage ne touche plus LD_LIBRARY_PATH : rien à rétablir)
+// programme du bureau (xdg-open), détaché (l'AppImage ne touche plus LD_LIBRARY_PATH : rien à rétablir). Double fork :
+// l'enfant lance xdg-open dans un petit-enfant et sort aussitôt, ramassé ici ; le petit-enfant est repris par init (ou
+// le sous-moissonneur du bureau). Avant, chaque clic laissait un zombie, jamais ramassé, jusqu'à la fin du launcher.
 static void ouvrir(const std::string& cible) {
-    if (fork() == 0) {
+    const pid_t pid = fork();
+    if (pid == 0) {
         setsid();
-        execlp("xdg-open", "xdg-open", cible.c_str(), (char*)nullptr);
-        _exit(127);
+        if (fork() == 0) {
+            execlp("xdg-open", "xdg-open", cible.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        _exit(0);
     }
+    if (pid > 0)
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
 }
 HANDLE ShellExecuteW(HWND, const wchar_t*, const wchar_t* fichier, const wchar_t*, const wchar_t*, int) {
     ouvrir(plat_chemin(fichier));   // fichier ou dossier, avec le programme du bureau
