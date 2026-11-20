@@ -586,8 +586,36 @@ bool create_swapchain(HWND hwnd, VkSwapchainKHR old = VK_NULL_HANDLE) {
     std::vector<VkSurfaceFormatKHR> fmts(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.pd, g.surf, &n, fmts.data());
     VkSurfaceFormatKHR sf = fmts.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR} : fmts[0];
+#ifdef _WIN32
     for (auto& f : fmts)
         if (f.format == VK_FORMAT_B8G8R8A8_SRGB) sf = f;
+#else
+    // Linux : espace de couleur sRGB exigé. Le dernier B8G8R8A8_SRGB de la liste était pris quel que soit son espace de
+    // couleur, et le premier format offert à défaut : un bureau HDR ou KDE Wayland peut offrir ce format dans un autre
+    // espace (image trop claire, noirs gris, signalé par un joueur, issue GitHub n° 21 ; cause non confirmée). Ordre :
+    // B8G8R8A8_SRGB en sRGB, puis R8G8B8A8_SRGB en sRGB, puis le premier format en sRGB, puis le premier.
+    // RECOMP_SWAPCHAIN_ANY_COLORSPACE=1 : ancien choix. Formats offerts et choix au journal (une fois par liste).
+    if (getenv("RECOMP_SWAPCHAIN_ANY_COLORSPACE")) {
+        for (auto& f : fmts)
+            if (f.format == VK_FORMAT_B8G8R8A8_SRGB) sf = f;
+    } else {
+        int rang = 9;
+        for (auto& f : fmts) {
+            if (f.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) continue;
+            const int r = f.format == VK_FORMAT_B8G8R8A8_SRGB ? 0 : f.format == VK_FORMAT_R8G8B8A8_SRGB ? 1 : 2;
+            if (r < rang) rang = r, sf = f;
+        }
+    }
+    {
+        std::string l;
+        for (auto& f : fmts) l += (l.empty() ? "" : ", ") + std::to_string((int)f.format) + "/" + std::to_string((int)f.colorSpace);
+        static std::string vue;
+        if (l != vue) {
+            vue = l;
+            HLOG("vk", "swapchain formats (format/color space): %s; chosen %d/%d", l.c_str(), (int)sf.format, (int)sf.colorSpace);
+        }
+    }
+#endif
 #ifdef _WIN32
     RECT rc;
     GetClientRect(hwnd, &rc);
