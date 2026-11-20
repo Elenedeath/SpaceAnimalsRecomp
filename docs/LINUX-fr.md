@@ -31,6 +31,11 @@ encore : le pilote Linux relit les pages d'un import de mémoire hôte à chaque
 plage inaccessible fait échouer la soumission (DEVICE LOST au retour au menu). Ces pages sont seulement vidées
 (`MADV_DONTNEED`, elles se relisent à zéro). `RECOMP_UNMAP_PINNED_OLD=1` : ancien comportement (toute la plage inaccessible).
 
+Les nombres s'écrivent toujours avec un point. Sur un système qui n'est pas en anglais (`fr_FR`…), SDL passe un moment
+la locale du processus à celle du système sous X11, et l'échelle du rendu s'écrivait alors `1,0000` dans les réglages du
+moteur, qu'il ne sait pas lire : scène 3D noire, interface seule. Le jeu pose `LC_NUMERIC=C` au démarrage (avant SDL), et
+l'échelle du rendu est écrite en entiers. `RECOMP_NUMERIC_LOCALE=1` : ancien comportement (locale du système).
+
 ## Construire l'AppImage
 
 Sous Linux (ou WSL), avec clang/ld.lld, cmake, ninja, readelf et ffmpeg (extraits du fond), après avoir préparé la

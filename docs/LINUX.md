@@ -32,6 +32,11 @@ covers: the Linux driver re-reads the pages of a host memory import at every sub
 inaccessible range makes the submission fail (DEVICE LOST when going back to the menu). Those pages are only emptied
 (`MADV_DONTNEED`, they read back as zero). `RECOMP_UNMAP_PINNED_OLD=1`: old behaviour (the whole range inaccessible).
 
+Numbers always use a decimal point. On a system that is not in English (`fr_FR`…), SDL briefly switches the process
+locale to the system's under X11, and the render scale was then written as `1,0000` in the engine settings, which the
+engine cannot read: black 3D scene, HUD only. The game sets `LC_NUMERIC=C` at start (before SDL), and the render scale is
+written with integers. `RECOMP_NUMERIC_LOCALE=1`: old behaviour (the system's locale).
+
 ## Building the AppImage
 
 On Linux (or WSL), with clang/ld.lld, cmake, ninja, readelf and ffmpeg (background clips), after preparing the system

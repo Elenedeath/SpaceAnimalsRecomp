@@ -34,6 +34,7 @@
 #include <vector>
 #include <chrono>
 #include <cstdio>
+#include <clocale>
 #include <cstring>
 #include <mutex>
 #include <map>
@@ -793,6 +794,16 @@ bool version_du_jeu_a_jour() {
 }
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    // Nombres toujours avec un point : sur un système non anglais (fr_FR…), SDL passe un moment la locale du processus
+    // à celle du système (X11), et un printf("%f") écrivait alors « 1,0000 ». Variable posée avant le premier appel à
+    // SDL (qui copie l'environnement une fois) : son setlocale(LC_ALL, "") garde LC_NUMERIC à C, sauf LC_ALL imposé.
+    // RECOMP_NUMERIC_LOCALE=1 : ancien comportement (locale du système).
+    if (!getenv("RECOMP_NUMERIC_LOCALE")) {
+        setenv("LC_NUMERIC", "C", 1);
+        setlocale(LC_NUMERIC, "C");
+    }
+#endif
     dpi_compatible();   // avant toute fenêtre (et avant SDL)
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
