@@ -64,6 +64,7 @@ enum Zone : int {
     Z_FSR_G, Z_FSR_D, Z_FSRV_G, Z_FSRV_D,                     // page Graphismes : mode et version du FSR d'AMD
     Z_GPU_G, Z_GPU_D,                                         // page Graphismes : carte graphique
     Z_DEPLACER, Z_RACCOURCI,                                  // page Réglages : emplacement du jeu, raccourci
+    Z_Q_OUI, Z_Q_NON,                                         // question à l'écran : OUI (ou OK), NON
     Z_ONGLET_CLAVIER, Z_ONGLET_MANETTE, Z_PAD_DEFAUT,         // page Contrôles : onglets, manette par défaut
     Z_PAD0, Z_PAD_FIN = Z_PAD0 + NB_PAD - 1,                  // bouton de la Switch (liste) : attend l'entrée voulue
     Z_PADG0, Z_PADG_FIN = Z_PADG0 + NB_PAD - 1,               // ‹ : entrée précédente
@@ -131,6 +132,17 @@ struct Carte {
     uint64_t memoire = 0;     // mémoire vidéo (plus grand tas local)
 };
 
+// Question posée dans la fenêtre du launcher (lanceur.cpp, demander ; dessin.cpp, boite_question) : oui / non ou un
+// simple message, qui se mène à la souris, au clavier et à la manette
+struct Question {
+    bool active = false;
+    std::wstring texte;
+    bool oui_non = true;      // sinon un message et OK
+    bool attention = false;   // mise en garde : cadre ambre
+    int defaut = Z_Q_OUI;     // bouton choisi par Entrée, ou par A quand rien n'est sélectionné
+    int reponse = -1;         // 1 oui (OK), 0 non ; -1 : pas encore répondu
+};
+
 struct Construction {
     std::mutex lk;
     Tache tache = Tache::Construction;
@@ -188,6 +200,7 @@ struct App {
     std::wstring statut_jeu;     // message après une partie (code de sortie…)
     bool rapport_en_cours = false;   // RAPPORT DE BUG : rapport.py tourne
     Construction cons;
+    Question question;
     ULONGLONG t0 = 0;
 };
 
@@ -238,6 +251,9 @@ bool dlss_possible();
 std::wstring nom_carte(const std::string& nom);   // nom affiché : sans (TM) ni (R), « GeForce RTX 5070 Ti »
 // Raccourci du launcher sur le bureau (page Réglages) : 0 aucun, 1 présent, vers ce launcher, 2 vers un autre dossier
 int raccourci_etat();
+// Question dans la fenêtre du launcher (type : MB_YESNO ou MB_OK, MB_ICONWARNING, MB_DEFBUTTON2 comme MessageBoxW) ;
+// rend vrai pour oui (ou OK). Attend la réponse en faisant tourner la fenêtre (images, messages, manettes).
+bool demander(const std::wstring& texte, UINT type);
 
 // manette.cpp
 void manettes_lire();                 // une fois par image hors partie : SDL3 seulement quand une manette est branchée

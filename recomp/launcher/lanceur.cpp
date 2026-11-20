@@ -1011,9 +1011,8 @@ void verifier_reconstruction() {
 // dossier d'installation.
 void desinstaller() {
     if (!g.paquet || g.cons.active || g.jeu_lance) return;
-    if (MessageBoxW(g.hwnd, T("desinst_question"), NOM, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
-    const bool sauvegardes =
-        MessageBoxW(g.hwnd, T("desinst_sauvegardes"), NOM, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    if (!demander(T("desinst_question"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)) return;
+    const bool sauvegardes = demander(T("desinst_sauvegardes"), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
     std::wstring cmd = commande_python(g.recomp + L"\\launcher\\desinstaller.py");
     if (cmd.empty()) {
         g.statut_jeu = T("pas_de_python");
@@ -1198,14 +1197,14 @@ void deplacer() {
         jlog(L"move refused: %ls", e.empty() ? L"deplacer.py gave no answer" : e.c_str());
         const std::wstring m = std::wstring(T("dep_refus")) + (e.empty() ? L"deplacer.py" : e);
         if (essai) g.statut_jeu = m;
-        else MessageBoxW(g.hwnd, m.c_str(), NOM, MB_OK | MB_ICONWARNING);
+        else demander(m, MB_OK | MB_ICONWARNING);
         return;
     }
     const bool autre = apres_marque(sortie, "@volume ") != "meme";
     if (!essai) {
         wchar_t q[1600];
         swprintf(q, 1600, T(autre ? "dep_question_autre" : "dep_question_meme"), dest.c_str());
-        if (MessageBoxW(g.hwnd, q, NOM, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+        if (!demander(q, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2)) return;
     }
     g.dep_vers = dest, g.dep_autre_volume = autre;
     ini_ecrire(L"deplacement_vers", dest);   // launcher fermé pendant la copie : retirée au prochain démarrage
@@ -1464,6 +1463,10 @@ void rapport_de_bug() {
 void basculer(Page p) { g.page = g.page == p ? Page::Aucune : p; }
 
 void action(int z) {
+    if (g.question.active) {   // question à l'écran : seuls ses boutons répondent
+        if (z == Z_Q_OUI || z == Z_Q_NON) g.question.reponse = z == Z_Q_OUI;
+        return;
+    }
     if (z >= Z_TOUCHE0 && z <= Z_TOUCHE_FIN) {   // page Contrôles : cette case attend la prochaine touche pressée
         g.capture = z - Z_TOUCHE0;
         return;
@@ -1667,6 +1670,14 @@ void manette_naviguer() {
         g.sx = g.sy = -1;   // la souris ne reprend la sélection qu'en bougeant
     }
     if (appui(P_SUD) && g.pad_nav && g.zone_survol != Z_AUCUNE && zone_presente(g.zone_survol)) cliquer(g.zone_survol);
+    if (g.question.active) {   // question : B comme Échap, Start comme A
+        if (appui(P_EST)) g.question.reponse = g.question.oui_non ? 0 : 1;
+        else if (appui(P_START)) {
+            const int sel = g.pad_nav && zone_presente(g.zone_survol) ? g.zone_survol : g.question.defaut;
+            g.question.reponse = sel == Z_Q_OUI;
+        }
+        return;
+    }
     if (appui(P_EST)) {   // comme Échap
         if (g.capture >= 0) g.capture = -1;
         else g.page = Page::Aucune;
@@ -1677,6 +1688,79 @@ void manette_naviguer() {
         if (o != Z_AUCUNE) action(o);
     }
 }
+
+// Un tour de la boucle de la fenêtre : messages, manettes, une image. Faux quand WM_QUIT arrive. Sert aussi aux
+// questions (demander), qui attendent leur réponse sans bloquer la fenêtre.
+bool boucle_tour() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) return false;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (IsIconic(g.hwnd) || !IsWindowVisible(g.hwnd)) {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
+        return true;
+    }
+    if (g.sx >= 0) g.zone_survol = zone_sous(g.sx, g.sy);
+    // hors partie : manettes lues (navigation dans le launcher ; onglet Manette : dessin, attente d'un appui) ;
+    // pendant une partie, SDL est arrêté et les manettes sont rendues (au jeu)
+    if (!g.jeu_lance) {
+        manettes_lire();
+        manette_naviguer();   // avant la capture : l'appui qui la termine ne déplace pas aussi la sélection
+        if (g.page == Page::Controles && g.onglet_manette && !g.cons.active && !g.question.active) pad_suivre_capture();
+        else g.capture_pad = -1;
+    } else {
+        manettes_fermer();
+        g.capture_pad = -1;
+    }
+    dessin_image();   // Present attend le balayage de l'écran : ≈ 60 images par seconde
+    return true;
+}
+
+}  // namespace
+
+// Questions dans la fenêtre du launcher (revue de la PR #57 : les boîtes de Windows ne se mènent pas à la manette, un
+// Steam Deck en mode Jeu demandait l'écran tactile). Une manette branchée : le bouton par défaut est sélectionné, A
+// répond. LANCEUR_QUESTIONS_SYSTEME=1 : boîtes de Windows, comme avant ; elles servent aussi quand la fenêtre est cachée
+// ou qu'une question est déjà à l'écran.
+bool demander(const std::wstring& texte, UINT type) {
+    static const bool systeme = _wgetenv(L"LANCEUR_QUESTIONS_SYSTEME") && !wcscmp(_wgetenv(L"LANCEUR_QUESTIONS_SYSTEME"), L"1");
+    if (systeme || g.question.active || !g.hwnd || !IsWindowVisible(g.hwnd)) {
+        const int r = MessageBoxW(g.hwnd, texte.c_str(), NOM, type);
+        return r == IDYES || r == IDOK;
+    }
+    Question& q = g.question;
+    q.texte = texte;
+    // masques de MB_TYPEMASK (0xF), MB_ICONMASK (0xF0) et MB_DEFMASK (0xF00), écrits en chiffres
+    q.oui_non = (type & 0xFu) == MB_YESNO;
+    q.attention = (type & 0xF0u) == MB_ICONWARNING || (type & 0xF0u) == MB_ICONERROR;
+    q.defaut = q.oui_non && (type & 0xF00u) == MB_DEFBUTTON2 ? Z_Q_NON : Z_Q_OUI;
+    q.reponse = -1;
+    q.active = true;
+    const int survol = g.zone_survol;
+    const bool nav = g.pad_nav;
+    g.capture = g.capture_pad = -1;
+    if (manettes().nb > 0) {   // la manette mène : le bouton par défaut est sélectionné
+        g.pad_nav = true;
+        g.zone_survol = q.defaut;
+        g.sx = g.sy = -1;
+    } else {
+        g.pad_nav = false;
+        g.zone_survol = Z_AUCUNE;
+    }
+    while (q.reponse < 0)
+        if (!boucle_tour()) {   // fermeture de l'application : « non », et WM_QUIT rendu à la boucle principale
+            PostQuitMessage(0);
+            q.reponse = 0;
+        }
+    q.active = false;
+    g.pad_nav = nav;
+    g.zone_survol = nav ? survol : Z_AUCUNE;
+    return q.reponse == 1;
+}
+
+namespace {
 
 float dpi_fenetre(float dpi_ecran, const RECT& zone) {
     const float lw = LARGEUR * dpi_ecran / 96, lh = HAUTEUR * dpi_ecran / 96;
@@ -1694,6 +1778,10 @@ RECT zone_de_travail(HWND h) {
 
 LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     static bool suivi = false;
+    if (m == WM_CLOSE && g.question.active) {   // fermeture (Alt+F4…) pendant une question : elle reçoit « non », comme
+        g.question.reponse = 0;                  // une boîte de Windows
+        return 0;
+    }
     switch (m) {
     case WM_NCHITTEST: {
         POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -1748,6 +1836,20 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
+        if (g.question.active) {   // question : Entrée le bouton sélectionné (sinon celui par défaut), Échap non,
+            if (m == WM_SYSKEYDOWN) break;   // ← → Tab passent d'un bouton à l'autre ; Alt+F4 reste possible
+            Question& q = g.question;
+            const int sel = g.zone_survol == Z_Q_OUI || g.zone_survol == Z_Q_NON ? g.zone_survol : q.defaut;
+            // espace, ← et → en chiffres (VK_SPACE 0x20, VK_LEFT 0x25, VK_RIGHT 0x27)
+            if (w == VK_ESCAPE) q.reponse = q.oui_non ? 0 : 1;
+            else if (w == VK_RETURN || w == 0x20) q.reponse = sel == Z_Q_OUI;
+            else if (q.oui_non && (w == 0x25 || w == 0x27 || w == VK_TAB)) {
+                g.zone_survol = sel == Z_Q_OUI ? Z_Q_NON : Z_Q_OUI;
+                g.pad_nav = true;   // sélection affichée par le cadre, comme à la manette
+                g.sx = g.sy = -1;
+            }
+            return 0;
+        }
         if (g.capture_pad >= 0) {   // onglet Manette : Échap annule l'attente d'un appui sur la manette
             if (w == VK_ESCAPE) g.capture_pad = -1;
             return 0;
@@ -1843,13 +1945,14 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         const bool essai = _wgetenv(L"LANCEUR_ACTION") || _wgetenv(L"LANCEUR_CAPTURE") || _wgetenv(L"LANCEUR_HZ");
         if (maj.empty() || essai || g.cons.active || g.jeu_lance || ini_lire(L"maj_refusee", L"") == maj) return 0;
-        if (!IsWindowEnabled(h)) {   // une autre question est à l'écran : celle-ci attend son tour, jamais deux à la fois
+        if (g.question.active || !IsWindowEnabled(h)) {   // une autre question (ou un dialogue) est à l'écran : celle-ci
+                                                          // attend son tour, jamais deux à la fois
             SetTimer(h, MINUTEUR_MAJ, 1500, nullptr);
             return 0;
         }
         wchar_t q[640];
         swprintf(q, 640, T("maj_question"), maj.c_str());
-        if (MessageBoxW(h, q, NOM, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        if (demander(q, MB_YESNO | MB_ICONQUESTION)) {
             lancer_mise_a_jour();
         } else {
             ini_ecrire(L"maj_refusee", maj);
@@ -1892,7 +1995,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g.cons.active && !_wgetenv(L"LANCEUR_CAPTURE_QUITTER") && !g.quitter_sans_question) {
             const wchar_t* q = g.langue == Langue::Fr ? L"Une tâche est en cours (construction, shaders, mise à jour ou déplacement). L'arrêter et quitter ?"
                                                       : L"A task is running (build, shaders, update or move). Stop it and quit?";
-            if (MessageBoxW(h, q, NOM, MB_YESNO | MB_ICONWARNING) != IDYES) return 0;
+            if (!demander(q, MB_YESNO | MB_ICONWARNING)) return 0;
         }
         annuler_construction();
         DestroyWindow(h);
@@ -2007,7 +2110,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (nouvelle_version && !essai) ini_ecrire(L"version_vue", g.version);
         if (nouvelle_version && !essai && g.jeu_pret && g.jeu_obsolete && g.copie_ok) {
             // le joueur choisit : reconstruire maintenant, ou garder le jeu actuel et le faire plus tard, ou jamais
-            if (MessageBoxW(g.hwnd, T("maj_jeu_question"), NOM, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (demander(T("maj_jeu_question"), MB_YESNO | MB_ICONQUESTION)) {
                 jlog(L"new launcher version: game update accepted by the player");
                 lancer_construction(false);
             } else {
@@ -2031,32 +2134,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
 
-    MSG msg;
-    bool fin = false;
-    while (!fin) {
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) fin = true;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        if (fin) break;
-        if (IsIconic(g.hwnd) || !IsWindowVisible(g.hwnd)) {
-            MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
-            continue;
-        }
-        if (g.sx >= 0) g.zone_survol = zone_sous(g.sx, g.sy);
-        // hors partie : manettes lues (navigation dans le launcher ; onglet Manette : dessin, attente d'un appui) ;
-        // pendant une partie, SDL est arrêté et les manettes sont rendues (au jeu)
-        if (!g.jeu_lance) {
-            manettes_lire();
-            manette_naviguer();   // avant la capture : l'appui qui la termine ne déplace pas aussi la sélection
-            if (g.page == Page::Controles && g.onglet_manette && !g.cons.active) pad_suivre_capture();
-            else g.capture_pad = -1;
-        } else {
-            manettes_fermer();
-            g.capture_pad = -1;
-        }
-        dessin_image();   // Present attend le balayage de l'écran : ≈ 60 images par seconde
+    while (boucle_tour()) {
     }
     video_arreter();
     annuler_construction();
