@@ -81,6 +81,13 @@ struct Settings {
     // temporaire des textures (memory.cpp, vides_balayer) ; le jeu les retrouve telles quelles s'il y revient. Faux
     // aussi sans texture_release ou zero_page_release (settings_init).
     bool cold_page_release = true;
+    // Transit des textures et mémoire vidéo (section [performance] de recomp.ini, 2026-11-20 ; avant : variables
+    // d'environnement seulement, qui passent toujours devant) :
+    int staging_arena_mb = -1;          // arène de transit préchauffée (vk_render.cpp) : -1 auto (512 Mo), 0 aucune, n Mo
+    int staging_pool_mb = 512;          // réserve des tampons de transit au-delà de 5 Go validables libres
+    bool vertex_buffers_vram = false;   // sommets et index lus en mémoire vidéo (essai ; ignoré sous Linux)
+    int vertex_buffers_vram_mb = 2048;  // plafond de mémoire vidéo de vertex_buffers_vram
+    int deswizzle_threads = 0;          // fils du désentrelacement des textures : 0 auto (moitié des processeurs, 8 au plus)
     // Optimisations du 2026-11-12 (jeux de descripteurs repris d'un dessin à l'autre, état dynamique gardé, étages de
     // textures sautés, caches d'enregistrement et d'appels indirects, attente active entre fils du jeu) : false les
     // coupe toutes d'un coup (comme la 1.0.3), à essayer si un défaut d'image ou un plantage apparaît.

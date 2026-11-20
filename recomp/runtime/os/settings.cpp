@@ -164,6 +164,30 @@ const char* const kCleGpu = R"(
 gpu = auto
 )";
 
+// Apparu en 1.1.0.x (transit des textures et mémoire vidéo, revue de la PR, 2026-11-20)
+const char* const kClePerf = R"(
+[performance]
+; Transit des textures vers la carte graphique et mémoire vidéo. Les valeurs par défaut conviennent à presque tous les
+; PC ; les baisser aide un PC qui manque de mémoire.
+; staging_arena_mb : tampon de transit préparé d'avance pour les chargements (auto = 512 Mo, off = aucun, ou n Mo) ;
+; créé seulement au-delà de 5 Go de mémoire libre. staging_pool_mb : réserve de tampons de transit gardés entre deux
+; chargements, au-delà de 5 Go libres (128 = taille d'avant la 1.1.0.2). deswizzle_threads : fils qui préparent les
+; textures (auto = la moitié des processeurs, 8 au plus). vertex_buffers_vram : essai, sommets lus depuis la mémoire
+; vidéo (plus rapide dans les scènes chargées, Windows seulement), avec vertex_buffers_vram_mb Mo au plus.
+; Texture transfer to the graphics card and video memory. The defaults suit almost every PC; lowering them helps a PC
+; short of memory.
+; staging_arena_mb: staging buffer prepared in advance for loads (auto = 512 MB, off = none, or n MB); only created
+; with more than 5 GB of free memory. staging_pool_mb: staging buffers kept between loads, above 5 GB free (128 = size
+; before 1.1.0.2). deswizzle_threads: threads that prepare textures (auto = half of the processors, 8 at most).
+; vertex_buffers_vram: test, vertices read from video memory (faster in heavy scenes, Windows only), with
+; vertex_buffers_vram_mb MB at most.
+staging_arena_mb = auto
+staging_pool_mb = 512
+deswizzle_threads = auto
+vertex_buffers_vram = false
+vertex_buffers_vram_mb = 2048
+)";
+
 // noms des actions dans les clés key_… et pad_… (ordre de Settings::keys ; les 16 premières sont les boutons)
 const char* const kNomsActions[Settings::K_NB] = {
     "a", "b", "x", "y", "l", "r", "zl", "zr", "plus", "minus", "lstick", "rstick", "up", "down", "left", "right",
@@ -329,6 +353,30 @@ void apply(const std::string& key, const std::string& val, const char* src) {
         bool b;
         if (parse_bool(v, &b)) g_settings.cold_page_release = b;
         else HLOG("cfg", "%s: cold_page_release = '%s' invalid (true or false): ignored", src, v.c_str());
+    } else if (k == "staging_arena_mb") {
+        long n;
+        const std::string m = lower(trim(v));
+        if (m == "auto") g_settings.staging_arena_mb = -1;
+        else if (m == "off" || m == "false" || m == "none") g_settings.staging_arena_mb = 0;
+        else if (parse_int(v, &n) && n >= 0 && n <= 4096) g_settings.staging_arena_mb = (int)n;
+        else HLOG("cfg", "%s: staging_arena_mb = '%s' invalid (auto, off, 0 to 4096): ignored", src, v.c_str());
+    } else if (k == "staging_pool_mb") {
+        long n;
+        if (parse_int(v, &n) && n >= 0 && n <= 4096) g_settings.staging_pool_mb = (int)n;
+        else HLOG("cfg", "%s: staging_pool_mb = '%s' invalid (0 to 4096): ignored", src, v.c_str());
+    } else if (k == "deswizzle_threads") {
+        long n;
+        if (lower(trim(v)) == "auto") g_settings.deswizzle_threads = 0;
+        else if (parse_int(v, &n) && n >= 1 && n <= 16) g_settings.deswizzle_threads = (int)n;
+        else HLOG("cfg", "%s: deswizzle_threads = '%s' invalid (auto, 1 to 16): ignored", src, v.c_str());
+    } else if (k == "vertex_buffers_vram") {
+        bool b;
+        if (parse_bool(v, &b)) g_settings.vertex_buffers_vram = b;
+        else HLOG("cfg", "%s: vertex_buffers_vram = '%s' invalid (true or false): ignored", src, v.c_str());
+    } else if (k == "vertex_buffers_vram_mb") {
+        long n;
+        if (parse_int(v, &n) && n >= 32 && n <= 65536) g_settings.vertex_buffers_vram_mb = (int)n;
+        else HLOG("cfg", "%s: vertex_buffers_vram_mb = '%s' invalid (32 to 65536): ignored", src, v.c_str());
     } else if (k == "texture_release" || k == "shaders_on_demand") {
         bool b;
         if (parse_bool(v, &b)) (k == "texture_release" ? g_settings.texture_release : g_settings.shaders_on_demand) = b;
@@ -373,6 +421,7 @@ void load_file(const std::string& path, bool create) {
             fputs(kCleFsr, w);
             fputs(kCleRendu, w);
             fputs(kCleGpu, w);
+            fputs(kClePerf, w);
             fclose(w);
             HLOG("cfg", "%s created with default values", path.c_str());
         }
@@ -411,6 +460,7 @@ void load_file(const std::string& path, bool create) {
         if (!vues.count("fsr")) ajout += kCleFsr;
         if (!vues.count("fast_rendering")) ajout += kCleRendu;
         if (!vues.count("gpu")) ajout += kCleGpu;
+        if (!vues.count("staging_arena_mb")) ajout += kClePerf;
         if (!ajout.empty()) {
             if (FILE* w = fopen(path.c_str(), "ab")) {
                 fputs(ajout.c_str(), w);
@@ -498,6 +548,13 @@ void settings_init(int argc, char** argv) {
     if (const char* e = getenv("RECOMP_VIBRATION")) apply("vibration", e, "RECOMP_VIBRATION");
     if (const char* e = getenv("RECOMP_MEMORY_SAVER")) apply("memory_saver", e, "RECOMP_MEMORY_SAVER");
     if (getenv("RECOMP_EAGER_COMMIT")) apply("memory_saver", "false", "RECOMP_EAGER_COMMIT");   // ancien nom (essais)
+    // section [performance] : les variables d'essai d'avant passent devant recomp.ini
+    if (const char* e = getenv("RECOMP_STAGING_ARENA_MB")) apply("staging_arena_mb", e, "RECOMP_STAGING_ARENA_MB");
+    if (getenv("RECOMP_NO_STAGING_ARENA")) apply("staging_arena_mb", "off", "RECOMP_NO_STAGING_ARENA");
+    if (const char* e = getenv("RECOMP_STAGING_POOL_MB")) apply("staging_pool_mb", e, "RECOMP_STAGING_POOL_MB");
+    if (const char* e = getenv("RECOMP_DESWIZZLE_THREADS")) apply("deswizzle_threads", e, "RECOMP_DESWIZZLE_THREADS");
+    if (const char* e = getenv("RECOMP_VB_VRAM")) apply("vertex_buffers_vram", e, "RECOMP_VB_VRAM");
+    if (const char* e = getenv("RECOMP_VB_VRAM_MO")) apply("vertex_buffers_vram_mb", e, "RECOMP_VB_VRAM_MO");
     if (const char* e = getenv("RECOMP_TEX_RELEASE")) apply("texture_release", e, "RECOMP_TEX_RELEASE");
     if (const char* e = getenv("RECOMP_SHADERS_ON_DEMAND")) apply("shaders_on_demand", e, "RECOMP_SHADERS_ON_DEMAND");
     if (const char* e = getenv("RECOMP_ZERO_PAGE_RELEASE")) apply("zero_page_release", e, "RECOMP_ZERO_PAGE_RELEASE");
@@ -567,6 +624,22 @@ void settings_init(int argc, char** argv) {
     HLOG("cfg", "texture data released after upload: %s; shaders prepared at first use: %s; empty game pages given "
                 "back: %s; forgotten game pages put in the temporary file: %s", s.texture_release ? "on" : "off",
          s.shaders_on_demand ? "on" : "off", s.zero_page_release ? "on" : "off", s.cold_page_release ? "on" : "off");
+    {   // section [performance] : une ligne quand un réglage n'a pas sa valeur par défaut
+        const Settings d;
+        if (s.staging_arena_mb != d.staging_arena_mb || s.staging_pool_mb != d.staging_pool_mb ||
+            s.deswizzle_threads != d.deswizzle_threads || s.vertex_buffers_vram != d.vertex_buffers_vram ||
+            s.vertex_buffers_vram_mb != d.vertex_buffers_vram_mb) {
+            char arene[16], fils[16];
+            if (s.staging_arena_mb < 0) snprintf(arene, sizeof arene, "auto");
+            else if (s.staging_arena_mb == 0) snprintf(arene, sizeof arene, "off");
+            else snprintf(arene, sizeof arene, "%d MB", s.staging_arena_mb);
+            if (s.deswizzle_threads) snprintf(fils, sizeof fils, "%d", s.deswizzle_threads);
+            else snprintf(fils, sizeof fils, "auto");
+            HLOG("cfg", "performance: staging arena %s, staging pool %d MB, deswizzle threads %s, vertex buffers in video "
+                        "memory %s (%d MB)", arene, s.staging_pool_mb, fils, s.vertex_buffers_vram ? "on" : "off",
+                 s.vertex_buffers_vram_mb);
+        }
+    }
     if (s.refresh_rate != 60 && s.refresh_rate != 90 && s.refresh_rate != 120)
         HLOG("cfg", "%d Hz: untested value (60, 90 and 120 Hz are verified)", s.refresh_rate);
 }

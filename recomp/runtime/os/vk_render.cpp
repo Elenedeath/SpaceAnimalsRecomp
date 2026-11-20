@@ -2195,8 +2195,7 @@ constexpr uint64_t TRANSIT_RESERVE_MAX = 128ull << 20, TRANSIT_CLASSE_MAX = 64ul
 constexpr uint64_t TRANSIT_CLASSE_ABS = 256ull << 20;
 uint64_t transit_reserve_n0() {
     static const uint64_t v = [] {
-        const char* e = getenv("RECOMP_STAGING_POOL_MB");
-        return e ? (uint64_t)std::max(0, atoi(e)) << 20 : 512ull << 20;
+        return (uint64_t)std::max(0, settings().staging_pool_mb) << 20;   // recomp.ini ou RECOMP_STAGING_POOL_MB
     }();
     return v;
 }
@@ -2247,9 +2246,9 @@ AreneTransit g_arene;
 constexpr uint64_t ARENE_GRAIN = 64ull << 10;
 uint64_t arene_octets() {
     static const uint64_t v = [] {
-        if (getenv("RECOMP_NO_STAGING_ARENA")) return (uint64_t)0;
-        const char* e = getenv("RECOMP_STAGING_ARENA_MB");
-        return (uint64_t)((e ? (uint64_t)std::max(0, atoi(e)) : 512ull) << 20);
+        // recomp.ini (staging_arena_mb) ou RECOMP_STAGING_ARENA_MB / RECOMP_NO_STAGING_ARENA : -1 auto (512 Mo), 0 aucune
+        const int mo = settings().staging_arena_mb;
+        return (uint64_t)(mo < 0 ? 512ull : (uint64_t)mo) << 20;
     }();
     return v;
 }
@@ -3215,8 +3214,9 @@ unsigned nb_ouvriers() {
     static const unsigned n = [] {
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
         unsigned v = std::min(8u, std::max(1u, hw / 2));
-        if (const char* e = getenv("RECOMP_DESWIZZLE_THREADS")) v = std::max(1u, std::min(16u, (unsigned)atoi(e)));
-        HLOG("vk", "texture deswizzle and hashing: %u threads%s", v, getenv("RECOMP_DESWIZZLE_THREADS") ? " (RECOMP_DESWIZZLE_THREADS)" : "");
+        const int voulu = settings().deswizzle_threads;   // recomp.ini ou RECOMP_DESWIZZLE_THREADS ; 0 : auto
+        if (voulu > 0) v = std::max(1u, std::min(16u, (unsigned)voulu));
+        HLOG("vk", "texture deswizzle and hashing: %u threads%s", v, voulu > 0 ? " (deswizzle_threads)" : "");
         return v;
     }();
     return n;
@@ -6686,13 +6686,12 @@ std::unordered_map<uint64_t, VbIdx> g_vbw_idx;
 
 bool vbv_actif() {
 #ifdef _WIN32
-    static const bool on = getenv("RECOMP_VB_VRAM") && atoi(getenv("RECOMP_VB_VRAM")) != 0;
+    static const bool on = settings().vertex_buffers_vram;   // recomp.ini ou RECOMP_VB_VRAM
 #else
     // Linux : toujours désactivé. Le suivi protège les morceaux en écriture et compte sur le gestionnaire de fautes
     // pour les rendre ; celui de Linux ne le fait pas, et la première écriture du jeu plantait à l'écran titre.
     static const bool on = [] {
-        if (getenv("RECOMP_VB_VRAM") && atoi(getenv("RECOMP_VB_VRAM")) != 0)
-            HLOG("vk", "RECOMP_VB_VRAM ignored: not supported on Linux");
+        if (settings().vertex_buffers_vram) HLOG("vk", "vertex_buffers_vram ignored: not supported on Linux");
         return false;
     }();
 #endif
@@ -6808,7 +6807,7 @@ VbCell* vbw_cellule(uint64_t cb) {
     auto it = g_vbw.find(cb);
     if (it != g_vbw.end()) return it->second;
     static const uint64_t plafond =
-        (getenv("RECOMP_VB_VRAM_MO") ? strtoull(getenv("RECOMP_VB_VRAM_MO"), nullptr, 10) : 2048ull) << 20;
+        (uint64_t)std::max(32, settings().vertex_buffers_vram_mb) << 20;   // recomp.ini ou RECOMP_VB_VRAM_MO
     if ((g_vbw.size() + 1) * VBW_CELL > plafond) return nullptr;
     VbCell* c = new VbCell;
     c->base = cb;
