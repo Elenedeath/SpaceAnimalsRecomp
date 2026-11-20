@@ -2482,6 +2482,27 @@ void vram_rendre(int32_t bloc, uint64_t off, uint64_t taille) {
             }
     }
 }
+// Blocs vides gardés (un par type) rendus quand la mémoire manque (2026-11-20, revue de la PR) : moins de 3 Go
+// validables libres, mémoire vidéo au-delà de 85 % de son budget, ou mémoire refusée au jeu (fin_image). Ils étaient
+// gardés en toutes circonstances. Un bloc entamé reste : le rendre demanderait de déplacer ses images.
+// RECOMP_IMAGE_BLOCKS_KEEP=1 : les blocs vides restent gardés, comme avant.
+void vram_blocs_vides_rendre(const char* raison) {
+    static const bool garder = getenv("RECOMP_IMAGE_BLOCKS_KEEP") != nullptr;
+    if (garder) return;
+    unsigned n = 0;
+    for (BlocVram& b : g_blocs_vram)
+        if (b.mem && b.utilise == 0) {
+            vkFreeMemory(g.dev, b.mem, nullptr);
+            b = BlocVram{};
+            n++;
+        }
+    static unsigned journal = 0;
+    if (n && journal < 20) {
+        journal++;
+        HLOG("vk", "texture video memory: %u empty block(s) of %llu MB released (%s)", n,
+             (unsigned long long)(VRAM_BLOC >> 20), raison);
+    }
+}
 
 void begin_frame() {
     if (g.recording) return;
@@ -8791,10 +8812,12 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     // memory_saver = false : plafond fixe, comme en 1.0.2.
     if (frame % 60 == 0) {
         int niveau = 0;
+        bool vram_pleine = false;
         if (settings().memory_saver) {
             const double libre = memoire_validable_libre_go();
             uint64_t used = 0, budget = 0;
             const bool video_pleine = vram_usage(&used, &budget) && used > budget / 100 * 85;
+            vram_pleine = video_pleine;
             niveau = libre < 3.0 ? 2 : libre < 5.0 || video_pleine ? 1 : 0;
             // rendus des textures en attente et réserve de tampons : réduits sous 5 Go, vidés sous 3 Go
             memoire_niveau_suivre(libre);
@@ -8809,6 +8832,8 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
         evict_unreferenced(niveau == 2 ? 0 : niveau == 1 ? std::min<uint64_t>(UNREF_CAP, 256ull << 20) : UNREF_CAP);
         if (niveau == 2)
             while (evict_import(120)) {}
+        if (g_memoire_niveau >= 2) vram_blocs_vides_rendre("less than 3 GB of commit free");
+        else if (vram_pleine) vram_blocs_vides_rendre("video memory over 85 % of its budget");
     }
     // Windows a refusé de la mémoire au jeu (memory.cpp, mem_pression) : les images sans objet et les fenêtres d'import
     // qui ne servent pas à l'image en cours sont rendues tout de suite, pendant que le fil fautif réessaie.
@@ -8819,6 +8844,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
         const uint64_t avant = g.unref_bytes, imp = g.imported;
         evict_unreferenced(0);
         while (evict_import(2)) {}
+        vram_blocs_vides_rendre("memory refused");
         if (premier)
             HLOG("vk", "memory pressure: %.0f MB of orphaned images and %.0f MB of import windows released",
                  (avant - g.unref_bytes) / 1048576.0, (imp - g.imported) / 1048576.0);
