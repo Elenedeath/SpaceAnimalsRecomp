@@ -67,3 +67,13 @@ Pour le launcher seul : `python3 recomp/launcher/construire.py --sysroot <sysroo
   `volumetric_fog = false`) fait passer de 13-22 à 45-60 img/s. Le reste dépend de la surface couverte par les
   personnages (shaders de pixels) : rendu 3D à 75 % conseillé.
 - Polices : Barlow (OFL) remplace Bahnschrift, absente de Linux.
+- DLSS : coupé sous Linux pour l'instant. Le pilote NVIDIA répond `0xbad00012` quand NGX demande les extensions du DLSS,
+  et l'énumération des cartes qu'il demande tôt entrait en concurrence avec SDL dans libvulkan (plantage au démarrage).
+  La page Graphismes l'indique comme indisponible. `RECOMP_DLSS_LINUX=1` : essais (branché comme décrit plus haut).
+- Choix automatique de la carte : le rendu logiciel de Mesa (llvmpipe) est écarté par le jeu et absent de la liste du
+  launcher. Il annonce la RAM comme mémoire vidéo et était préféré à une carte intégrée sur un PC sans carte dédiée
+  (pas d'image). Le réglage `gpu` peut encore le nommer.
+- Swapchain : `B8G8R8A8_SRGB` dans l'espace de couleur sRGB d'abord, puis `R8G8B8A8_SRGB`, puis n'importe quel format en
+  sRGB. La liste des formats et le choix sont écrits au journal (`swapchain formats`). `RECOMP_SWAPCHAIN_ANY_COLORSPACE=1` :
+  ancien choix (dernier `B8G8R8A8_SRGB` quel que soit son espace de couleur, sinon le premier format). Une image trop
+  claire (noirs gris) a été signalée une fois ; ce n'est pas confirmé comme sa cause.
