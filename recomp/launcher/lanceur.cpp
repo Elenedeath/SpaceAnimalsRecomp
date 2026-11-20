@@ -365,6 +365,13 @@ void cartes_lister() {
                         ecartees++;
                         continue;
                     }
+#ifndef _WIN32
+                    // Linux : ni le rendu logiciel de Mesa (llvmpipe, type CPU), que le jeu écarte aussi
+                    if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                        ecartees++;
+                        continue;
+                    }
+#endif
                     VkPhysicalDeviceMemoryProperties mp;
                     memoire(pds[i], &mp);
                     Carte c;

@@ -736,6 +736,12 @@ uint64_t memoire_locale(const VkPhysicalDeviceMemoryProperties& mp) {
 // précompilation plantait. RECOMP_GPU_SET_ASIDE=<partie du nom> (essais) : écarte aussi ces cartes-là.
 bool carte_utilisable(const VkPhysicalDeviceProperties& pr) {
     if (pr.apiVersion < VK_API_VERSION_1_3 || !strncmp(pr.deviceName, "Microsoft Direct3D12", 20)) return false;
+#ifndef _WIN32
+    // Linux : rendu logiciel de Mesa (llvmpipe, type CPU), présent sur la plupart des systèmes. Il annonce la RAM
+    // comme mémoire de la carte, et le choix automatique le préférait à la carte intégrée d'un PC sans carte dédiée :
+    // pas d'image. Écarté du choix automatique (le réglage gpu peut encore le nommer).
+    if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) return false;
+#endif
     static const char* ecart = getenv("RECOMP_GPU_SET_ASIDE");
     return !(ecart && *ecart && minuscules(pr.deviceName).find(minuscules(ecart)) != std::string::npos);
 }
