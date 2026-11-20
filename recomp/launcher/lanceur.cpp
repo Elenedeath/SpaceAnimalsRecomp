@@ -1810,10 +1810,22 @@ void cliquer(int z) {
 }
 uint32_t g_nav_prec = 0;      // entrées (et directions du stick) de l'image précédente
 ULONGLONG g_nav_repete = 0;   // direction tenue : prochaine répétition
+int g_nav_nb = 0;             // manettes vues à l'image précédente
+// Zone choisie quand rien n'est sélectionné : le bouton par défaut d'une question, sinon JOUER
+int zone_defaut() { return g.question.active ? g.question.defaut : Z_PRINCIPAL; }
 }  // namespace
 
 void manette_naviguer() {
     const EtatManettes& e = manettes();
+    // Une manette arrive (au démarrage, ou branchée ensuite) : JOUER (ou le bouton par défaut d'une question) est
+    // sélectionné, A le valide sans avoir à bouger d'abord. LANCEUR_PAD_SELECTION=0 : rien de sélectionné, comme avant.
+    static const bool selection = !(_wgetenv(L"LANCEUR_PAD_SELECTION") && !wcscmp(_wgetenv(L"LANCEUR_PAD_SELECTION"), L"0"));
+    if (selection && e.nb > 0 && g_nav_nb == 0 && !g.pad_nav) {
+        g.pad_nav = true;
+        g.zone_survol = zone_defaut();
+        g.sx = g.sy = -1;
+    }
+    g_nav_nb = e.nb;
     uint32_t m = e.appuyees;
     // stick gauche : une direction quand il est poussé à plus de la moitié (l'axe dominant)
     const float sx = e.axes[0], sy = e.axes[1];
@@ -1860,6 +1872,12 @@ void manette_naviguer() {
         g.zone_survol = z;
         g.pad_nav = true;
         g.sx = g.sy = -1;   // la souris ne reprend la sélection qu'en bougeant
+    }
+    if (appui(P_SUD) && selection && !(g.pad_nav && zone_presente(g.zone_survol))) {
+        // rien de sélectionné (la souris a bougé) : la zone sous la souris, sinon celle par défaut
+        g.zone_survol = g.zone_survol != Z_AUCUNE && zone_presente(g.zone_survol) ? g.zone_survol : zone_defaut();
+        g.pad_nav = true;
+        g.sx = g.sy = -1;
     }
     if (appui(P_SUD) && g.pad_nav && g.zone_survol != Z_AUCUNE && zone_presente(g.zone_survol)) cliquer(g.zone_survol);
     if (g.question.active) {   // question : B comme Échap, Start comme A
