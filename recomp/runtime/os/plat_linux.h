@@ -17,6 +17,7 @@
 #include <sched.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <setjmp.h>
@@ -289,6 +290,19 @@ inline BOOL FindClose(HANDLE h) {
 // ---------------------------------------------------------------- mémoire d'un processus (journal, surveillance)
 // GetCurrentProcess() : pseudo-poignée ; un autre processus est désigné par son pid (precompile_enfant, vk_render.cpp)
 inline HANDLE GetCurrentProcess() { return (HANDLE)(intptr_t)-1; }
+// Fils : priorité d'un fil (le préchauffage de l'arène de transit tourne en priorité basse), par sa valeur nice
+#define THREAD_PRIORITY_BELOW_NORMAL (-1)
+inline HANDLE GetCurrentThread() { return (HANDLE)(intptr_t)-2; }
+inline BOOL SetThreadPriority(HANDLE, int prio) {   // fil courant seulement (seul usage)
+    return setpriority(PRIO_PROCESS, (id_t)gettid(), prio < 0 ? 5 : 0) == 0;
+}
+// Protection de pages (suivi des sommets RECOMP_VB_VRAM) : mprotect, ancienne protection non relue
+#define PAGE_READONLY 0x02u
+#define PAGE_READWRITE 0x04u
+inline BOOL VirtualProtect(void* a, size_t n, DWORD prot, DWORD* avant) {
+    if (avant) *avant = PAGE_READWRITE;
+    return mprotect(a, n, prot == PAGE_READONLY ? PROT_READ : PROT_READ | PROT_WRITE) == 0;
+}
 struct PROCESS_MEMORY_COUNTERS {
     DWORD cb;
     DWORD PageFaultCount;

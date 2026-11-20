@@ -25,6 +25,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <thread>
 
 // en-têtes Vulkan du moteur (runtime/third_party, construire.py) ; vulkan-1.dll est chargé à l'exécution
@@ -107,7 +108,12 @@ void jlog(const wchar_t* fmt, ...) {
 namespace {
 
 constexpr UINT WM_JEU_FINI = WM_APP + 1, WM_CONS_FINIE = WM_APP + 2, WM_RAPPORT_FINI = WM_APP + 3, WM_REFAIRE = WM_APP + 4,
-               WM_MAJ_DISPO = WM_APP + 5;
+               WM_MAJ_DISPO = WM_APP + 5, WM_DESINSTALLE = WM_APP + 6;
+#ifndef _WIN32
+std::atomic<bool> g_desinstallation{false};   // desinstaller_linux.py tourne (fil à part) : ni jeu, ni tâche, ni fermeture
+#else
+constexpr bool g_desinstallation = false;
+#endif
 constexpr UINT_PTR MINUTEUR_MAJ = 1;
 
 // Une seule instance par classe de fenêtre. Version d'essai (construire.py --classe) : une autre classe, pour tourner à
@@ -359,6 +365,13 @@ void cartes_lister() {
                         ecartees++;
                         continue;
                     }
+#ifndef _WIN32
+                    // Linux : ni le rendu logiciel de Mesa (llvmpipe, type CPU), que le jeu écarte aussi
+                    if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                        ecartees++;
+                        continue;
+                    }
+#endif
                     VkPhysicalDeviceMemoryProperties mp;
                     memoire(pds[i], &mp);
                     Carte c;
@@ -416,6 +429,9 @@ int carte_du_jeu(bool* nommee) {
 }
 
 bool dlss_possible() {
+#ifndef _WIN32
+    if (!_wgetenv(L"RECOMP_DLSS_LINUX")) return false;   // pas encore de DLSS sous Linux (dlss.cpp, carte_dlss)
+#endif
     const int i = carte_du_jeu();
     if (i < 0) return true;
     return g.cartes[i].fabricant == 0x10DE && minuscules(g.cartes[i].nom).find("rtx") != std::string::npos;
@@ -969,7 +985,7 @@ std::wstring commande_python(const std::wstring& script) {
 }
 
 void lancer_construction(bool forcer) {
-    if (g.cons.active) return;
+    if (g.cons.active || g_desinstallation) return;
     g.page = Page::Construction;
     auto echec = [](const std::wstring& m) {
         std::lock_guard<std::mutex> l(g.cons.lk);
@@ -1085,8 +1101,9 @@ void fond_relancer();
 void desinstaller() {
 #ifndef _WIN32
     // Linux (AppImage) : desinstaller_linux.py supprime tout pendant que le launcher tourne (un fichier ouvert peut
-    // être supprimé) ; le launcher attend sa fin, car ce Python est dans l'image montée, qui disparaît avec lui
-    if (!_wgetenv(L"APPIMAGE") || g.cons.active || g.jeu_lance) return;
+    // être supprimé) ; le launcher attend sa fin, car ce Python est dans l'image montée, qui disparaît avec lui. Attente
+    // dans un fil à part (WM_DESINSTALLE à la fin) : sur le fil de la fenêtre, elle la figeait jusqu'à 5 minutes.
+    if (!_wgetenv(L"APPIMAGE") || g.cons.active || g.jeu_lance || g_desinstallation) return;
     if (MessageBoxW(g.hwnd, T("desinst_question"), NOM, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     const bool sauv =
         MessageBoxW(g.hwnd, T("desinst_sauvegardes"), NOM, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
@@ -1099,16 +1116,11 @@ void desinstaller() {
          entre_guillemets(_wgetenv(L"APPIMAGE")) + (sauv ? L" --sauvegardes" : L"");
     jlog(L"uninstall requested (saves %ls)", sauv ? L"deleted too" : L"kept");
     video_arreter();
-    const std::string sortie = sortie_commande(c, 300000);
-    const std::string fini = apres_marque(sortie, "@fini ");
-    if (fini.empty()) {   // rien ou pas tout : le launcher reste ouvert, avec la raison
-        const std::string e = apres_marque(sortie, "@erreur ");
-        g.statut_jeu = std::wstring(T("desinst_echec")) + (e.empty() ? L"desinstaller_linux.py" : wide(e));
-        fond_relancer();
-        return;
-    }
-    g.quitter_sans_question = true;
-    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+    g_desinstallation = true;
+    g.statut_jeu = T("desinst_en_cours");
+    std::thread([c] {
+        PostMessageW(g.hwnd, WM_DESINSTALLE, 0, (LPARAM) new std::string(sortie_commande(c, 300000)));
+    }).detach();
     return;
 #endif
     if (!g.paquet || g.cons.active || g.jeu_lance) return;
@@ -1362,6 +1374,7 @@ void lancer_jeu();
 // JOUER : d'abord les shaders compilés pour ce GPU (au premier lancement, après une mise à jour ou un nouveau pilote ;
 // sinon fini en une fraction de seconde), puis le jeu
 void jouer() {
+    if (g_desinstallation) return;
     manettes_fermer();   // les manettes sont au jeu (onglet Manette ouvert : SDL arrêté dans le launcher)
     // Le jeu engage environ 12 Go de mémoire validable (RAM + fichier d'échange ; 12,06 Go mesurés après 3 min 30 de
     // partie le 2026-11-11). S'il en reste moins de 13, il s'arrêterait
@@ -1460,13 +1473,43 @@ std::wstring raccourci_chemin() {
     else bureau = plat_bureau();
     return bureau.empty() ? bureau : bureau + L"/" + NOM + L".desktop";
 }
+// Valeurs d'un fichier .desktop, selon la spécification Desktop Entry (comme AppRun et present.cpp). Deux niveaux :
+// la chaîne (\\ pour \), puis, dans les guillemets d'Exec, \" \` \$ \\ ; % s'écrit %%. Sans échappement, un chemin
+// contenant " $ ` \ ou % donnait un raccourci qui ne lançait rien.
+std::string desktop_chaine(const std::string& v) {   // niveau chaîne (Path=, Icon=)
+    std::string r;
+    for (char c : v) r += c == '\\' ? std::string("\\\\") : std::string(1, c);
+    return r;
+}
+std::string desktop_exec(const std::string& chemin) {   // Exec= : chemin entre guillemets
+    std::string r = "\"";
+    for (char c : chemin) {
+        if (c == '\\') r += "\\\\\\\\";
+        else if (c == '"' || c == '`' || c == '$') r += "\\\\", r += c;
+        else if (c == '%') r += "%%";
+        else r += c;
+    }
+    return r + "\"";
+}
+std::string desktop_exec_lu(const std::string& v) {   // inverse de desktop_exec (aussi les anciens raccourcis, non échappés)
+    std::string s;
+    for (size_t i = 0; i < v.size(); i++)
+        if (v[i] == '\\' && i + 1 < v.size() && strchr("\\sntr", v[i + 1])) {
+            const char n = v[++i];
+            s += n == 's' ? ' ' : n == 'n' ? '\n' : n == 't' ? '\t' : n == 'r' ? '\r' : '\\';
+        } else s += v[i];
+    if (s.empty() || s[0] != '"') return s.substr(0, s.find(' '));
+    std::string r;
+    for (size_t i = 1; i < s.size() && s[i] != '"'; i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) r += s[++i];
+        else if (s[i] == '%' && i + 1 < s.size() && s[i + 1] == '%') r += '%', i++;
+        else r += s[i];
+    }
+    return r;
+}
 std::wstring raccourci_cible(const std::wstring& lnk) {
     for (const std::string& l : lignes_fichier(lnk))
-        if (l.rfind("Exec=", 0) == 0) {
-            std::string c = l.substr(5);
-            if (c.size() >= 2 && c.front() == '"') c = c.substr(1, c.find('"', 1) - 1);
-            return wide(c);
-        }
+        if (l.rfind("Exec=", 0) == 0) return wide(desktop_exec_lu(l.substr(5)));
     return {};
 }
 bool raccourci_creer() {
@@ -1475,9 +1518,9 @@ bool raccourci_creer() {
     FILE* f = _wfopen(lnk.c_str(), L"wb");
     if (!f) return false;
     const std::wstring icone = g.dossier_exe + L"/lanceur.png";
-    fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\nExec=\"%s\"\nPath=%s\n%s%sCategories=Game;\nTerminal=false\n",
-            utf8(NOM).c_str(), utf8(exe).c_str(), utf8(parent(exe)).c_str(), existe(icone) ? "Icon=" : "",
-            existe(icone) ? (utf8(icone) + "\n").c_str() : "");
+    fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\nExec=%s\nPath=%s\n%s%sCategories=Game;\nTerminal=false\n",
+            utf8(NOM).c_str(), desktop_exec(utf8(exe)).c_str(), desktop_chaine(utf8(parent(exe))).c_str(),
+            existe(icone) ? "Icon=" : "", existe(icone) ? (desktop_chaine(utf8(icone)) + "\n").c_str() : "");
     fclose(f);
     chmod(plat_chemin(lnk).c_str(), 0755);   // (un bureau n'ouvre qu'un lanceur exécutable)
     return true;
@@ -1935,6 +1978,23 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         break;
+#ifndef _WIN32
+    case WM_DESINSTALLE: {   // fin de desinstaller_linux.py (desinstaller) : sortie complète
+        std::string* sortie = (std::string*)l;
+        g_desinstallation = false;
+        const std::string fini = apres_marque(*sortie, "@fini ");
+        if (fini.empty()) {   // rien ou pas tout : le launcher reste ouvert, avec la raison
+            const std::string e = apres_marque(*sortie, "@erreur ");
+            g.statut_jeu = std::wstring(T("desinst_echec")) + (e.empty() ? L"desinstaller_linux.py" : wide(e));
+            fond_relancer();
+        } else {
+            g.quitter_sans_question = true;
+            PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+        }
+        delete sortie;
+        return 0;
+    }
+#endif
     case WM_REFAIRE: {   // preparer.py --a-refaire : des étapes de la construction sont à refaire
         std::wstring* v = (std::wstring*)l;
         if (g.jeu_pret && !g.cons.active && !g.jeu_lance) {
@@ -1965,6 +2025,7 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        if (g_desinstallation) return 0;   // le Python de la désinstallation est dans l'image, démontée à la fermeture
         if (g.cons.active && !_wgetenv(L"LANCEUR_CAPTURE_QUITTER") && !g.quitter_sans_question) {
             const wchar_t* q = g.langue == Langue::Fr ? L"Une tâche est en cours (construction, shaders, mise à jour ou déplacement). L'arrêter et quitter ?"
                                                       : L"A task is running (build, shaders, update or move). Stop it and quit?";

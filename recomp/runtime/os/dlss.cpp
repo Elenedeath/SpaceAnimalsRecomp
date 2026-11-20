@@ -394,6 +394,15 @@ const char* nom_modele(char m) {
 // (extensions_peripherique, puis NGX).
 bool carte_dlss() {
     static const bool ok = [] {
+#ifndef _WIN32
+        // Linux : pas de DLSS pour l'instant. Le pilote NVIDIA répond 0xbad00012 quand NGX demande les extensions du
+        // DLSS, et l'énumération à part de carte_prevue, qui tournait pendant que SDL chargeait libvulkan sur le fil
+        // principal, faisait planter le jeu au démarrage (course dans libvulkan). RECOMP_DLSS_LINUX=1 : essais.
+        if (!getenv("RECOMP_DLSS_LINUX")) {
+            if (settings().dlss) HLOG("dlss", "DLSS is not available on Linux yet: DLSS off, the game keeps its anti-aliasing");
+            return false;
+        }
+#endif
         std::string nom;
         uint32_t fabricant = 0;
         if (!vkr::carte_prevue(&nom, &fabricant)) return true;

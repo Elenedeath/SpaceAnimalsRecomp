@@ -32,6 +32,11 @@ covers: the Linux driver re-reads the pages of a host memory import at every sub
 inaccessible range makes the submission fail (DEVICE LOST when going back to the menu). Those pages are only emptied
 (`MADV_DONTNEED`, they read back as zero). `RECOMP_UNMAP_PINNED_OLD=1`: old behaviour (the whole range inaccessible).
 
+Numbers always use a decimal point. On a system that is not in English (`fr_FR`…), SDL briefly switches the process
+locale to the system's under X11, and the render scale was then written as `1,0000` in the engine settings, which the
+engine cannot read: black 3D scene, HUD only. The game sets `LC_NUMERIC=C` at start (before SDL), and the render scale is
+written with integers. `RECOMP_NUMERIC_LOCALE=1`: old behaviour (the system's locale).
+
 ## Building the AppImage
 
 On Linux (or WSL), with clang/ld.lld, cmake, ninja, readelf and ffmpeg (background clips), after preparing the system
@@ -63,3 +68,13 @@ Launcher only: `python3 recomp/launcher/construire.py --sysroot <sysroot>` (writ
   `volumetric_fog = false`) raises it from 13-22 to 45-60 fps. The rest depends on the screen area covered by the
   characters (pixel shaders): 3D rendering at 75 % recommended.
 - Fonts: Barlow (OFL) replaces Bahnschrift, which Linux lacks.
+- DLSS: off on Linux for now. The NVIDIA driver answers `0xbad00012` when NGX asks for the DLSS extensions, and the
+  early GPU enumeration it needs raced with SDL inside libvulkan (crash at start). The Graphics page shows it as not
+  available. `RECOMP_DLSS_LINUX=1`: tests (wired as above).
+- Automatic GPU choice: Mesa's software renderer (llvmpipe) is set aside by the game and not listed by the launcher. It
+  reports system RAM as video memory and was picked over an integrated GPU on PCs without a discrete card (no picture).
+  The `gpu` setting can still name it.
+- Swapchain: `B8G8R8A8_SRGB` in the sRGB color space first, then `R8G8B8A8_SRGB`, then any format in sRGB. The format
+  list and the choice are written to the log (`swapchain formats`). `RECOMP_SWAPCHAIN_ANY_COLORSPACE=1`: old choice
+  (last `B8G8R8A8_SRGB` whatever its color space, else the first format). A too-bright picture (grey blacks) was
+  reported once; this is not confirmed as its cause.

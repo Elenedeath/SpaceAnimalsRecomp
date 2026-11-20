@@ -1540,6 +1540,7 @@ uint64_t mem_release(uint64_t, uint64_t, uint64_t* id) {
     *id = 0;
     return 0;
 }
+uint64_t mem_release_part(uint64_t, uint64_t, uint64_t*) { return 0; }
 bool mem_released_intact(uint64_t, uint64_t, uint64_t) { return false; }
 void mem_release_vivant(uint64_t, uint64_t, uint64_t, bool) {}
 void mem_restore(uint64_t, uint64_t) {}
@@ -1552,6 +1553,8 @@ void mem_census_init() {}
 void mem_vides_init() {}
 void mem_noyau_debut() {}
 void mem_noyau_fin() {}
+bool mem_noyau_essayer() { return true; }   // garde du noyau sans objet sous Linux (comme mem_noyau_debut)
+void mem_noyau_liberer() {}
 void mem_epingler(uint64_t addr, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_epingle_mx);
     g_epingles[{addr, addr + size}]++;

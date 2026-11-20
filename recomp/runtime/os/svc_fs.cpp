@@ -3,6 +3,7 @@
 //    sont lues en place dans le conteneur .nup d'origine (ouvert en lecture seule, jamais copié) ;
 //  * sauvegardes et carte SD : dossiers de l'hôte (à côté de l'exécutable).
 #include <atomic>
+#include <cmath>
 #include "svc_util.h"
 #include "settings.h"
 
@@ -46,8 +47,11 @@ std::vector<std::pair<std::string, std::string>> recomp_cvars() {
     std::vector<std::pair<std::string, std::string>> v;
     double echelle = dlss::echelle_dlss();
     if (echelle <= 0) echelle = std::clamp(settings().render_scale, 67, 100) / 100.0;
-    char e[16];
-    snprintf(e, sizeof e, "%.4f", echelle);
+    // écrit en entiers : "%.4f" suit la locale du processus, et donnait « 1,0000 » (illisible pour le moteur, scène 3D
+    // noire) quand SDL l'avait passée à celle d'un système non anglais (X11). Même texte qu'avant avec un point.
+    char e[24];
+    const long dix_milliemes = std::lround(echelle * 10000.0);
+    snprintf(e, sizeof e, "%ld.%04ld", dix_milliemes / 10000, dix_milliemes % 10000);
     v.push_back({"render.resolution_scale_console", e});
     v.push_back({"render.resolution_scale", e});
     v.push_back({"render.dynres_enabled", "false"});

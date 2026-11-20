@@ -15,7 +15,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <glob.h>
+#include <fnmatch.h>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/prctl.h>
@@ -301,15 +301,30 @@ int SHCreateDirectoryExW(HWND, const wchar_t* p, void*) {
         if (i == s.size() || s[i] == '/') mkdir(s.substr(0, i).c_str(), 0755);
     return 0;
 }
+// Joker dans le dernier élément seulement, comme Windows : `*` et `?`, rien d'autre. Le dossier est ouvert tel quel
+// (opendir) : avec glob() sur tout le chemin, un dossier dont le nom contient [ ] * ? (« Star Fox [EU] ») ne se
+// trouvait plus (copie du jeu introuvable, shaders jamais comptés). [ ] et \ du motif sont échappés pour fnmatch, où
+// ils ont un sens qu'ils n'ont pas sous Windows. Comme glob() avant : noms triés, `*` ne prend pas les noms cachés.
 HANDLE FindFirstFileW(const wchar_t* motif, WIN32_FIND_DATAW* d) {
-    glob_t g{};
-    if (glob(plat_chemin(motif).c_str(), 0, nullptr, &g) != 0 || !g.gl_pathc) {
-        globfree(&g);
-        return INVALID_HANDLE_VALUE;
+    const std::string m = plat_chemin(motif);
+    const size_t k = m.find_last_of('/');
+    const std::string dossier = k == std::string::npos ? std::string() : m.substr(0, k + 1);
+    std::string nom;
+    for (char c : k == std::string::npos ? m : m.substr(k + 1)) {
+        if (c == '[' || c == ']' || c == '\\') nom += '\\';
+        nom += c;
     }
+    DIR* dir = opendir(dossier.empty() ? "." : dossier.c_str());
+    if (!dir) return erreur(), INVALID_HANDLE_VALUE;
+    std::vector<std::string> noms;
+    while (dirent* e = readdir(dir))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") && !fnmatch(nom.c_str(), e->d_name, FNM_PERIOD))
+            noms.push_back(dossier + e->d_name);
+    closedir(dir);
+    if (noms.empty()) return INVALID_HANDLE_VALUE;
+    std::sort(noms.begin(), noms.end());
     auto* h = new PlatObjet(PlatObjet::RECHERCHE);
-    for (size_t i = 0; i < g.gl_pathc; i++) h->noms.push_back(g.gl_pathv[i]);
-    globfree(&g);
+    h->noms = std::move(noms);
     if (!FindNextFileW(h, d)) {
         delete h;
         return INVALID_HANDLE_VALUE;
@@ -647,13 +662,21 @@ BOOL TerminateJobObject(HANDLE job, UINT) {
     return TRUE;
 }
 
-// programme du bureau (xdg-open), détaché (l'AppImage ne touche plus LD_LIBRARY_PATH : rien à rétablir)
+// programme du bureau (xdg-open), détaché (l'AppImage ne touche plus LD_LIBRARY_PATH : rien à rétablir). Double fork :
+// l'enfant lance xdg-open dans un petit-enfant et sort aussitôt, ramassé ici ; le petit-enfant est repris par init (ou
+// le sous-moissonneur du bureau). Avant, chaque clic laissait un zombie, jamais ramassé, jusqu'à la fin du launcher.
 static void ouvrir(const std::string& cible) {
-    if (fork() == 0) {
+    const pid_t pid = fork();
+    if (pid == 0) {
         setsid();
-        execlp("xdg-open", "xdg-open", cible.c_str(), (char*)nullptr);
-        _exit(127);
+        if (fork() == 0) {
+            execlp("xdg-open", "xdg-open", cible.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        _exit(0);
     }
+    if (pid > 0)
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
 }
 HANDLE ShellExecuteW(HWND, const wchar_t*, const wchar_t* fichier, const wchar_t*, const wchar_t*, int) {
     ouvrir(plat_chemin(fichier));   // fichier ou dossier, avec le programme du bureau
@@ -819,6 +842,7 @@ BOOL SetWindowPos(HWND, HWND, int x, int y, int w, int h, UINT) {
 }
 BOOL IsIconic(HWND) { return g_win && (SDL_GetWindowFlags(g_win) & SDL_WINDOW_MINIMIZED); }
 BOOL IsWindowVisible(HWND) { return g_win && !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_HIDDEN); }
+HWND GetForegroundWindow() { return g_win && (SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS) ? (HWND)g_win : nullptr; }
 BOOL IsWindowEnabled(HWND) { return !g_question.load(); }
 BOOL GetClientRect(HWND, RECT* r) {
     int w = 0, h = 0;

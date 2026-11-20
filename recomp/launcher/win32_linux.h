@@ -293,6 +293,7 @@ BOOL SetForegroundWindow(HWND h);
 BOOL SetWindowPos(HWND h, HWND, int x, int y, int w, int hh, UINT drapeaux);
 BOOL IsIconic(HWND h);
 BOOL IsWindowVisible(HWND h);
+HWND GetForegroundWindow();   // la fenêtre du launcher quand elle a le clavier, sinon nullptr
 BOOL IsWindowEnabled(HWND h);   // faux pendant une question (MessageBoxW)
 BOOL GetClientRect(HWND h, RECT* r);
 BOOL ScreenToClient(HWND, POINT*);   // (WM_NCHITTEST reçoit déjà des coordonnées de la fenêtre)
