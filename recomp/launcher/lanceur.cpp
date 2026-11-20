@@ -1682,8 +1682,9 @@ void manette_naviguer() {
         g.sx = g.sy = -1;   // la souris ne reprend la sélection qu'en bougeant
     }
     if (appui(P_SUD) && selection && !(g.pad_nav && zone_presente(g.zone_survol))) {
-        // rien de sélectionné (la souris a bougé) : la zone sous la souris, sinon celle par défaut
-        g.zone_survol = g.zone_survol != Z_AUCUNE && zone_presente(g.zone_survol) ? g.zone_survol : zone_defaut();
+        // rien de sélectionné par la manette : JOUER (ou le bouton par défaut d'une question), jamais la zone sous un
+        // curseur de souris que le joueur ne regarde pas
+        g.zone_survol = zone_defaut();
         g.pad_nav = true;
         g.sx = g.sy = -1;
     }
@@ -1814,9 +1815,21 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return TRUE;
         }
         break;
-    case WM_MOUSEMOVE:
+    case WM_MOUSEMOVE: {
+        // Sélection menée par la manette : la souris ne la reprend qu'après un vrai déplacement, de LANCEUR_SOURIS_SEUIL
+        // DIP (8 par défaut ; 0 : au premier message, comme avant) depuis la première position vue. Des messages sans
+        // déplacement réel (fenêtre qui apparaît sous le curseur, curseur replacé par gamescope ou Steam Input sur le
+        // Steam Deck) effaçaient le cadre de la manette.
+        static const float seuil = _wgetenv(L"LANCEUR_SOURIS_SEUIL") ? (float)_wtof(_wgetenv(L"LANCEUR_SOURIS_SEUIL")) : 8.f;
+        static float ax = -1, ay = -1;   // première position vue depuis que la manette mène
+        const float x = dip(GET_X_LPARAM(l)), y = dip(GET_Y_LPARAM(l));
+        if (g.pad_nav && seuil > 0) {
+            if (ax < 0) ax = x, ay = y;
+            if (std::hypot(x - ax, y - ay) < seuil) return 0;
+        }
+        ax = ay = -1;
         g.pad_nav = false;   // la souris reprend la sélection (navigation à la manette)
-        g.sx = dip(GET_X_LPARAM(l)), g.sy = dip(GET_Y_LPARAM(l));
+        g.sx = x, g.sy = y;
         g.zone_survol = zone_sous(g.sx, g.sy);
         if (!suivi) {
             TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
@@ -1824,10 +1837,11 @@ LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             suivi = true;
         }
         return 0;
+    }
     case WM_MOUSELEAVE:
         suivi = false;
         g.sx = g.sy = -1;
-        g.zone_survol = Z_AUCUNE;
+        if (!g.pad_nav) g.zone_survol = Z_AUCUNE;   // la sélection de la manette reste
         return 0;
     case WM_LBUTTONDOWN:
         SetCapture(h);
