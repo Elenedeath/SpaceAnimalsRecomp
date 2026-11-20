@@ -2105,6 +2105,24 @@ uint64_t transit_reserve_n0() {
 // 3 Go — les mêmes seuils que le cache des images sans objet. Les parties de l'utilisateur tournent souvent au niveau
 // 1 (≈ 2 à 3 Go libres en jeu) : à ce niveau, la réserve et la file des rendus différés sont réduites, pas vidées.
 int g_memoire_niveau = 0;
+uint64_t arene_octets();
+// Hystérésis (2026-11-20, revue de la PR) : le niveau descend dès que la mémoire libre passe sous un seuil, mais ne
+// remonte qu'avec une marge au-dessus : 3,5 Go pour quitter le niveau 2 ; pour revenir au niveau 0, 5 Go plus la taille
+// de l'arène de transit plus 0,25 Go. Sans marge, près de 5 Go, l'arène se recréait (512 Mo pris), faisait repasser le
+// PC sous 5 Go, était détruite, et ainsi de suite toutes les ~10 s ; la réserve de tampons changeait de taille avec.
+// Avec la marge, l'arène recréée laisse encore au moins 5,25 Go libres. RECOMP_MEM_NO_HYSTERESIS=1 : sans marge.
+void memoire_niveau_suivre(double libre) {
+    static const bool sans_marge = getenv("RECOMP_MEM_NO_HYSTERESIS") != nullptr;
+    const int brut = libre < 3.0 ? 2 : libre < 5.0 ? 1 : 0;
+    if (sans_marge || brut >= g_memoire_niveau) {
+        g_memoire_niveau = brut;
+        return;
+    }
+    int n = g_memoire_niveau;
+    if (n == 2 && libre >= 3.5) n = 1;
+    if (n == 1 && libre >= 5.25 + arene_octets() / 1073741824.0) n = 0;
+    g_memoire_niveau = n;
+}
 uint64_t transit_reserve_max() { return g_memoire_niveau >= 2 ? 0 : g_memoire_niveau == 1 ? 64ull << 20 : transit_reserve_n0(); }
 uint64_t transit_classe_max() { return g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? TRANSIT_CLASSE_ABS : TRANSIT_CLASSE_MAX; }
 uint64_t transit_garde() { return g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? 36000 : 600; }
@@ -8779,7 +8797,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
             const bool video_pleine = vram_usage(&used, &budget) && used > budget / 100 * 85;
             niveau = libre < 3.0 ? 2 : libre < 5.0 || video_pleine ? 1 : 0;
             // rendus des textures en attente et réserve de tampons : réduits sous 5 Go, vidés sous 3 Go
-            g_memoire_niveau = libre < 3.0 ? 2 : libre < 5.0 ? 1 : 0;
+            memoire_niveau_suivre(libre);
             static int niveau_vu = 0;
             if (niveau != niveau_vu) {
                 HLOG("vk", "orphaned-image cache: %s (%.1f GB available commit, video memory %.0f / %.0f MB)",
