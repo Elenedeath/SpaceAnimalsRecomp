@@ -3256,6 +3256,15 @@ uint64_t edges_hash(uint64_t addr, uint64_t n, uint64_t d, uint64_t f) {
     return hash_mem((const uint8_t*)addr, d - addr) ^ (hash_mem((const uint8_t*)f, addr + n - f) * 0x9E3779B97F4A7C15ull);
 }
 
+// [d, f) touche un import (pool vivant ou en attente de retrait) : le GPU lit ces pages directement, on n'y touche pas
+bool plage_importee(uint64_t d, uint64_t f) {
+    for (auto& p : g.pools)
+        if (d < p.base + p.size && p.base < f) return true;
+    for (auto& dp : g.dead_pools)
+        if (d < dp.second.base + dp.second.size && dp.second.base < f) return true;
+    return false;
+}
+
 // Rend les pages entières de la source de l'image, qui vient d'être lue en entier (envoi, ou empreinte inchangée).
 // Pages entières [*d, *f) de la source de l'image, si elles peuvent être rendues (fichier ouvert, assez grosses, hors
 // des imports que le GPU lit directement)
@@ -3263,17 +3272,10 @@ bool tex_release_plage(Image& im, uint64_t* d_, uint64_t* f_) {
     if (!mem_release_actif() || !im.src_bytes || !im.addr || im.rel_n >= 3) return false;
     const uint64_t d = (im.addr + 0xfff) & ~0xfffull, f = (im.addr + im.src_bytes) & ~0xfffull;
     if (f < d + (64ull << 10)) return false;   // petite texture : rien à gagner
-    // pages verrouillées par un import (le GPU les lit directement) : on n'y touche pas
-    for (auto& p : g.pools)
-        if (d < p.base + p.size && p.base < f) {
-            g.tex_rel_import += f - d;
-            return false;
-        }
-    for (auto& dp : g.dead_pools)
-        if (d < dp.second.base + dp.second.size && dp.second.base < f) {
-            g.tex_rel_import += f - d;
-            return false;
-        }
+    if (plage_importee(d, f)) {
+        g.tex_rel_import += f - d;
+        return false;
+    }
     *d_ = d, *f_ = f;
     return true;
 }
@@ -3352,6 +3354,8 @@ void tex_release_later(Image& im) {
 // L'empreinte de chaque morceau est relevée au départ (le tout comparé à celle de l'envoi), puis recomparée juste
 // avant de rendre le morceau : une source réécrite entre-temps arrête le rendu, l'image n'est pas marquée comme rendue
 // (les morceaux déjà rendus restent lisibles, relus à l'accès). L'image n'est marquée rendue qu'au dernier morceau.
+// Les imports sont aussi revérifiés avant chaque morceau, comme avant chaque mem_release : un import créé pendant que
+// les morceaux s'étalent sur les fins d'image a ses pages épinglées, qui ne doivent pas être désengagées.
 // RECOMP_TEX_RELEASE_WHOLE=1 : ancien comportement, la source d'un bloc.
 constexpr uint64_t REL_MORCEAU = 4ull << 20;
 // hash_mem d'un morceau reste sur un seul fil (moins de 8 morceaux de 1 Mo) : pas d'appel imbriqué de ouvriers()
@@ -3382,6 +3386,10 @@ bool rendu_partiel_pas() {
     const uint64_t k = (r.pos - r.d) / REL_MORCEAU;
     const uint64_t n = std::min(REL_MORCEAU, r.f - r.pos);
     bool ok = im && im->addr == r.addr && im->initialized && plage_engagee(r.pos, n);
+    if (ok && plage_importee(r.pos, r.f)) {   // import créé depuis le départ : le reste n'est pas rendu
+        g.tex_rel_import += r.f - r.pos;
+        ok = false;
+    }
     if (ok) {
         ok = hash_mem((const uint8_t*)r.pos, n) == r.h[k];
         if (!ok) g_rendus_changes++;
