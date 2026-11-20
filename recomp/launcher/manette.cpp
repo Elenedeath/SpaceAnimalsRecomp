@@ -5,6 +5,8 @@
 // (runtime/os/input.cpp : mêmes indices, EntreePad = Settings::P_*).
 #include "lanceur.h"
 
+#include <cstdlib>
+#include <fstream>
 #include <type_traits>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -48,6 +50,52 @@ bool g_init = false;    // SDL_Init fait (onglet ouvert)
 bool g_refus = false;   // SDL_Init a échoué : pas de nouvel essai avant la fermeture de l'onglet
 std::vector<Pad> g_pads;
 unsigned g_tour = 0;
+bool g_branchee = false;        // une manette est branchée (manette_branchee, une fois par seconde)
+ULONGLONG g_prochaine_vue = 0;  // prochaine détection
+
+// Une manette est-elle branchée ? Détection légère, sans SDL (revue de la PR #57 : SDL ne doit pas être chargé chez
+// un joueur sans manette, ni pendant une construction si aucune n'est branchée). Windows : périphériques d'entrée
+// (Raw Input) de type joystick ou manette (page HID 1, usage 4 ou 5), ce que sont les manettes Xbox (XInput), PlayStation
+// et Nintendo. Linux : /proc/bus/input/devices, un périphérique qui a les boutons d'une manette (BTN_GAMEPAD, 0x130)
+// ou d'un joystick (BTN_JOYSTICK, 0x120), la règle de udev (ID_INPUT_JOYSTICK).
+bool manette_branchee() {
+#ifdef _WIN32
+    UINT n = 0;
+    if (GetRawInputDeviceList(nullptr, &n, sizeof(RAWINPUTDEVICELIST)) != 0 || n == 0) return false;
+    std::vector<RAWINPUTDEVICELIST> liste(n);
+    const UINT lu = GetRawInputDeviceList(liste.data(), &n, sizeof(RAWINPUTDEVICELIST));
+    if (lu == (UINT)-1) return false;
+    for (UINT i = 0; i < lu; i++) {
+        if (liste[i].dwType != RIM_TYPEHID) continue;
+        RID_DEVICE_INFO info{};
+        info.cbSize = sizeof info;
+        UINT t = sizeof info;
+        if (GetRawInputDeviceInfoW(liste[i].hDevice, RIDI_DEVICEINFO, &info, &t) == (UINT)-1) continue;
+        if (info.hid.usUsagePage == 1 && (info.hid.usUsage == 4 || info.hid.usUsage == 5)) return true;
+    }
+    return false;
+#else
+    std::ifstream f("/proc/bus/input/devices");
+    std::string l;
+    while (std::getline(f, l)) {
+        if (l.rfind("B: KEY=", 0) != 0) continue;
+        // mots hexadécimaux de 64 bits, le plus fort d'abord : le bit k est dans le mot (nombre - 1 - k / 64)
+        std::vector<unsigned long long> mots;
+        const char* p = l.c_str() + 7;
+        char* fin = nullptr;
+        for (unsigned long long v = strtoull(p, &fin, 16); fin != p; v = strtoull(p, &fin, 16)) {
+            mots.push_back(v);
+            p = fin;
+        }
+        auto bit = [&](unsigned k) {
+            const size_t m = k / 64;
+            return m < mots.size() && (mots[mots.size() - 1 - m] >> (k % 64) & 1);
+        };
+        if (bit(0x130) || bit(0x120)) return true;
+    }
+    return false;
+#endif
+}
 
 // SDL3.dll : à côté du jeu, puis dans les outils du paquet (<racine>\outils\sdl3), puis dans ceux des sources
 // (recomp\outils\sdl3), comme le jeu (input.cpp, chercher_sdl)
@@ -173,6 +221,21 @@ void suivre() {
 const EtatManettes& manettes() { return g_etat; }
 
 void manettes_lire() {
+    // SDL seulement quand une manette est branchée (ou sur l'onglet Manette, qui dit s'il en voit une) ; arrêté quand
+    // la dernière est débranchée. LANCEUR_MANETTES_TOUJOURS=1 : lues dès l'ouverture, comme avant.
+    static const bool toujours = getenv("LANCEUR_MANETTES_TOUJOURS") && *getenv("LANCEUR_MANETTES_TOUJOURS") == '1';
+    const ULONGLONG t = GetTickCount64();
+    if (!toujours && t >= g_prochaine_vue) {
+        g_prochaine_vue = t + 1000;
+        const bool b = manette_branchee();
+        if (b != g_branchee) jlog(b ? L"controllers: one plugged in" : L"controllers: none plugged in");
+        g_branchee = b;
+    }
+    if (!toujours && !g_branchee && !(g.page == Page::Controles && g.onglet_manette)) {
+        if (g_init) manettes_fermer();
+        g_etat = EtatManettes{};
+        return;
+    }
     if (!g_init) {
         if (g_refus || !charger()) {
             g_etat = EtatManettes{};

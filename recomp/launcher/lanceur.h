@@ -268,7 +268,7 @@ std::wstring nom_carte(const std::string& nom);   // nom affiché : sans (TM) ni
 int raccourci_etat();
 
 // manette.cpp
-void manettes_lire();                 // une fois par image hors partie : charge SDL3 la première fois
+void manettes_lire();                 // une fois par image hors partie : SDL3 seulement quand une manette est branchée
 void manettes_fermer();               // rend les manettes et SDL (onglet quitté, jeu lancé)
 const EtatManettes& manettes();       // dernier état lu
 std::wstring nom_entree(int entree, int famille);   // « B / ○ » (famille 0), « ○ » (PlayStation)…
