@@ -251,6 +251,11 @@ int zone_premiere();                // première zone de la dernière image (Z_A
 // zone la plus proche de `depuis` dans la direction (dx, dy) (une seule composante non nulle), d'après la dernière
 // image ; Z_AUCUNE s'il n'y en a pas
 int zone_voisine(int depuis, int dx, int dy);
+// sélecteur ‹ › de la dernière image qui contient la zone z : ses zones ‹ et ›, et *ligne si z est sa ligne entière
+// (onglet Manette) ; faux si z n'est pas dans un sélecteur
+bool selecteur_de(int z, int* zg, int* zd, bool* ligne);
+// onglet voisin de l'onglet ouvert dans la dernière image (sens −1 ou 1, en boucle) ; Z_AUCUNE : pas d'onglets
+int onglet_voisin(int sens);
 
 // lanceur.cpp
 std::string utf8(const std::wstring& w);
