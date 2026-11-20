@@ -845,7 +845,11 @@ void page_graphismes() {
         }
     }
     if (!possible) {
+#ifdef _WIN32
         libelle(y, "reg_dlss", "reg_dlss_rtx");
+#else
+        libelle(y, "reg_dlss", _wgetenv(L"RECOMP_DLSS_LINUX") ? "reg_dlss_rtx" : "reg_dlss_linux");
+#endif
         selecteur(y, T("dlss_indispo"), Z_DLSS_G, Z_DLSS_D, false);
     } else if (mode && !dll) {
         libelle(y, "reg_dlss", "reg_dlss_manque");

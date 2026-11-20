@@ -429,6 +429,9 @@ int carte_du_jeu(bool* nommee) {
 }
 
 bool dlss_possible() {
+#ifndef _WIN32
+    if (!_wgetenv(L"RECOMP_DLSS_LINUX")) return false;   // pas encore de DLSS sous Linux (dlss.cpp, carte_dlss)
+#endif
     const int i = carte_du_jeu();
     if (i < 0) return true;
     return g.cartes[i].fabricant == 0x10DE && minuscules(g.cartes[i].nom).find("rtx") != std::string::npos;
