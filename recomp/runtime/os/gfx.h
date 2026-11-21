@@ -9,7 +9,15 @@ namespace hos {
 void gfx_open_window(int width, int height);           // crée la fenêtre hôte (une fois)
 void gfx_present(const float rgba[4], uint64_t frame);  // présente une image (cadencée à 60 Hz)
 bool gfx_window_focused();                              // la fenêtre hôte a le focus clavier
-void* gfx_window_handle();                             // HWND (moteur Vulkan)
+void* gfx_window_handle();                             // HWND (moteur Vulkan) ; Linux : SDL_Window*
+#ifndef _WIN32
+// Linux (present.cpp, SDL3) : boucle d'événements du fil principal tant que fini(arg) est faux (run_main_thread) ;
+// extensions d'instance Vulkan et surface de la fenêtre ; taille de la fenêtre en pixels
+void gfx_boucle_principale(bool (*fini)(void*), void* arg);
+bool gfx_vk_extensions(std::vector<const char*>& ext);
+bool gfx_vk_surface(void* instance, void* gipa, uint64_t* surface);
+void gfx_window_pixels(int* w, int* h);
+#endif
 void gfx_status(const char* text);                     // état affiché dans le titre de la fenêtre (avant la 1re image)
 void gfx_count_frame(uint64_t frame);
 // écran virtuel (hle_gfx.cpp) : période de vblank en ticks du compteur invité (31,25 MHz), image affichée à un vblank
@@ -28,5 +36,14 @@ HostPad host_poll_input();
 // Vibration envoyée par le jeu (svc_hid.cpp, nn::hid::SendVibrationValue) pour un côté de la manette (0 gauche,
 // 1 droite) : amplitudes 0..1 et fréquences (Hz) des bandes basse et haute ; appliquée par input.cpp à 60 Hz.
 void host_set_vibration(int side, float amp_low, float freq_low, float amp_high, float freq_high);
+// Souris du jeu (hle_kbm.cpp, réglage mouse_keyboard) : Raw Input enregistré à la création de la fenêtre ; messages de la
+// fenêtre qui la concernent (vrai : traité, *res est la réponse) ; boutons de la souris appuyés pendant la capture
+// (bits Settings::M_GAUCHE…, 0 hors capture), que input.cpp change en boutons de la manette.
+void kbm_window_created(void* hwnd);
+bool kbm_wndproc(void* hwnd, unsigned msg, uintptr_t wp, intptr_t lp, intptr_t* res);
+uint32_t kbm_mouse_buttons();
+void kbm_release();   // (aussi dans hos.h) curseur de Windows rendu s'il est retenu, avant de terminer le processus
+// Ctrl, Maj, Alt tenus (Settings::MODIF_*, input.cpp) ; AltGr ne compte ni comme Ctrl ni comme Alt
+unsigned host_modifiers_held();
 
 }  // namespace hos

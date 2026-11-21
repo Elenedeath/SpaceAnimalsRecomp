@@ -14,6 +14,9 @@
 #include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <xmmintrin.h>
+#ifdef __SSE4_2__
+#include <nmmintrin.h>   // crc32 (crc32_update)
+#endif
 #endif
 
 namespace {
@@ -175,7 +178,13 @@ void rt_tailcall(CPUState* ctx, uint64_t target) {
     RecompFn fn = rt_lookup(target);
     if (!fn) fatal(4, target, "saut indirect vers 0x%llx inconnu (lr=0x%llx)",
                    (unsigned long long)target, (unsigned long long)ctx->x[30]);
+#if defined(__clang__)
+    // runtime compilé par clang (Linux) : le code généré, compilé par clang lui aussi, passe par rt_tailjump
+    // (clang_compat.h) et n'appelle jamais rt_tailcall ; clang refuse l'appel terminal garanti de signature différente
+    return fn(ctx);
+#else
     MUSTTAIL return fn(ctx);
+#endif
 }
 
 // Saut indirect du code généré compilé par clang (clang_compat.h) : la cible est dans ctx->pad. Même corps que
@@ -263,17 +272,28 @@ uint64_t rt_cntfrq() {
 // appears dead: last reported in 74282 ms ago », puis Abort ; issue n° 13 : RX 6800 XT, les shaders préparés au
 // démarrage par le pilote AMD ont pris plus longtemps que ce délai, écran noir puis arrêt). Sur la console, rien ne
 // bloque aussi longtemps. Entre rt_stall_begin et rt_stall_end (création de pipelines par le pilote, vk_render.cpp),
-// le compteur avance normalement pendant STALL_GRACE (5 s : une saccade ordinaire ne change donc rien), puis s'arrête ;
-// à la fin du blocage il reprend d'où il s'était arrêté. Pour le jeu, un blocage dure donc 5 s au plus.
+// le compteur avance normalement tant qu'il reste du crédit (STALL_GRACE, 5 s : une saccade ordinaire ne change donc
+// rien), puis s'arrête ; à la fin du blocage il reprend d'où il s'était arrêté.
+// Le crédit est CUMULÉ depuis le 2026-11-14 (issue n° 26 : RX 580, pilote sans bibliothèques de pipelines). Jusque-là
+// chaque blocage avait ses 5 s : des dizaines de pipelines compilés en entier au premier dessin, 1 à 4 s chacun, au
+// lancement de la cinématique de fin de Corneria, ne mettaient jamais le compteur en pause, et le chien de garde
+// arrêtait le jeu (« last reported in 71899 ms ago »). Maintenant un blocage consomme le crédit, qui se recharge
+// d'1 s par STALL_RECHARGE s passées hors blocage (5 s par minute) : pour le jeu, les blocages durent 5 s au plus par
+// minute, quel que soit leur nombre.
 // Lecture sans verrou (compteur de séquence) : rt_cntvct est appelé très souvent.
 // RECOMP_NO_CLOCK_PAUSE=1 : pas de pause (pour reproduire l'arrêt par le chien de garde).
+// RECOMP_STALL_PER_CALL=1 : ancien calcul, 5 s de grâce par blocage (pour reproduire l'arrêt de l'issue n° 26).
 namespace {
 constexpr int64_t STALL_GRACE = 5000000000ll;
+constexpr int64_t STALL_RECHARGE = 12;    // 1 ns de crédit rendue par 12 ns hors blocage
 std::mutex g_stall_mx;
 int g_stall_niveau = 0;
 std::atomic<uint32_t> g_stall_seq{0};
 std::atomic<int64_t> g_stall_debut{0};    // ns du début du blocage en cours ; 0 : aucun
+std::atomic<int64_t> g_stall_grace{STALL_GRACE};   // crédit du blocage en cours (lu par rt_cntvct)
 std::atomic<int64_t> g_stall_retire{0};   // ns retirées au compteur par les blocages finis
+int64_t g_stall_credit = STALL_GRACE;     // crédit restant (sous g_stall_mx)
+int64_t g_stall_fin = 0;                  // fin du dernier blocage, pour la recharge (sous g_stall_mx)
 int64_t host_ns() {
     using namespace std::chrono;
     static const auto t0 = steady_clock::now();
@@ -283,51 +303,114 @@ bool stall_actif() {
     static const bool non = getenv("RECOMP_NO_CLOCK_PAUSE") != nullptr;
     return !non;
 }
+bool stall_par_appel() {
+    static const bool oui = getenv("RECOMP_STALL_PER_CALL") != nullptr;
+    return oui;
+}
 }  // namespace
 void rt_stall_begin() {
     if (!stall_actif()) return;
     std::lock_guard<std::mutex> lk(g_stall_mx);
     if (g_stall_niveau++) return;
+    const int64_t t = std::max<int64_t>(1, host_ns());
+    if (stall_par_appel()) g_stall_credit = STALL_GRACE;
+    else g_stall_credit = std::min<int64_t>(STALL_GRACE, g_stall_credit + (t - g_stall_fin) / STALL_RECHARGE);
     g_stall_seq.fetch_add(1, std::memory_order_acq_rel);
-    g_stall_debut.store(std::max<int64_t>(1, host_ns()), std::memory_order_relaxed);
+    g_stall_debut.store(t, std::memory_order_relaxed);
+    g_stall_grace.store(g_stall_credit, std::memory_order_relaxed);
     g_stall_seq.fetch_add(1, std::memory_order_acq_rel);
 }
 void rt_stall_end() {
     if (!stall_actif()) return;
     std::lock_guard<std::mutex> lk(g_stall_mx);
     if (--g_stall_niveau) return;
-    const int64_t duree = host_ns() - g_stall_debut.load(std::memory_order_relaxed);
+    const int64_t t = host_ns();
+    const int64_t duree = t - g_stall_debut.load(std::memory_order_relaxed);
+    const int64_t visible = std::min(duree, g_stall_credit);   // ce que le jeu a vu passer
     g_stall_seq.fetch_add(1, std::memory_order_acq_rel);
-    if (duree > STALL_GRACE) g_stall_retire.fetch_add(duree - STALL_GRACE, std::memory_order_relaxed);
+    if (duree > visible) g_stall_retire.fetch_add(duree - visible, std::memory_order_relaxed);
     g_stall_debut.store(0, std::memory_order_relaxed);
     g_stall_seq.fetch_add(1, std::memory_order_acq_rel);
+    g_stall_credit -= visible;
+    g_stall_fin = t;
 }
+// ms de blocage cachées au jeu depuis le démarrage (journal du rendu)
+uint64_t rt_stall_cache_ms() { return (uint64_t)(g_stall_retire.load(std::memory_order_relaxed) / 1000000); }
 
 uint64_t rt_cntvct() {
 #ifdef RECOMP_BENCH
     return 0x123456789ull;
 #else
-    int64_t ns, debut, retire;
+    int64_t ns, debut, grace, retire;
     for (;;) {
         const uint32_t c = g_stall_seq.load(std::memory_order_acquire);
         debut = g_stall_debut.load(std::memory_order_relaxed);
+        grace = g_stall_grace.load(std::memory_order_relaxed);
         retire = g_stall_retire.load(std::memory_order_relaxed);
         ns = host_ns();
         if (!(c & 1) && g_stall_seq.load(std::memory_order_acquire) == c) break;
     }
-    if (debut && ns > debut + STALL_GRACE) ns = debut + STALL_GRACE;   // blocage en cours : compteur arrêté
+    if (debut && ns > debut + grace) ns = debut + grace;   // blocage en cours, crédit épuisé : compteur arrêté
     ns -= retire;
     return (uint64_t)((unsigned __int128)ns * rt_cntfrq() / 1000000000ull);
 #endif
 }
 
-uint32_t crc32_update(uint32_t crc, uint64_t data, int bytes, bool castagnoli) {
-    const uint32_t poly = castagnoli ? 0x82F63B78u : 0xEDB88320u;
-    for (int i = 0; i < bytes; i++) {
-        crc ^= (uint8_t)(data >> (8 * i));
-        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (poly & (0u - (crc & 1)));
+// CRC32 / CRC32C d'AArch64 (polynôme réfléchi, sans inversion avant ni après). Le profil d'une cinématique
+// chargée (2026-11-17) y mettait ≈ 4,6 % du temps des threads de travail du jeu avec le calcul bit à bit
+// (64 tours pour 8 octets). CRC32C : instruction crc32 de SSE4.2 (même définition que celle d'AArch64 ; déjà
+// permise par -march=x86-64-v3). CRC32 : tables « slicing-by-8 » calculées à la compilation, en C pur.
+// Résultat identique au bit près à l'ancien calcul (vérifié sur des millions de valeurs, chaque taille).
+namespace {
+struct CrcTables {
+    uint32_t t[8][256];
+};
+constexpr CrcTables crc_tables(uint32_t poly) {
+    CrcTables r{};
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (poly & (0u - (c & 1)));
+        r.t[0][i] = c;
     }
+    for (int s = 1; s < 8; s++)
+        for (uint32_t i = 0; i < 256; i++) r.t[s][i] = (r.t[s - 1][i] >> 8) ^ r.t[0][r.t[s - 1][i] & 0xff];
+    return r;
+}
+constexpr CrcTables kCrc32 = crc_tables(0xEDB88320u);
+#ifndef __SSE4_2__
+constexpr CrcTables kCrc32c = crc_tables(0x82F63B78u);
+#endif
+
+inline uint32_t crc_tab(const CrcTables& T, uint32_t crc, uint64_t data, int bytes) {
+    if (bytes == 8) {
+        const uint32_t lo = crc ^ (uint32_t)data, hi = (uint32_t)(data >> 32);
+        return T.t[7][lo & 0xff] ^ T.t[6][(lo >> 8) & 0xff] ^ T.t[5][(lo >> 16) & 0xff] ^ T.t[4][lo >> 24] ^
+               T.t[3][hi & 0xff] ^ T.t[2][(hi >> 8) & 0xff] ^ T.t[1][(hi >> 16) & 0xff] ^ T.t[0][hi >> 24];
+    }
+    if (bytes == 4) {
+        const uint32_t v = crc ^ (uint32_t)data;
+        return T.t[3][v & 0xff] ^ T.t[2][(v >> 8) & 0xff] ^ T.t[1][(v >> 16) & 0xff] ^ T.t[0][v >> 24];
+    }
+    for (int i = 0; i < bytes; i++) crc = T.t[0][(crc ^ (uint8_t)(data >> (8 * i))) & 0xff] ^ (crc >> 8);
     return crc;
+}
+}  // namespace
+
+uint32_t crc32_update(uint32_t crc, uint64_t data, int bytes, bool castagnoli) {
+    if (!castagnoli) return crc_tab(kCrc32, crc, data, bytes);
+#ifdef __SSE4_2__
+    switch (bytes) {
+    case 1: return _mm_crc32_u8(crc, (uint8_t)data);
+    case 2: return _mm_crc32_u16(crc, (uint16_t)data);
+    case 4: return _mm_crc32_u32(crc, (uint32_t)data);
+    case 8: return (uint32_t)_mm_crc32_u64(crc, data);
+    default:
+        for (int i = 0; i < bytes; i++) crc = _mm_crc32_u8(crc, (uint8_t)(data >> (8 * i)));
+        return crc;
+    }
+#else
+    return crc_tab(kCrc32c, crc, data, bytes);
+#endif
 }
 
 // ------------------------------------------------------------------------------------------

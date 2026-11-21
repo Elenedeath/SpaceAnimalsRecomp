@@ -1,6 +1,7 @@
 // Launcher du portage natif : état partagé entre la fenêtre (lanceur.cpp), le dessin (dessin.cpp), la vidéo
 // de fond (video.cpp) et les textes (textes.cpp).
 #pragma once
+#ifdef _WIN32
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -16,6 +17,15 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#define JEU_EXE L"\\recomp_main.exe"          // exécutable du jeu, dans recomp\build\full
+#define MOTIF_EXTRAITS L"\\extrait_*.mp4"     // extraits du fond (video.cpp)
+#else
+// Linux : même launcher, l'API Win32 dont il se sert est réalisée sur POSIX et SDL3 (win32_linux.cpp), Direct2D sur
+// cairo (d2d_cairo.h). Les extraits du fond sont en MPEG-1 (lus par pl_mpeg, convertis à la construction du paquet).
+#include "win32_linux.h"
+#define JEU_EXE L"/recomp_main"
+#define MOTIF_EXTRAITS L"/extrait_*.mpg"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -25,12 +35,31 @@
 
 namespace lz {
 
+// Chemins : le code commun les écrit avec « / » (ch(L"/build/full")) ; ch() rend le séparateur de la plateforme,
+// « \ » sous Windows. Aucun chemin Windows sous Linux, aucun chemin Linux sous Windows (journaux, commandes, textes).
+#ifdef _WIN32
+#define SEP L"\\"
+#define SEP_C L'\\'
+#define SEPARATEURS L"\\/"
+#else
+#define SEP L"/"
+#define SEP_C L'/'
+#define SEPARATEURS L"/"
+#endif
+inline std::wstring ch(std::wstring s) {
+#ifdef _WIN32
+    for (wchar_t& c : s)
+        if (c == L'/') c = L'\\';
+#endif
+    return s;
+}
+
 constexpr float LARGEUR = 1000.f, HAUTEUR = 600.f;   // taille logique de la fenêtre (DIP)
 // Agrandissement de la fenêtre (demande de l'utilisateur, 2026-11-11) : 1200 × 720 sur un écran à 100 %. Le dessin et
 // les clics restent dans le repère logique de 1000 × 600 : c'est l'échelle d'affichage (g.dpi) qui est multipliée
 // (lanceur.cpp, dpi_fenetre). Réduit de lui-même sur un écran trop petit.
 constexpr float ECHELLE = 1.2f;
-constexpr const wchar_t* VERSION = L"1.1.0";            // si recomp/VERSION est absent
+constexpr const wchar_t* VERSION = L"1.2.0";            // si recomp/VERSION est absent
 constexpr const wchar_t* NOM = L"StarFox Remake [recompiled]";
 constexpr const wchar_t* DEPOT = L"SerenityG4K/SpaceAnimalsRecomp";   // releases GitHub (mises à jour)
 
@@ -40,9 +69,13 @@ enum class Langue { Fr, En };
 // zones cliquables, déclarées par le dessin à chaque image
 // Touches du clavier : une par action de la manette (page Contrôles). Même ordre que Settings::keys du jeu
 // (runtime/os/settings.h) et que TOUCHES_CLES (lanceur.cpp).
-constexpr int NB_TOUCHES = 24;
+// Puis SL et SR de chaque Joy-Con. Une touche peut demander Ctrl, Maj, Alt (MODIF_*, bits 16 à 18 ; « shift+0x11 » dans
+// recomp.ini) : W et Maj+W font alors deux actions.
+constexpr int NB_TOUCHES = 28;
 enum Touche { K_A, K_B, K_X, K_Y, K_L, K_R, K_ZL, K_ZR, K_PLUS, K_MINUS, K_LSTICK, K_RSTICK, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-              K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT, K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT };
+              K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT, K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT, K_LSL, K_LSR, K_RSL,
+              K_RSR };
+constexpr unsigned MODIF_CTRL = 1u << 16, MODIF_SHIFT = 1u << 17, MODIF_ALT = 1u << 18, MODIF_MASK = MODIF_CTRL | MODIF_SHIFT | MODIF_ALT;
 // Manette (page Contrôles, onglet Manette) : les 16 boutons de la Switch (ordre K_A … K_RIGHT), chacun donné à une entrée
 // de la manette, repérée par sa position comme SDL le fait (P_SUD : bouton du bas, A d'une manette Xbox, ✕ d'une
 // PlayStation, B d'une Nintendo). Mêmes valeurs que Settings::P_* du jeu (runtime/os/settings.h) ; noms dans recomp.ini :
@@ -51,6 +84,11 @@ constexpr int NB_PAD = 16;
 enum EntreePad { P_AUCUNE, P_SUD, P_EST, P_OUEST, P_NORD, P_BACK, P_GUIDE, P_START, P_STICK_G, P_STICK_D, P_EPAULE_G,
                  P_EPAULE_D, P_HAUT, P_BAS, P_GAUCHE, P_DROITE, P_MISC1, P_PALETTE_D1, P_PALETTE_G1, P_PALETTE_D2,
                  P_PALETTE_G2, P_PAVE, P_GACHETTE_G, P_GACHETTE_D, P_NB };
+// Souris (page Contrôles, onglet Souris) : boutons de la souris (gauche, droit, milieu, arrière, avant) et molette (vers
+// le haut, vers le bas), chacun donné à une action de la manette (ordre K_A … K_RSR : boutons, directions des sticks,
+// SL, SR ; -1 : aucune). Clés mouse_left … de recomp.ini (SOURIS_CLES, lanceur.cpp), mêmes que Settings::mouse_buttons
+// du jeu (runtime/os/settings.h).
+constexpr int NB_BOUTONS_SOURIS = 7;
 
 enum Zone : int {
     Z_AUCUNE = 0, Z_PRINCIPAL, Z_MENU_REGLAGES, Z_MENU_CONTROLES, Z_MENU_CONSTRUCTION, Z_MENU_QUITTER, Z_COPIE,
@@ -63,13 +101,17 @@ enum Zone : int {
     Z_DLSS_G, Z_DLSS_D, Z_DLSSM_G, Z_DLSSM_D,                 // page Graphismes : mode et modèle du DLSS
     Z_FSR_G, Z_FSR_D, Z_FSRV_G, Z_FSRV_D,                     // page Graphismes : mode et version du FSR d'AMD
     Z_GPU_G, Z_GPU_D,                                         // page Graphismes : carte graphique
+    Z_BROUIL_G, Z_BROUIL_D,                                   // page Graphismes (Linux) : brouillard volumétrique
     Z_DEPLACER, Z_RACCOURCI,                                  // page Réglages : emplacement du jeu, raccourci
+    Z_Q_OUI, Z_Q_NON,                                         // question à l'écran : OUI (ou OK), NON
     Z_ONGLET_CLAVIER, Z_ONGLET_MANETTE, Z_PAD_DEFAUT,         // page Contrôles : onglets, manette par défaut
     Z_PAD0, Z_PAD_FIN = Z_PAD0 + NB_PAD - 1,                  // bouton de la Switch (liste) : attend l'entrée voulue
     Z_PADG0, Z_PADG_FIN = Z_PADG0 + NB_PAD - 1,               // ‹ : entrée précédente
     Z_PADD0, Z_PADD_FIN = Z_PADD0 + NB_PAD - 1,               // › : entrée suivante
     Z_ENTREE0, Z_ENTREE_FIN = Z_ENTREE0 + P_NB - 1,           // entrée de la manette sur le dessin (clic)
     Z_TOUCHE0, Z_TOUCHE_FIN = Z_TOUCHE0 + NB_TOUCHES - 1,     // page Contrôles : une case par touche
+    Z_ONGLET_SOURIS, Z_SOURIS_G, Z_SOURIS_D, Z_SOURIS_VIT_G, Z_SOURIS_VIT_D,   // onglet Souris : mode souris, vitesse
+    Z_SOURIS_B0, Z_SOURIS_B_FIN = Z_SOURIS_B0 + 2 * NB_BOUTONS_SOURIS - 1,  // ‹ › du bouton de chaque bouton de la souris
 };
 
 // tâche en cours, lancée par le launcher (même protocole de lignes « @… »)
@@ -102,14 +144,23 @@ struct ReglagesJeu {   // recomp.ini du jeu
     bool sans_bordure = true;   // plein écran sans bordure, sinon fenêtré
     std::string langue = "auto";   // langue du jeu (code de la console), auto = celle de Windows
     int vibration = 100;        // vibrations de la manette, en % (0 : aucune)
+    // brouillard volumétrique du moteur (volumetric_fog, page Graphismes sous Linux) : coupé, la cinématique du prologue
+    // passe de 13-22 à 55-60 img/s sur le Steam Deck
+    bool brouillard = true;
     // touches du clavier par action (scancodes, 0xE0xx : touche étendue ; 0 : aucune) ; par défaut les positions du jeu
     unsigned touches[NB_TOUCHES] = {0x2E, 0x2D, 0x2F, 0x2C, 0x10, 0x12, 0x13, 0x14, 0x32, 0x31, 0x21, 0x23,
-                                    0xE048, 0xE050, 0xE04B, 0xE04D, 0x11, 0x1F, 0x1E, 0x20, 0x17, 0x25, 0x24, 0x26};
+                                    0xE048, 0xE050, 0xE04B, 0xE04D, 0x11, 0x1F, 0x1E, 0x20, 0x17, 0x25, 0x24, 0x26,
+                                    0, 0, 0, 0};
     bool touches_ecrites = false;   // recomp.ini contient des clés key_… (ou le joueur vient de changer une touche)
     // entrée de la manette de chaque bouton de la Switch (pad_…) ; par défaut, la disposition par position du jeu
     uint8_t manette[NB_PAD] = {P_EST, P_SUD, P_NORD, P_OUEST, P_EPAULE_G, P_EPAULE_D, P_GACHETTE_G, P_GACHETTE_D,
                                P_START, P_BACK, P_STICK_G, P_STICK_D, P_HAUT, P_BAS, P_GAUCHE, P_DROITE};
     bool manette_ecrite = false;    // recomp.ini contient des clés pad_… (ou le joueur vient de changer un bouton)
+    // mode souris du jeu (mouse_keyboard) : la souris du PC devient le Joy-Con 2 droit posé comme une souris ; vitesse de
+    // la souris en % (mouse_speed) ; bouton de la Switch de chaque bouton de la souris (mouse_left …)
+    bool souris = false;
+    int souris_vitesse = 100;
+    int souris_boutons[NB_BOUTONS_SOURIS] = {K_R, K_ZR, K_RSTICK, -1, -1, -1, -1};
 };
 
 // Manettes vues par le launcher (manette.cpp, SDL3 : onglet Manette de la page Contrôles)
@@ -129,6 +180,17 @@ struct Carte {
     uint32_t fabricant = 0;   // 0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel
     bool dediee = false;      // carte dédiée (pas intégrée au processeur)
     uint64_t memoire = 0;     // mémoire vidéo (plus grand tas local)
+};
+
+// Question posée dans la fenêtre du launcher (lanceur.cpp, demander ; dessin.cpp, boite_question) : oui / non ou un
+// simple message, qui se mène à la souris, au clavier et à la manette
+struct Question {
+    bool active = false;
+    std::wstring texte;
+    bool oui_non = true;      // sinon un message et OK
+    bool attention = false;   // mise en garde : cadre ambre
+    int defaut = Z_Q_OUI;     // bouton choisi par Entrée, ou par A quand rien n'est sélectionné
+    int reponse = -1;         // 1 oui (OK), 0 non ; -1 : pas encore répondu
 };
 
 struct Construction {
@@ -152,9 +214,11 @@ struct App {
     Langue langue = Langue::Fr;
     Page page = Page::Aucune;
     int capture = -1;   // page Contrôles : action dont on attend la nouvelle touche ; -1 : aucune
-    bool onglet_manette = false;   // page Contrôles : onglet Manette (sinon Clavier)
+    unsigned capture_mod = 0;   // touche modificatrice appuyée pendant l'attente (donnée seule si relâchée seule)
+    int onglet_controles = 0;      // page Contrôles : onglet 0 Clavier, 1 Manette, 2 Souris
     int capture_pad = -1;          // onglet Manette : bouton de la Switch qui attend un appui sur la manette ; -1 : aucun
     uint32_t pad_tenues = 0;       // entrées déjà appuyées quand l'attente a commencé (ne comptent qu'une fois relâchées)
+    bool pad_nav = false;          // sélection menée par la manette (zone_survol) : cadre dessiné, souris ignorée
     // chemins
     std::wstring dossier_exe, recomp, jeu, extraits, ini, copie;
     bool copie_ok = false;
@@ -187,6 +251,7 @@ struct App {
     std::wstring statut_jeu;     // message après une partie (code de sortie…)
     bool rapport_en_cours = false;   // RAPPORT DE BUG : rapport.py tourne
     Construction cons;
+    Question question;
     ULONGLONG t0 = 0;
 };
 
@@ -212,6 +277,16 @@ void dessin_redim();
 void dessin_image();          // une image complète ; met à jour g.zone_survol
 void dessin_liberer();
 int zone_sous(float x, float y);   // zone cliquable sous le point (DIP), d'après la dernière image
+bool zone_presente(int id);         // la zone était-elle dans la dernière image ?
+int zone_premiere();                // première zone de la dernière image (Z_AUCUNE : aucune)
+// zone la plus proche de `depuis` dans la direction (dx, dy) (une seule composante non nulle), d'après la dernière
+// image ; Z_AUCUNE s'il n'y en a pas
+int zone_voisine(int depuis, int dx, int dy);
+// sélecteur ‹ › de la dernière image qui contient la zone z : ses zones ‹ et ›, et *ligne si z est sa ligne entière
+// (onglet Manette) ; faux si z n'est pas dans un sélecteur
+bool selecteur_de(int z, int* zg, int* zd, bool* ligne);
+// onglet voisin de l'onglet ouvert dans la dernière image (sens −1 ou 1, en boucle) ; Z_AUCUNE : pas d'onglets
+int onglet_voisin(int sens);
 
 // lanceur.cpp
 std::string utf8(const std::wstring& w);
@@ -227,9 +302,12 @@ bool dlss_possible();
 std::wstring nom_carte(const std::string& nom);   // nom affiché : sans (TM) ni (R), « GeForce RTX 5070 Ti »
 // Raccourci du launcher sur le bureau (page Réglages) : 0 aucun, 1 présent, vers ce launcher, 2 vers un autre dossier
 int raccourci_etat();
+// Question dans la fenêtre du launcher (type : MB_YESNO ou MB_OK, MB_ICONWARNING, MB_DEFBUTTON2 comme MessageBoxW) ;
+// rend vrai pour oui (ou OK). Attend la réponse en faisant tourner la fenêtre (images, messages, manettes).
+bool demander(const std::wstring& texte, UINT type);
 
 // manette.cpp
-void manettes_lire();                 // une fois par image sur l'onglet Manette : charge SDL3 la première fois
+void manettes_lire();                 // une fois par image hors partie : SDL3 seulement quand une manette est branchée
 void manettes_fermer();               // rend les manettes et SDL (onglet quitté, jeu lancé)
 const EtatManettes& manettes();       // dernier état lu
 std::wstring nom_entree(int entree, int famille);   // « B / ○ » (famille 0), « ○ » (PlayStation)…

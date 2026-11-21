@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.2.0 — Linux, mouse mode, in-game menu, smoother loading
+
+A big one, and most of it comes from contributors: thanks to Elenedeath, sKuhLight and razzamatazm!
+
+- **Linux (experimental)** (contributed by Elenedeath, #39, asked for in #21 and #53): a native Linux version, as an
+  AppImage or a `.deb`, with the same launcher. The game is still built from your own copy. DLSS works on NVIDIA RTX
+  cards with NVIDIA's driver; FSR is not available on Linux yet. Updating or moving the game from the launcher is
+  turned off there (replace the AppImage instead). Tried on a Linux Mint PC (NVIDIA and AMD), and by Elenedeath on the
+  Steam Deck, where turning off **Fog** in **GRAPHICS** and using 75 % 3D rendering make the prologue smoother.
+- **Mouse mode (experimental, Windows only)** (contributed by sKuhLight, #51, asked for in #45): the PC mouse becomes
+  the Joy-Con 2 mouse, and the game switches to mouse aiming by itself, like on the console. Off by default: turn it on
+  in **CONTROLS › MOUSE**. Every mouse button and the wheel can be mapped, keys can use Ctrl, Shift or Alt, and F9
+  frees the cursor.
+- **In-game menu** (contributed by razzamatazm, #48, asked for in #56): F1 or Insert opens a settings menu over the
+  game, on a controller the Guide button or Back and Start together. Window mode, volume, keys, controller buttons,
+  vibration, an FPS counter and more apply at once; resolution, graphics card, DLSS, FSR and language on the next
+  launch. **Quit the game** is there too.
+- **Launcher with a controller** (contributed by Elenedeath, #57): D-pad or stick to move, A to click, B to go back,
+  Start to play, LB and RB for tabs. The questions (update, uninstall…) are now drawn in the launcher window so they
+  work with a controller too. Handy on a Steam Deck or a TV.
+- **Smoother loading** (contributed by Elenedeath, #54): hitches when the game loads a lot of textures are about
+  halved. Elenedeath also measured less CPU work per frame, which may help slower PCs (no fps change on our fast
+  one). The main switches are in a new `[performance]` section of `recomp.ini`.
+- **Faster shaders** (contributed by Elenedeath, #40): loops are translated as real loops and global-memory accesses
+  are cheaper. Up to 50 % more frames on weak AMD cards, about 5 % on NVIDIA.
+- **Smoother motion** (#41): frames are now shown at regular intervals instead of as soon as they are ready. If your
+  PC can't keep up with your settings, nothing changes. `frame_pacing = false` in `recomp\build\full\recomp.ini` brings
+  back the 1.1.0 behavior.
+- Fixed (#26): the game could stop by itself after a long freeze on graphics cards that prepare effects the first time
+  they appear (seen at the end of Corneria on a Radeon RX 580). The freeze can still happen, but the game goes on.
+- Fixed (#3): if the controller, FSR or DLSS libraries are missing from your install, the launcher now asks for a
+  rebuild, and the rebuild downloads them.
+- Fixed: shader precompilation now uses the graphics card chosen in the launcher (it always used the automatic choice,
+  so the game could freeze the first time effects appeared on another card).
+- #21: the Windows launcher no longer shows a white window when a Windows drawing effect is missing (seen with Wine
+  and Proton).
+- When the game stops showing frames, the log now says what the renderer was waiting for. It doesn't fix freezes yet
+  (#38, #33), but a bug report made after one will tell us the cause.
+- #37, #43: an install without its `outils` folder (the update zip extracted on its own) now tells you to download
+  the full package, instead of asking you to install Python.
+- Updating from 1.1.0 on Windows: say yes to the update, then **REBUILD NOW ›** (a few minutes: the game itself isn't
+  recompiled). On Linux, download the AppImage or the `.deb` and build the game from your copy.
+
 ## 1.1.0 — FSR and DLSS, PlayStation and Switch controllers, better performance
 
 Thanks again to everyone who opened an issue: most of this comes from your reports.

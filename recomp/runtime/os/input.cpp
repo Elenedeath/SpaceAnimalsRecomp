@@ -23,13 +23,25 @@
 // cherchée que là, sans y être, et seules les manettes Xbox marchaient. Joy-Con : une paire est réunie en une manette
 // (SDL_JOYSTICK_HIDAPI_COMBINE_JOY_CONS) ; un Joy-Con seul se tient à l'horizontale, comme une petite manette.
 #include "gfx.h"
+#include "menu.h"
 #include "settings.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include <xinput.h>
+#else
+// Linux : SDL3 est liée au jeu (fenêtre, son) : ses fonctions sont prises dans le processus ; clavier lu par SDL, en
+// scancodes (scancodes.h fait la correspondance avec ceux de recomp.ini) ; pas de XInput
+#include "plat_linux.h"
+#include "scancodes.h"
+#include <SDL3/SDL_keyboard.h>
+#include <dlfcn.h>
+#define XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE 7849
+#define XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE 8689
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -50,16 +62,22 @@ enum : uint64_t {
     BTN_LEFT = 1ull << 12, BTN_UP = 1ull << 13, BTN_RIGHT = 1ull << 14, BTN_DOWN = 1ull << 15,
     // directions des sticks (16-19 gauche, 20-23 droit : gauche, haut, droite, bas)
     BTN_LS_LEFT = 1ull << 16, BTN_RS_LEFT = 1ull << 20,
+    // SL et SR du Joy-Con gauche (24, 25) et du droit (26, 27), ordre K_LSL … K_RSR de Settings
+    BTN_LEFT_SL = 1ull << 24,
 };
 constexpr int32_t STICK_MAX = 0x7FFF;
 // bits des boutons de la Switch, dans l'ordre K_A … K_RIGHT de Settings (touches du clavier, boutons de la manette)
 const uint64_t kBoutons[16] = {BTN_A, BTN_B, BTN_X, BTN_Y, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
                                BTN_LSTICK, BTN_RSTICK, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT};
 
+#ifdef _WIN32
 typedef DWORD(WINAPI* XInputGetStateFn)(DWORD, XINPUT_STATE*);
 typedef DWORD(WINAPI* XInputSetStateFn)(DWORD, XINPUT_VIBRATION*);
 XInputGetStateFn g_xget = nullptr;
 XInputSetStateFn g_xset = nullptr;
+#else
+void* g_xget = nullptr;   // (pas de XInput sous Linux)
+#endif
 std::once_flag g_once;
 
 // ---------------------------------------------------------------- SDL3 (prototypes de l'ABI stable de SDL 3)
@@ -104,6 +122,7 @@ struct Pad {
 bool g_sdl = false;
 std::vector<Pad> g_pads;
 
+#ifdef _WIN32
 std::string utf8(const std::wstring& w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -128,7 +147,13 @@ std::wstring chercher_sdl() {
     return L"";
 }
 
+#else
+std::string utf8(const std::string& s) { return s; }
+#define GetProcAddress dlsym
+#endif
+
 bool charger_sdl() {
+#ifdef _WIN32
     if (getenv("RECOMP_NO_SDL")) {
         HLOG("input", "SDL3 disabled (RECOMP_NO_SDL): XInput controller only");
         return false;
@@ -140,6 +165,15 @@ bool charger_sdl() {
              chemin.empty() ? "not found (neither next to the game nor in outils\\sdl3)" : "refused at load time");
         return false;
     }
+#else
+    if (getenv("RECOMP_NO_SDL")) {
+        HLOG("input", "controllers disabled (RECOMP_NO_SDL): keyboard only");
+        return false;
+    }
+    Dl_info di{};
+    const std::string chemin = dladdr((void*)&SDL_GetKeyboardState, &di) && di.dli_fname ? di.dli_fname : "libSDL3.so.0";
+    void* m = RTLD_DEFAULT;
+#endif
     bool ok = true;
     auto f = [&](auto& ptr, const char* nom) {
         ptr = reinterpret_cast<std::remove_reference_t<decltype(ptr)>>((void*)GetProcAddress(m, nom));
@@ -196,6 +230,7 @@ bool entree_sdl(sdl::Gamepad* g, int e) {
     return false;
 }
 
+#ifdef _WIN32
 // Entrées appuyées d'une manette XInput (sans SDL3.dll), une par bit Settings::P_*
 uint32_t entrees_xinput(const XINPUT_GAMEPAD& x) {
     static const struct { WORD x; int e; } map[] = {
@@ -214,6 +249,7 @@ uint32_t entrees_xinput(const XINPUT_GAMEPAD& x) {
     if (x.bRightTrigger > 30) m |= 1u << Settings::P_GACHETTE_D;
     return m;
 }
+#endif
 
 // Manettes branchées ou débranchées (toutes les 0,5 s) : chaque changement est noté dans le journal.
 void suivre_pads() {
@@ -256,6 +292,7 @@ void suivre_pads() {
 
 void init() {
     g_sdl = charger_sdl();
+#ifdef _WIN32
     if (!g_sdl) {
         HMODULE m = LoadLibraryW(L"xinput1_4.dll");
         if (!m) m = LoadLibraryW(L"xinput9_1_0.dll");
@@ -266,6 +303,9 @@ void init() {
     } else {
         suivre_pads();
     }
+#else
+    if (g_sdl) suivre_pads();
+#endif
     HLOG("input", "inputs: keyboard%s, read when the window is active%s; rumble %d %%",
          g_sdl ? " + controllers (SDL3)" : g_xget ? " + XInput controller" : "",
          getenv("RECOMP_BACKGROUND_INPUT") ? " (controller also in the background: RECOMP_BACKGROUND_INPUT)" : "",
@@ -311,6 +351,7 @@ void appliquer_vibrations(bool actif) {
         }
         return;
     }
+#ifdef _WIN32
     static uint16_t avant[2] = {0, 0};
     if (g_xset) {
         XINPUT_VIBRATION x{amplitude(bas, false), amplitude(haut, false)};
@@ -319,8 +360,34 @@ void appliquer_vibrations(bool actif) {
             avant[0] = x.wLeftMotorSpeed, avant[1] = x.wRightMotorSpeed;
         }
     }
+#endif
 }
 
+#ifndef _WIN32
+// Linux : état du clavier tenu par SDL (fil principal, present.cpp), par scancode
+bool sdl_appuyee(int s) {
+    int n = 0;
+    const bool* k = SDL_GetKeyboardState(&n);
+    return k && s > 0 && s < n && k[s];
+}
+bool key_sc(unsigned sc) { return sc && sdl_appuyee(scancodes::vers_sdl(sc)); }
+enum { VK_RETURN, VK_BACK, VK_ESCAPE, VK_TAB, VK_SHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU };
+bool key_vk(int vk) {
+    switch (vk) {
+    case VK_RETURN: return sdl_appuyee(SDL_SCANCODE_RETURN) || sdl_appuyee(SDL_SCANCODE_KP_ENTER);
+    case VK_BACK: return sdl_appuyee(SDL_SCANCODE_BACKSPACE);
+    case VK_ESCAPE: return sdl_appuyee(SDL_SCANCODE_ESCAPE);
+    case VK_TAB: return sdl_appuyee(SDL_SCANCODE_TAB);
+    // modificateurs des combinaisons de touches (host_modifiers_held)
+    case VK_SHIFT: return sdl_appuyee(SDL_SCANCODE_LSHIFT) || sdl_appuyee(SDL_SCANCODE_RSHIFT);
+    case VK_LCONTROL: return sdl_appuyee(SDL_SCANCODE_LCTRL);
+    case VK_RCONTROL: return sdl_appuyee(SDL_SCANCODE_RCTRL);
+    case VK_LMENU: return sdl_appuyee(SDL_SCANCODE_LALT);
+    case VK_RMENU: return sdl_appuyee(SDL_SCANCODE_RALT);
+    }
+    return false;
+}
+#else
 bool key_sc(UINT sc) {   // sc : scancode, 0xE0xx pour une touche étendue (flèches…) ; 0 : aucune touche
     if (!sc) return false;
     // pavé numérique (scancodes non étendus 0x47 à 0x53) : selon le verrouillage numérique, Windows rapporte la touche en
@@ -332,6 +399,85 @@ bool key_sc(UINT sc) {   // sc : scancode, 0xE0xx pour une touche étendue (flè
     return vk && (GetAsyncKeyState((int)vk) & 0x8000);
 }
 bool key_vk(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+#endif
+
+// Modificateur que la touche `sc` est elle-même (Ctrl, Maj, Alt, gauche ou droite), 0 sinon
+unsigned modificateur(unsigned sc) {
+    switch (sc) {
+    case 0x1D: case 0xE01D: return Settings::MODIF_CTRL;
+    case 0x2A: case 0x36: return Settings::MODIF_SHIFT;
+    case 0x38: case 0xE038: return Settings::MODIF_ALT;
+    }
+    return 0;
+}
+
+// AltGr (claviers AZERTY, QWERTZ, US international…) : Windows le rapporte comme Ctrl gauche + Alt droit. Une disposition
+// a AltGr si l'un de ses caractères se tape avec Ctrl+Alt. Vu une fois par disposition (le joueur peut en changer).
+bool disposition_altgr() {
+#ifndef _WIN32
+    // SDL (Linux) : AltGr arrive comme Alt droit seul, sans le Ctrl gauche qu'ajoute Windows ; il reste un modificateur
+    return false;
+#else
+    static std::mutex lk;
+    static HKL vue = nullptr;
+    static bool altgr = false;
+    const HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+    std::lock_guard<std::mutex> g(lk);
+    if (hkl != vue) {
+        vue = hkl;
+        altgr = false;
+        for (wchar_t c = 0x21; c <= 0xFF && !altgr; c++) {
+            const SHORT r = VkKeyScanExW(c, hkl);
+            altgr = r != -1 && (HIBYTE(r) & 6) == 6;
+        }
+        if (!altgr) altgr = [&] { const SHORT r = VkKeyScanExW(0x20AC, hkl); return r != -1 && (HIBYTE(r) & 6) == 6; }();
+        HLOG("input", "keyboard layout %p: %s", (void*)hkl, altgr ? "AltGr (right Alt) is not Ctrl+Alt" : "no AltGr");
+    }
+    return altgr;
+#endif
+}
+bool altgr_tenu() { return key_vk(VK_RMENU) && disposition_altgr(); }
+
+}  // namespace
+
+// Ctrl, Maj et Alt tenus (Settings::MODIF_*). AltGr tenu ne compte ni comme Ctrl ni comme Alt : une action liée à
+// ctrl+X ne part pas avec AltGr+X ; Ctrl droit et Alt gauche restent des modificateurs.
+unsigned host_modifiers_held() {
+    const bool altgr = altgr_tenu();
+    const bool ctrl = key_vk(VK_RCONTROL) || (key_vk(VK_LCONTROL) && !altgr);
+    const bool alt = key_vk(VK_LMENU) || (key_vk(VK_RMENU) && !altgr);
+    return (ctrl ? Settings::MODIF_CTRL : 0) | (key_vk(VK_SHIFT) ? Settings::MODIF_SHIFT : 0) | (alt ? Settings::MODIF_ALT : 0);
+}
+
+namespace {
+
+// Actions de la manette dont la touche (avec ses modificateurs) est appuyée. Une touche liée sans modificateur compte
+// aussi quand d'autres sont tenus (Maj tenu pour un boost, W pour monter) ; mais si la même touche est liée ailleurs
+// avec plus de modificateurs, tous tenus, cette combinaison plus précise l'emporte seule (W : stick gauche, Maj+W :
+// stick droit). Une touche modificatrice liée seule ne compte pas pendant une combinaison qui se sert d'elle.
+void touches_actives(bool actif[Settings::K_NB]) {
+    const unsigned* K = settings().keys;
+    const unsigned tenus = host_modifiers_held();
+    const bool altgr = altgr_tenu();
+    bool brut[Settings::K_NB];
+    for (int i = 0; i < Settings::K_NB; i++) {
+        const unsigned sc = K[i] & 0xFFFF, m = K[i] & Settings::MODIF_MASK;
+        // le Ctrl gauche qu'envoie AltGr n'appuie pas une touche liée à Ctrl gauche
+        brut[i] = sc && (m & ~tenus) == 0 && key_sc(sc) && !(altgr && sc == 0x1D);
+    }
+    unsigned servis = 0;   // modificateurs d'une combinaison active
+    for (int i = 0; i < Settings::K_NB; i++) {
+        actif[i] = brut[i];
+        const unsigned m = K[i] & Settings::MODIF_MASK;
+        for (int j = 0; j < Settings::K_NB && actif[i]; j++) {
+            const unsigned mj = K[j] & Settings::MODIF_MASK;
+            if (j != i && brut[j] && (K[j] & 0xFFFF) == (K[i] & 0xFFFF) && mj != m && (mj & m) == m) actif[i] = false;
+        }
+        if (actif[i]) servis |= m;
+    }
+    for (int i = 0; i < Settings::K_NB; i++)
+        if (actif[i] && !(K[i] & Settings::MODIF_MASK) && (modificateur(K[i] & 0xFFFF) & servis)) actif[i] = false;
+}
 
 int32_t axis(bool neg, bool pos) { return (pos ? STICK_MAX : 0) - (neg ? STICK_MAX : 0); }
 
@@ -412,24 +558,31 @@ HostPad host_poll_input() {
     HostPad p;
     if (gfx_window_focused()) {
         const unsigned* K = settings().keys;   // une touche par action (recomp.ini, page Contrôles du launcher)
-        static const uint64_t bits[] = {BTN_A, BTN_B, BTN_X, BTN_Y, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
-                                        BTN_LSTICK, BTN_RSTICK, BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT};
+        // actions appuyées : touches du clavier (et leurs combinaisons), puis entrées de la souris en mode souris
+        // (hle_kbm.cpp), chacune donnée à une action de la manette (bouton, direction d'un stick, SL, SR)
+        bool actif[Settings::K_NB];
+        touches_actives(actif);
+        const uint32_t souris = kbm_mouse_buttons();
+        for (int i = 0; i < Settings::M_NB; i++)
+            if ((souris >> i & 1) && settings().mouse_buttons[i] >= 0) actif[settings().mouse_buttons[i]] = true;
         for (int i = 0; i <= Settings::K_RIGHT; i++)
-            if (key_sc(K[i])) p.buttons |= bits[i];
-        // touches de confort des menus, sauf si le joueur a donné cette touche à une action
+            if (actif[i]) p.buttons |= kBoutons[i];
+        for (int i = Settings::K_LSL; i <= Settings::K_RSR; i++)
+            if (actif[i]) p.buttons |= BTN_LEFT_SL << (i - Settings::K_LSL);
+        // touches de confort des menus, sauf si le joueur a donné cette touche à une action (seule ou en combinaison)
         auto libre = [&](unsigned sc) {
             for (int i = 0; i < Settings::K_NB; i++)
-                if (K[i] == sc) return false;
+                if ((K[i] & 0xFFFF) == sc) return false;
             return true;
         };
         if (libre(0x1C) && libre(0xE01C) && key_vk(VK_RETURN)) p.buttons |= BTN_A;   // Entrée, et celle du pavé
         if (libre(0x0E) && key_vk(VK_BACK)) p.buttons |= BTN_B;
         if (libre(0x01) && key_vk(VK_ESCAPE)) p.buttons |= BTN_PLUS;
         if (libre(0x0F) && key_vk(VK_TAB)) p.buttons |= BTN_MINUS;
-        p.lx = axis(key_sc(K[Settings::K_LS_LEFT]), key_sc(K[Settings::K_LS_RIGHT]));
-        p.ly = axis(key_sc(K[Settings::K_LS_DOWN]), key_sc(K[Settings::K_LS_UP]));
-        p.rx = axis(key_sc(K[Settings::K_RS_LEFT]), key_sc(K[Settings::K_RS_RIGHT]));
-        p.ry = axis(key_sc(K[Settings::K_RS_DOWN]), key_sc(K[Settings::K_RS_UP]));
+        p.lx = axis(actif[Settings::K_LS_LEFT], actif[Settings::K_LS_RIGHT]);
+        p.ly = axis(actif[Settings::K_LS_DOWN], actif[Settings::K_LS_UP]);
+        p.rx = axis(actif[Settings::K_RS_LEFT], actif[Settings::K_RS_RIGHT]);
+        p.ry = axis(actif[Settings::K_RS_DOWN], actif[Settings::K_RS_UP]);
     }
     // Manette XInput lue seulement quand la fenêtre du jeu est active, comme le clavier : sinon une partie
     // jouée ailleurs avec la même manette pilotait aussi le jeu (le 2026-11-09, 17 appuis sur Start =
@@ -438,9 +591,15 @@ HostPad host_poll_input() {
     static const bool background = getenv("RECOMP_BACKGROUND_INPUT") != nullptr;
     const bool lire = background || gfx_window_focused();
     auto mix = [](int32_t a, int32_t b) { return a ? a : b; };   // le clavier prime
+    // pour le menu en jeu (menu.h) : entrées des manettes par position (un bit par Settings::P_*), sans les réglages du
+    // joueur, et stick gauche de la première manette qui le penche
+    uint32_t brut = 0;
+    int32_t brut_lx = 0, brut_ly = 0;
     if (g_sdl) {
         static int tour = 0;
+#ifdef _WIN32
         sdl::PumpEvents();
+#endif   // (Linux : les événements de SDL sont traités par le fil principal, present.cpp)
         if (++tour % 30 == 0) suivre_pads();
         sdl::UpdateGamepads();
         for (Pad& pd : g_pads) {
@@ -449,6 +608,8 @@ HostPad host_poll_input() {
             // chaque bouton de la Switch : l'entrée choisie (settings().pad ; par défaut, la disposition par position)
             for (int i = 0; i < Settings::PAD_NB; i++)
                 if (entree_sdl(pd.g, settings().pad[i])) p.buttons |= kBoutons[i];
+            for (int e = Settings::P_SUD; e < Settings::P_NB; e++)
+                if (entree_sdl(pd.g, e)) brut |= 1u << e;
             // SDL : y positif vers le bas ; Switch : vers le haut
             auto ax = [&](int a, bool inv, int32_t dz) {
                 int32_t v = sdl::GetGamepadAxis(pd.g, a);
@@ -459,9 +620,12 @@ HostPad host_poll_input() {
             p.ly = mix(p.ly, ax(sdl::LEFTY, true, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE));
             p.rx = mix(p.rx, ax(sdl::RIGHTX, false, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE));
             p.ry = mix(p.ry, ax(sdl::RIGHTY, true, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE));
+            brut_lx = mix(brut_lx, ax(sdl::LEFTX, false, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE));
+            brut_ly = mix(brut_ly, ax(sdl::LEFTY, true, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE));
         }
     }
-    appliquer_vibrations(lire);
+    appliquer_vibrations(lire && !menu::ouvert());   // pas de vibrations pendant que le menu en jeu est ouvert
+#ifdef _WIN32
     XINPUT_STATE st{};
     if (!g_sdl && g_xget && lire && g_xget(0, &st) == ERROR_SUCCESS) {
         p.xinput = true;
@@ -472,6 +636,18 @@ HostPad host_poll_input() {
         p.ly = mix(p.ly, dead(st.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE));
         p.rx = mix(p.rx, dead(st.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE));
         p.ry = mix(p.ry, dead(st.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE));
+        brut = e;
+        brut_lx = dead(st.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+        brut_ly = dead(st.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+    }
+#endif
+    // Menu en jeu : il lit la manette lui-même (le clavier lui vient de la fenêtre) ; ouvert, le jeu ne reçoit rien, et
+    // rien non plus juste après sa fermeture tant qu'un bouton reste appuyé (celui qui l'a fermé ne passe pas au jeu).
+    menu::manette(brut, brut_lx, brut_ly);
+    if (menu::masquer((p.buttons & 0xFFFF) == 0)) {
+        const bool branchee = p.xinput;
+        p = HostPad{};
+        p.xinput = branchee;
     }
     // diagnostic : RECOMP_AUTOPRESS=1 appuie sur A 100 ms toutes les 2 s (tests sans écran) ;
     // RECOMP_AUTOPRESS_UNTIL=s : seulement pendant les s premières secondes (écran titre), le jeu se

@@ -46,6 +46,9 @@ RACINE = os.path.dirname(RECOMP)                 # extracted/ et work/ (a64/modu
 OUTILS = os.path.join(RACINE, "tools")           # nup.py, nso.py
 FULL = os.path.join(RECOMP, "build", "full")
 MARQUES = os.path.join(FULL, ".preparation")
+sys.path.insert(0, RECOMP)
+import plateforme  # noqa: E402   (Windows / Linux)
+JEU = os.path.join(FULL, "recomp_main" + plateforme.EXE)
 
 TITRE = 0x0400E88025B1A000
 VERSION = 131072                                 # patch 2.0.0
@@ -66,10 +69,14 @@ ETAPES = ["verifier", "extraire", "images", "recompiler", "lier", "shaders", "pi
 DEPENDANCES = {
     "extraire": ([], ["tools/nup.py"]),
     "images": (["extraire"], ["tools/nso.py"]),
-    "recompiler": (["images"], ["recomp/recomp.py", "recomp/build.py", "recomp/fullbuild.py", "recomp/hooks.txt",
+    "recompiler": (["images"], ["recomp/recomp.py", "recomp/build.py", "recomp/plateforme.py", "recomp/fullbuild.py", "recomp/hooks.txt",
                                 "recomp/lots.txt",
                                 "recomp/a64/*.py", "recomp/runtime/*.h"]),
-    "lier": (["recompiler"], ["recomp/link.py", "recomp/runtime/*.cpp", "recomp/runtime/os/*.cpp", "recomp/runtime/os/*.h"]),
+    "lier": (["recompiler"], ["recomp/link.py", "recomp/plateforme.py", "recomp/runtime/*.cpp", "recomp/runtime/os/*.cpp",
+                              "recomp/runtime/os/*.h",
+                              # Dear ImGui (menu en jeu), compilée avec le runtime par link.py
+                              "recomp/runtime/third_party/imgui/*.cpp", "recomp/runtime/third_party/imgui/*.h",
+                              "recomp/runtime/third_party/imgui/backends/*"]),
     "shaders": ([], ["recomp/shaders/*.py"]),
 }
 # étape refaite à chaque construction : recomp_main --precompile ne recompile que si le GPU, le pilote ou les shaders
@@ -139,12 +146,127 @@ def dossiers_outils():
     return [d for d in (os.path.join(RACINE, "outils"), os.path.join(RECOMP, "outils")) if os.path.isdir(d)]
 
 
+# Installation incomplète (issues n° 37 et 43, 2026-11-19). update.zip ou le code source extraits seuls n'ont pas le
+# dossier outils/. Le launcher disait alors « Python 3 introuvable : installez-le » ; le joueur installait un Python,
+# et la construction échouait plus loin (modules absents, puis pas de compilateur : « 36 batch(es) failed »). Sans le
+# Python fourni, la construction s'arrête maintenant tout de suite, avec la marche à suivre.
+# RECOMP_OUTILS_DU_PC=1 : construire quand même avec le Python et le compilateur du PC (développement).
+def verifier_installation():
+    if os.environ.get("RECOMP_OUTILS_DU_PC"):
+        return
+    python = os.path.join("python", "bin", "python3") if plateforme.LINUX else os.path.join("python", "python.exe")
+    if any(os.path.exists(os.path.join(d, python)) for d in dossiers_outils()):
+        return
+    if plateforme.LINUX:   # (AppImage : outils/ est un lien vers l'image montée ; .deb : vers /opt/spaceanimalsrecomp)
+        raise Echec("incomplete installation (no 'outils' folder with the build tools): start the game from the "
+                    "SpaceAnimalsRecomp AppImage or from the installed package, not from a copy of its folder. "
+                    "Installing Python yourself is not needed.")
+    raise Echec("incomplete installation (no 'outils' folder with the build tools): download the full package "
+                f"SpaceAnimalsRecomp-{version_sources()}-windows.zip from the Releases page, extract it into a new "
+                "folder and run lanceur.exe from there. Installing Python yourself is not needed.")
+
+
+# Outils manquants (2026-11-14, issue n° 3 : launcher 1.1.0 sans SDL3.dll, « SDL3 missing (outils\sdl3) », manette Pro
+# inutilisable). La mise à jour faite par le launcher installe les outils qu'une nouvelle version ajoute (maj.py), mais
+# rien ne réparait une installation où il en manque : update.zip extrait à la main par-dessus l'ancienne version,
+# fichier supprimé ou mis en quarantaine, téléchargement jamais fait. La construction les réinstalle maintenant
+# (installer_outils_manquants), et « --a-refaire » ajoute « outils » à sa liste pour que le launcher propose de
+# reconstruire. Seuls les dossiers d'outils qui portent des marques (.installe, écrites par outils.py) sont regardés ;
+# Python et ses modules sont exclus (c'est le Python en cours d'exécution).
+def outils_manquants():
+    """(dossier d'outils, [noms des outils absents]) : marque .installe/<nom> absente ou d'une autre archive, ou
+    fichier témoin disparu (« temoin » de outils.py ; le fichier lui-même pour un outil fait d'un seul fichier)."""
+    script = os.path.join(LANCEUR, "outils.py")
+    bases = [b for b in dossiers_outils() if os.path.isdir(os.path.join(b, ".installe"))]
+    if not bases or not os.path.exists(script):
+        return None, []
+    base = bases[0]
+    ns = {"__file__": script, "__name__": "outils_prep"}
+    exec(compile(open(script, encoding="utf-8").read(), script, "exec"), ns)   # noqa: S102 (script de cette version)
+    manque = []
+    for o in ns["OUTILS"]:
+        if o["dest"] == "python" or o["dest"].startswith("python/"):
+            continue
+        try:
+            vue = open(os.path.join(base, ".installe", o["nom"]), encoding="utf-8").read().strip()
+        except OSError:
+            vue = ""
+        ok = vue == o["sha256"] or vue in o.get("acceptes", ())
+        temoin = o.get("temoin") or (o["url"].rsplit("/", 1)[1] if o.get("fichier") else None)
+        if ok and temoin and not os.path.exists(os.path.join(base, o["dest"], temoin)):
+            ok = False
+        if not ok:
+            manque.append(o["nom"])
+    return base, manque
+
+
+def essai_outils(base):
+    """Fichier qui retient les outils qu'un téléchargement n'a pas pu installer (pas d'accès au réseau…)."""
+    return os.path.join(base, ".installe", "_echec.txt")
+
+
+def installer_outils_manquants():
+    """Début de construction : télécharge les outils qui manquent (outils.py, sources officielles, SHA-256 vérifié).
+    Un échec n'arrête pas la construction : SDL3, FSR et DLSS sont facultatifs, et l'absence du compilateur ou de
+    glslang se verra à leur étape. L'échec est retenu, pour que « --a-refaire » ne redemande pas une reconstruction à
+    chaque démarrage du launcher chez un joueur sans réseau."""
+    base, manque = outils_manquants()
+    if not manque:
+        if base:
+            try:
+                os.remove(essai_outils(base))
+            except OSError:
+                pass
+        return
+    dire("missing tools: " + ", ".join(manque) + " (downloading them from their official sources)")
+    dire("@info tools: " + ", ".join(manque))
+    for nom in manque:   # marque d'un outil dont le fichier a disparu : outils.py le croirait installé
+        try:
+            os.remove(os.path.join(base, ".installe", nom))
+        except OSError:
+            pass
+    try:
+        lancer([sys.executable, "-X", "utf8", os.path.join(LANCEUR, "outils.py"), "--dest", base], RECOMP, env=dict(os.environ))
+    except Echec as e:
+        dire(f"tools not installed ({e}): the build goes on; controllers other than Xbox, FSR or DLSS may be "
+             "unavailable until the next build with network access")
+    reste = outils_manquants()[1]
+    try:
+        if reste:
+            with open(essai_outils(base), "w", encoding="utf-8") as f:
+                f.write(",".join(reste) + "\n")
+        else:
+            os.remove(essai_outils(base))
+    except OSError:
+        pass
+    GCC.clear()   # dossier du compilateur à redéterminer s'il vient d'être installé
+
+
+def outils_a_signaler():
+    """Pour « --a-refaire » : True s'il manque des outils et que leur téléchargement n'a pas déjà échoué pour les
+    mêmes (le launcher propose alors de reconstruire, ce qui les installe)."""
+    base, manque = outils_manquants()
+    if not manque:
+        return False
+    try:
+        deja = open(essai_outils(base), encoding="utf-8").read().strip().split(",")
+    except OSError:
+        deja = []
+    return sorted(deja) != sorted(manque)
+
+
 def outils_env():
     """PATH des sous-processus : compilateur et glslang fournis (outils/), sinon MSYS2, sinon le PATH.
     RECOMP_SANS_MSYS2=1 ignore MSYS2 (vérification du paquet comme sur un PC où rien n'est installé)."""
     env = dict(os.environ)
     chemins = []
     for base in dossiers_outils():
+        if plateforme.LINUX:   # Linux : zig (plateforme.zig_cxx) et glslang fournis ; pas de GCC ni de MSYS2
+            if os.path.isdir(os.path.join(base, "glslang", "bin")):
+                chemins.append(os.path.join(base, "glslang", "bin"))
+            if plateforme.glslang() and "RECOMP_GLSLANG" not in env:
+                env["RECOMP_GLSLANG"] = plateforme.glslang()
+            continue
         if os.path.isdir(os.path.join(base, "gcc", "bin")):
             if not GCC:
                 GCC.append(gcc_sans_espaces(base))
@@ -156,7 +278,7 @@ def outils_env():
             if os.path.exists(exe) and "RECOMP_GLSLANG" not in env:
                 env["RECOMP_GLSLANG"] = exe
     msys = r"C:\msys64\ucrt64\bin"
-    if not os.environ.get("RECOMP_SANS_MSYS2") and os.path.isdir(msys):
+    if not plateforme.LINUX and not os.environ.get("RECOMP_SANS_MSYS2") and os.path.isdir(msys):
         chemins.append(msys)
     env["PATH"] = os.pathsep.join(chemins + [env.get("PATH", "")])
     env["PYTHONUTF8"] = "1"
@@ -182,7 +304,7 @@ def lancer(cmd, cwd, analyse=None, env=None):
         if analyse:
             analyse(ligne)
     if p.wait():
-        nom = next((os.path.basename(c) for c in cmd if str(c).endswith((".py", ".exe"))), os.path.basename(cmd[0]))
+        nom = next((os.path.basename(c) for c in cmd if str(c).endswith((".py", ".exe"))), os.path.basename(str(cmd[0])))
         e = Echec(f"{nom} failed (code {p.returncode}): " + (queue[-1] if queue else ""))
         e.sortie = list(queue)   # dernières lignes (diagnostic : manque de mémoire…)
         raise e
@@ -236,6 +358,12 @@ def verifier_pc(construire):
         except UnicodeEncodeError:
             raise Echec("the folder path contains characters the compiler cannot handle: "
                         "move the game folder (for example to C:\\Jeux\\StarFox)")
+    elif plateforme.LINUX:
+        if not plateforme.avx2():
+            raise Echec("this processor lacks the AVX2 instructions: the recompiled game cannot run on it")
+        import ctypes.util
+        if not ctypes.util.find_library("vulkan"):
+            dire("warning: Vulkan not found (libvulkan.so.1): install the Vulkan driver of your graphics card")
     if construire:
         libre = shutil.disk_usage(RACINE).free
         if libre < 6e9:
@@ -391,7 +519,9 @@ _MESURE = {"go": 0.0, "faite": False}   # plus grand pic mesuré (Go) ; gardé d
 
 def memoire_processus(p):
     """Mémoire (Go) d'un processus lancé par subprocess : le plus grand de ses compteurs (jeu de travail et mémoire
-    privée, actuels et de pointe) ; 0 si elle n'est pas lisible (hors de Windows, processus disparu)."""
+    privée, actuels et de pointe) ; 0 si elle n'est pas lisible (processus disparu). Linux : /proc/<pid>/status."""
+    if plateforme.LINUX:
+        return plateforme.memoire_processus_linux(p.pid)
     try:
         import ctypes
         from ctypes import wintypes
@@ -491,6 +621,8 @@ def construction_surveillee(arguments):
     sys.path.insert(0, RECOMP)
     import fullbuild
     fullbuild.Compilations = compilations_surveillees(fullbuild)
+    if plateforme.LINUX:   # (fullbuild.go_libres ne lit que la mémoire de Windows)
+        fullbuild.go_libres = lambda: min(memoire_libre())
     sys.argv = [os.path.join(RECOMP, "fullbuild.py")] + list(arguments)
     return fullbuild.main()
 
@@ -498,6 +630,8 @@ def construction_surveillee(arguments):
 def avec_clang():
     """Le code généré sera-t-il compilé par clang ? Même règle que build.compilateur_genere : RECOMP_CXX, sinon
     clang++.exe à côté du g++ que la construction trouve (outils fournis, MSYS2, PATH)."""
+    if plateforme.LINUX:
+        return True   # zig (clang)
     choix = os.environ.get("RECOMP_CXX")
     if choix:
         return "clang" in os.path.basename(choix).lower()
@@ -510,7 +644,7 @@ def compilateur_a_niveau():
     construction complète est 3 fois plus rapide et demande 3 fois moins de mémoire par tâche avec Clang, donc
     l'archive actuelle du compilateur est installée d'abord (outils.py --niveau, une seule fois). Tant qu'il a ses
     objets compilés par g++, rien n'est fait : ils restent valables. Un échec (pas de réseau…) laisse g++ en place."""
-    if os.environ.get("RECOMP_CXX") or avec_clang():
+    if plateforme.LINUX or os.environ.get("RECOMP_CXX") or avec_clang():
         return
     objets = glob.glob(os.path.join(glob.escape(RECOMP), "build", "full", "main", "main_*.o"))
     if len(objets) >= 100:
@@ -536,6 +670,8 @@ def memoire_libre():
     if os.environ.get("RECOMP_MEM_LIBRE_GO"):
         v = float(os.environ["RECOMP_MEM_LIBRE_GO"])
         return v, v
+    if plateforme.LINUX:
+        return plateforme.memoire_libre()
     import ctypes
 
     class Etat(ctypes.Structure):
@@ -557,7 +693,9 @@ def fils_selon_memoire(demandes):
         return demandes
     clang = avec_clang()
     n = max(1, min(demandes, int((min(ram, validable) - GO_RESERVE) / (GO_PAR_TACHE_CLANG if clang else GO_PAR_TACHE))))
-    dire(f"free memory: {ram:.0f} GB of RAM, {validable:.0f} GB of commit, compiler {'clang' if clang else 'g++'}"
+    # Windows : mémoire validable (RAM + fichier d'échange) ; Linux : RAM disponible + swap libre
+    reserve = "RAM + swap" if plateforme.LINUX else "commit"
+    dire(f"free memory: {ram:.0f} GB of RAM, {validable:.0f} GB of {reserve}, compiler {'clang' if clang else 'g++'}"
          f" → {n} parallel compilation(s)"
          + (f" instead of {demandes} (closing other programs speeds up the build)" if n < demandes else ""))
     return n
@@ -678,6 +816,10 @@ def extraire_icone(copie):
     chemin_jpg = os.path.join(FULL, "icone.jpg")
     with open(chemin_jpg, "wb") as f:
         f.write(jpg)
+    if plateforme.LINUX:   # pas d'icône dans l'exécutable sous Linux : le JPEG est gardé (fenêtre du jeu, present.cpp)
+        os.replace(chemin_jpg, os.path.join(FULL, "icone_jeu.jpg"))
+        dire("game icon: icone_jeu.jpg")
+        return
     try:
         jpeg_vers_ico(chemin_jpg, ico)
         dire(f"game icon: {ico} ({os.path.getsize(ico)} bytes)")
@@ -692,7 +834,7 @@ def e_lier(copie, a):
     extraire_icone(copie)
     dire("@progres 0.2")
     lancer([sys.executable, "-X", "utf8", os.path.join(RECOMP, "link.py")], RECOMP)
-    if not os.path.exists(os.path.join(FULL, "recomp_main.exe")):
+    if not os.path.exists(JEU):
         raise Echec("the executable was not produced")
 
 
@@ -744,7 +886,7 @@ def e_shaders(copie, a):
 def e_pipelines(copie, a):
     """Tous les shaders compilés pour ce GPU (comme les jeux récents au premier lancement) : recomp_main --precompile
     écrit pipelines.cache, que le jeu charge au démarrage. Rien à refaire si GPU, pilote et shaders sont inchangés."""
-    exe = os.path.join(FULL, "recomp_main.exe")
+    exe = JEU
 
     def analyse(l):
         if l.startswith("@progres ") or l.startswith("@info "):
@@ -769,7 +911,7 @@ def e_pipelines(copie, a):
 def releve_cle():
     """Identité de l'exécutable construit (taille, date) : le relevé est refait après chaque nouvelle édition de liens."""
     try:
-        s = os.stat(os.path.join(FULL, "recomp_main.exe"))
+        s = os.stat(JEU)
     except OSError:
         return None
     return f"{s.st_size}:{int(s.st_mtime)}"
@@ -782,7 +924,7 @@ def releve_shaders(a):
     sans le son et avec une sauvegarde à part, jusqu'à sa 600e image, puis on traduit ces nouveaux shaders.
     Jusqu'à la 1.0.1, l'enregistrement des extraits faisait ce relevé au passage. Renvoie False si le jeu n'a pas
     atteint sa 600e image (le relevé sera retenté à la prochaine construction) ; ce n'est jamais bloquant."""
-    exe = os.path.join(FULL, "recomp_main.exe")
+    exe = JEU
     save = os.path.join(FULL, "essai_releve")
     journal = os.path.join(FULL, "releve_shaders.log")
     shutil.rmtree(save, ignore_errors=True)
@@ -850,8 +992,10 @@ def main():
             copie = Copie(a.copie)
             copie.verifier()
             sig = signatures(copie.signature())
-            dire("@a_refaire " + ",".join(e for e in ETAPES if e not in TOUJOURS and e != "verifier"
-                                          and not deja_fait(e, sig[e])))
+            # « outils » en tête s'il manque des outils du paquet (SDL3…) : la reconstruction les télécharge
+            dire("@a_refaire " + ",".join((["outils"] if outils_a_signaler() else [])
+                                          + [e for e in ETAPES if e not in TOUJOURS and e != "verifier"
+                                             and not deja_fait(e, sig[e])]))
             return 0
         except Exception as ex:  # noqa: BLE001
             dire(f"@erreur {type(ex).__name__}: {ex}")
@@ -878,9 +1022,11 @@ def main():
     t0 = time.time()
     try:
         dire("@etape verifier")
+        verifier_installation()   # update.zip ou code source seuls, sans outils/ (issues n° 37 et 43)
         copie = Copie(a.copie)
         COPIE.append(os.path.abspath(a.copie))
         copie.verifier()
+        installer_outils_manquants()   # SDL3, FSR, DLSS… absents (issue n° 3) : téléchargés ici, jamais bloquant
         sig = signatures(copie.signature())
         verifier_pc(any(e in etapes and (a.forcer or not deja_fait(e, sig[e])) for e in ("recompiler", "lier")))
         dire("@ok verifier")

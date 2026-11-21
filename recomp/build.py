@@ -12,6 +12,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(HERE, "runtime")
+sys.path.insert(0, HERE)
+import plateforme  # noqa: E402
 
 BASE_FLAGS = ["-std=c++17", "-fno-strict-aliasing", "-ffp-contract=off", "-mcx16", "-march=x86-64-v3",
               "-fwrapv", "-I" + RUNTIME, "-Wno-unused-label", "-Wno-unused-variable",
@@ -39,6 +41,12 @@ def compilateur_genere():
     compilateur (clang++ ou g++). Le runtime et l'édition de liens restent à g++ (link.py) : même ABI (mingw, UCRT).
     Les drapeaux propres à clang changent l'empreinte des objets : passer d'un compilateur à l'autre recompile tout.
     """
+    if plateforme.LINUX:   # Linux : zig (clang) fourni, glibc 2.31 (plateforme.py)
+        choix = plateforme.zig_cxx()
+        # -g0 : zig c++ émet des informations de débogage DWARF même sans -g (3,8 Go sur les 4,9 de recomp_main ;
+        # le code généré n'en a pas sous Windows)
+        return choix, "clang", [*plateforme.cible_linux(choix), "-g0", "-include", os.path.join(RUNTIME, "clang_compat.h"),
+                                "-w"]
     choix = os.environ.get("RECOMP_CXX")
     if not choix:
         gxx = shutil.which("g++")
@@ -122,10 +130,10 @@ def build(srcs, out, objdir, opt="-O2", defs=(), jobs=None, kind="dll", extra_li
     # code généré : le compilateur des lots du jeu (clang s'il est fourni, RECOMP_CXX) ; runtime : g++, comme dans
     # l'exécutable du jeu (link.py)
     cxx, nom, propres = compilateur_genere()
-    gxx = shutil.which("g++") or cxx
+    gxx = cxx if plateforme.LINUX else (shutil.which("g++") or cxx)
     os.makedirs(objdir, exist_ok=True)
     flags = BASE_FLAGS + [opt] + list(defs) + propres
-    rt_flags = BASE_FLAGS + [opt] + list(defs)
+    rt_flags = BASE_FLAGS + [opt] + list(defs) + (plateforme.cible_linux(cxx) if plateforme.LINUX else [])
     runtime = [os.path.join(RUNTIME, "runtime.cpp"), os.path.join(RUNTIME, "fp.cpp")]
     srcs = list(srcs) + runtime
     jobs = jobs or os.cpu_count()
@@ -148,6 +156,8 @@ def build(srcs, out, objdir, opt="-O2", defs=(), jobs=None, kind="dll", extra_li
         return objs
     link = [shutil.which("g++") or cxx, "-o", out, *objs, "-static", "-static-libgcc", "-static-libstdc++", "-latomic",
             *extra_link]
+    if plateforme.LINUX:
+        link = [cxx, *plateforme.cible_linux(cxx), "-o", out, *objs, "-lpthread", "-ldl", *extra_link]
     if kind == "dll":
         link.insert(1, "-shared")
     r = subprocess.run(link, capture_output=True, text=True)

@@ -9,6 +9,7 @@
 //  * listes de commandes rejouées dans un tampon de commandes par image, en rendu dynamique, avec un
 //    cache de pipelines ; présentation : copie de la texture de fenêtre vers la swapchain.
 // Activé par défaut ; RECOMP_NO_VULKAN=1 revient à la présentation GDI (couleur d'effacement).
+#ifdef _WIN32
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
@@ -20,6 +21,22 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
+#else
+// Linux : surface créée par SDL3 (present.cpp, gfx_vk_surface), libvulkan.so.1 chargée à l'exécution
+#include "plat_linux.h"
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/sysinfo.h>
+#include <sys/wait.h>
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+typedef void* HWND;
+inline HMODULE LoadLibraryW(const wchar_t*) {
+    void* l = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_GLOBAL);
+    return l ? l : dlopen("libvulkan.so", RTLD_NOW | RTLD_GLOBAL);
+}
+inline void* GetProcAddress(HMODULE m, const char* nom) { return dlsym(m, nom); }
+#endif
 
 #include "gfx.h"
 #include "nvn_exec.h"
@@ -29,12 +46,15 @@
 #include "dlss.h"
 #include "fsr.h"
 #include "dlss_spirv.h"
+#include "menu.h"
+#include "menu_vk.h"
 
 // runtime.cpp : pause du compteur du jeu pendant un long blocage du pilote. Pas déclarées dans cpu.h : cet en-tête
 // entre dans l'empreinte de chaque objet du jeu recompilé (build.py, GEN_HEADERS) ; y toucher ferait recompiler tout
 // le jeu chez les joueurs.
 void rt_stall_begin();
 void rt_stall_end();
+uint64_t rt_stall_cache_ms();
 
 #include <algorithm>
 #include <array>
@@ -48,20 +68,44 @@ void rt_stall_end();
 #include <map>
 #include <set>
 #include <sstream>
+#include <immintrin.h>   // désentrelacement (AVX2, écritures non temporelles)
 #include <thread>
 
 namespace hos {
+uint64_t mem_release_part(uint64_t addr, uint64_t size, uint64_t* id);   // memory.cpp : un morceau d'un rendu
+extern std::atomic<uint64_t> g_campagne_ns;   // début de campagne (svc_fs.cpp), pour RECOMP_SNAPSHOT_CAMPAIGN
+// Surveillance des blocages (2026-11-19, issues n° 38 et 33 : plus aucune image pendant 60 s puis arrêt par le chien de
+// garde du jeu, sans une ligne qui dise pourquoi). g_gpu_phase : ce que fait le fil du GPU (texte statique, posé par
+// Phase autour de chaque attente) ; g_gpu_images : images que le jeu a livrées. Voir surveillance_blocages.
+std::atomic<const char*> g_gpu_phase{"starting"};
+std::atomic<uint64_t> g_gpu_images{0};
 namespace vkr {
+struct Phase {
+    const char* avant;
+    explicit Phase(const char* p) : avant(g_gpu_phase.exchange(p)) {}
+    ~Phase() { g_gpu_phase.store(avant); }
+    Phase(const Phase&) = delete;
+    Phase& operator=(const Phase&) = delete;
+};
 void flush_locked(const char* where);   // soumet et attend le GPU (défini plus bas)
 void dlss_emplacement(int slot);        // jeux de descripteurs des passes du DLSS de cet emplacement, remis à zéro
 namespace {
 
+inline uint64_t hz_ns(std::chrono::steady_clock::time_point t0) {   // ns écoulées depuis t0
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
 // ================================================================ fonctions Vulkan
+#ifdef _WIN32
+#define VK_SURFACE_WIN32(X) X(vkCreateWin32SurfaceKHR)
+#else
+#define VK_SURFACE_WIN32(X)
+#endif
 #define VK_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties)
 #define VK_INSTANCE(X)                                                                                       \
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures2) X(vkCreateDevice)                \
-    X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) X(vkCreateWin32SurfaceKHR)               \
+    X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) VK_SURFACE_WIN32(X)                     \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                    \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceSurfacePresentModesKHR)                          \
     X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties2)
@@ -135,6 +179,9 @@ struct Image {
     // refait toutes les EPARSE_PERIODE images tant que la source n'est pas rendue à Windows. 0 : pas prise.
     // eparse_due : image affichée à partir de laquelle la refaire.
     uint64_t eparse = 0, eparse_due = 0;
+    // mémoire taillée dans un bloc partagé (vram_prendre) : numéro du bloc, -1 : allocation propre (mem)
+    int32_t bloc = -1;
+    uint64_t moff = 0, mtaille = 0;
 };
 struct PoolBuf {
     uint64_t base = 0, size = 0;
@@ -146,6 +193,7 @@ struct PoolBuf {
 };
 struct ShaderMod {
     bool ok = false;
+    mutable bool servi = false;   // RECOMP_SHADER_USED : premier usage déjà noté au journal (voir shader_servi)
     mutable uint64_t lot = 0;   // lot de shaders (g_lot_gen) où ce shader est déjà noté : voir note_shader
     std::string hash;   // nom dans le cache (diagnostic des blocages GPU)
     VkShaderModule mod = VK_NULL_HANDLE;
@@ -188,6 +236,12 @@ struct Vk {
     bool prof = false;
     float ts_period = 1.0f;
     std::vector<std::string> qlabel;
+    std::vector<std::string> qpass;   // cible du dessin (« 2048x2048 depth only »…), « compute » pour un calcul
+    std::vector<uint64_t> qverts;     // sommets traités (count × instances)
+    std::string prof_why;   // RECOMP_GPU_PROFILE=auto : raison du déclenchement de l'image profilée
+    // RECOMP_PERF ou RECOMP_GPU_PROFILE=auto : temps GPU réel de chaque image, deux horodatages par
+    // enregistrement (début après la barrière complète de tête, fin avant vkEndCommandBuffer), par emplacement
+    VkQueryPool ftpool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;   // tampon de commandes de l'emplacement en cours (voir Slot)
     bool recording = false;
     uint64_t host_align = 4096;
@@ -293,7 +347,10 @@ struct Vk {
     std::set<std::string> missing;
     // tampons intermédiaires des envois de textures : libérés après la prochaine attente du GPU ; taille non nulle :
     // tampon de la réserve des envois de textures (transit_prendre), projeté en p, rendu à la réserve (transit_rendre)
-    struct Staging { VkBuffer b; VkDeviceMemory m; uint64_t taille = 0; uint8_t* p = nullptr; };
+    struct Staging {
+        VkBuffer b; VkDeviceMemory m; uint64_t taille = 0; uint8_t* p = nullptr;
+        uint64_t off = 0; bool arene = false;   // morceau de l'arène préchauffée (arene_prendre) : décalage dans b
+    };
     std::vector<Staging> staging;
     uint64_t staging_bytes = 0;   // octets des tampons de transit de l'enregistrement en cours (voir borner_transit)
     // données des textures rendues (tex_release) : octets gardés parce qu'un import les verrouille, réemplois d'une
@@ -321,6 +378,9 @@ struct Vk {
         std::vector<std::string> batch;         // shaders de la soumission (diagnostic des blocages)
         VkSemaphore sem_acq = VK_NULL_HANDLE;   // acquisition de l'image d'écran (présentation)
         uint64_t serial = 0;                    // valeur chronologique de sa dernière soumission (0 : jamais)
+        bool ft_written = false;                // horodatages de temps GPU écrits (relus à la réutilisation)
+        bool ft_present = false;                // dernier enregistrement d'une image (présentation)
+        uint64_t ft_frame = 0;                  // numéro de cette image
     };
     static constexpr int NSLOT = 6;
     Slot slots[NSLOT];
@@ -564,10 +624,43 @@ bool create_swapchain(HWND hwnd, VkSwapchainKHR old = VK_NULL_HANDLE) {
     std::vector<VkSurfaceFormatKHR> fmts(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.pd, g.surf, &n, fmts.data());
     VkSurfaceFormatKHR sf = fmts.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR} : fmts[0];
+#ifdef _WIN32
     for (auto& f : fmts)
         if (f.format == VK_FORMAT_B8G8R8A8_SRGB) sf = f;
+#else
+    // Linux : espace de couleur sRGB exigé. Le dernier B8G8R8A8_SRGB de la liste était pris quel que soit son espace de
+    // couleur, et le premier format offert à défaut : un bureau HDR ou KDE Wayland peut offrir ce format dans un autre
+    // espace (image trop claire, noirs gris, signalé par un joueur, issue GitHub n° 21 ; cause non confirmée). Ordre :
+    // B8G8R8A8_SRGB en sRGB, puis R8G8B8A8_SRGB en sRGB, puis le premier format en sRGB, puis le premier.
+    // RECOMP_SWAPCHAIN_ANY_COLORSPACE=1 : ancien choix. Formats offerts et choix au journal (une fois par liste).
+    if (getenv("RECOMP_SWAPCHAIN_ANY_COLORSPACE")) {
+        for (auto& f : fmts)
+            if (f.format == VK_FORMAT_B8G8R8A8_SRGB) sf = f;
+    } else {
+        int rang = 9;
+        for (auto& f : fmts) {
+            if (f.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) continue;
+            const int r = f.format == VK_FORMAT_B8G8R8A8_SRGB ? 0 : f.format == VK_FORMAT_R8G8B8A8_SRGB ? 1 : 2;
+            if (r < rang) rang = r, sf = f;
+        }
+    }
+    {
+        std::string l;
+        for (auto& f : fmts) l += (l.empty() ? "" : ", ") + std::to_string((int)f.format) + "/" + std::to_string((int)f.colorSpace);
+        static std::string vue;
+        if (l != vue) {
+            vue = l;
+            HLOG("vk", "swapchain formats (format/color space): %s; chosen %d/%d", l.c_str(), (int)sf.format, (int)sf.colorSpace);
+        }
+    }
+#endif
+#ifdef _WIN32
     RECT rc;
     GetClientRect(hwnd, &rc);
+#else
+    struct { int right, bottom; } rc{0, 0};
+    gfx_window_pixels(&rc.right, &rc.bottom);   // (Wayland : la surface prend la taille de la swapchain)
+#endif
     VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent
                                                              : VkExtent2D{(uint32_t)rc.right, (uint32_t)rc.bottom};
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -597,10 +690,16 @@ bool create_swapchain(HWND hwnd, VkSwapchainKHR old = VK_NULL_HANDLE) {
     vkGetSwapchainImagesKHR(g.dev, g.sc, &n, g.scimgs.data());
     g.scfmt = sf.format;
     g.scext = ext;
+    menu::vk::images_fenetre(g.scfmt, g.scimgs);   // menu en jeu (menu_vk.cpp) : vues des nouvelles images
     {
+#ifdef _WIN32
         DEVMODEW dm{};
         dm.dmSize = sizeof dm;
         EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm);
+#else
+        struct { unsigned dmPelsWidth, dmPelsHeight, dmDisplayFrequency; } dm{0, 0, 0};
+        gfx_window_pixels((int*)&dm.dmPelsWidth, (int*)&dm.dmPelsHeight);   // (taille de la fenêtre)
+#endif
         uint32_t npm = 0;
         vkGetPhysicalDeviceSurfacePresentModesKHR(g.pd, g.surf, &npm, nullptr);
         std::vector<VkPresentModeKHR> pms(npm);
@@ -704,6 +803,12 @@ uint64_t memoire_locale(const VkPhysicalDeviceMemoryProperties& mp) {
 // précompilation plantait. RECOMP_GPU_SET_ASIDE=<partie du nom> (essais) : écarte aussi ces cartes-là.
 bool carte_utilisable(const VkPhysicalDeviceProperties& pr) {
     if (pr.apiVersion < VK_API_VERSION_1_3 || !strncmp(pr.deviceName, "Microsoft Direct3D12", 20)) return false;
+#ifndef _WIN32
+    // Linux : rendu logiciel de Mesa (llvmpipe, type CPU), présent sur la plupart des systèmes. Il annonce la RAM
+    // comme mémoire de la carte, et le choix automatique le préférait à la carte intégrée d'un PC sans carte dédiée :
+    // pas d'image. Écarté du choix automatique (le réglage gpu peut encore le nommer).
+    if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) return false;
+#endif
     static const char* ecart = getenv("RECOMP_GPU_SET_ASIDE");
     return !(ecart && *ecart && minuscules(pr.deviceName).find(minuscules(ecart)) != std::string::npos);
 }
@@ -750,6 +855,17 @@ int choisir_carte(const std::vector<CarteVue>& cartes, bool* nommee) {
 // fonction locaux (rien de partagé avec init, qui peut tourner sur un autre fil). Pour le DLSS (dlss.cpp, carte_dlss) :
 // son mode de super résolution règle l'échelle du rendu dès la lecture des variables du moteur, avant init.
 bool carte_prevue(std::string* nom, uint32_t* fabricant) {
+#ifndef _WIN32
+    // Linux : attendre que le fil principal ait fini d'initialiser la vidéo de SDL et d'y charger Vulkan
+    // (gfx_screen_size ne revient qu'après). Sans cela, cette énumération (demandée dès la lecture des réglages du
+    // moteur quand le DLSS est choisi) tombait pendant SDL_Vulkan_LoadLibrary, et libvulkan.so.1 appelait un pointeur
+    // de fonction nul : plantage au démarrage avec le DLSS, une fois sur deux (2026-11-19 et 21, Linux Mint, pilote
+    // NVIDIA 595, X11).
+    {
+        int largeur = 0, hauteur = 0;
+        gfx_screen_size(&largeur, &hauteur);
+    }
+#endif
     HMODULE lib = LoadLibraryW(L"vulkan-1.dll");   // gardée chargée : le jeu s'en sert ensuite
     if (!lib) return false;
     const auto gipa = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(lib, "vkGetInstanceProcAddr");
@@ -792,6 +908,11 @@ bool carte_prevue(std::string* nom, uint32_t* fabricant) {
     return ok;
 }
 
+// RECOMP_VB_VRAM : sommets et index en mémoire vidéo (définis avec le dessin)
+bool vbv_actif();
+void vbw_copier();
+void vbw_oublie(uint64_t base, uint64_t size);
+extern thread_local bool t_vbw_muet;
 namespace {
 
 bool init(HWND hwnd) {
@@ -807,7 +928,15 @@ bool init(HWND hwnd) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "recomp_main";
     app.apiVersion = VK_API_VERSION_1_3;
+#ifdef _WIN32
     std::vector<const char*> iext = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#else
+    std::vector<const char*> iext;   // extensions de surface de la fenêtre SDL (X11 ou Wayland)
+    if (hwnd && !gfx_vk_extensions(iext)) {
+        HLOG("vk", "no Vulkan surface extensions from SDL");
+        return false;
+    }
+#endif
     // DLSS (dlss.cpp) : pas pour la précompilation des pipelines (sans fenêtre)
     const bool avec_dlss = hwnd && dlss::modele_demande();
     if (avec_dlss) {   // extensions d'instance demandées par NGX, s'il y en a
@@ -854,10 +983,19 @@ bool init(HWND hwnd) {
     HLOG("vk", "GPU: %s (Vulkan %u.%u, %s)", g.props.deviceName, VK_API_VERSION_MAJOR(g.props.apiVersion),
          VK_API_VERSION_MINOR(g.props.apiVersion), nommee ? "chosen in the settings" : "automatic choice");
     if (hwnd) {   // sans fenêtre : précompilation des pipelines (recomp_main --precompile)
+#ifdef _WIN32
         VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
         si.hinstance = GetModuleHandleW(nullptr);
         si.hwnd = hwnd;
         VKCHK(vkCreateWin32SurfaceKHR(g.inst, &si, nullptr, &g.surf));
+#else
+        uint64_t surf = 0;
+        if (!gfx_vk_surface((void*)g.inst, (void*)vkGetInstanceProcAddr, &surf)) {
+            HLOG("vk", "SDL_Vulkan_CreateSurface failed");
+            return false;
+        }
+        g.surf = (VkSurfaceKHR)surf;
+#endif
     }
     vkGetPhysicalDeviceQueueFamilyProperties(g.pd, &n, nullptr);
     std::vector<VkQueueFamilyProperties> qfs(n);
@@ -962,7 +1100,7 @@ bool init(HWND hwnd) {
     // mémoire globale des calculs (LDG/STG/ATOMG) : pointeurs de tampon vers les pools importés
     f12.bufferDeviceAddress = VK_TRUE;
     f12.shaderBufferInt64Atomics = VK_TRUE;
-    f12.hostQueryReset = VK_TRUE;   // profileur GPU (RECOMP_GPU_PROFILE)
+    f12.hostQueryReset = VK_TRUE;   // profileur GPU (RECOMP_GPU_PROFILE) et temps GPU des images (RECOMP_PERF)
     f12.timelineSemaphore = VK_TRUE;   // soumissions asynchrones (Vk::Slot)
     f12.pNext = &f13;
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -1072,6 +1210,12 @@ bool init(HWND hwnd) {
     HLOG("vk", "uniform buffers: alignment %llu, max size %u, %u per stage",
          (unsigned long long)g.ubo_align, p2.properties.limits.maxUniformBufferRange,
          p2.properties.limits.maxPerStageDescriptorUniformBuffers);
+    if (hwnd) {   // menu en jeu (menu.h, F1) : dessiné sur les images de la fenêtre, à la présentation
+        menu::vk::Acces acces;
+        acces.inst = g.inst, acces.pd = g.pd, acces.dev = g.dev, acces.famille = g.qf, acces.file = g.q;
+        acces.gipa = vkGetInstanceProcAddr, acces.gdpa = vkGetDeviceProcAddr, acces.en_vol = Vk::NSLOT;
+        menu::vk::init(acces);
+    }
     if (hwnd && !create_swapchain(hwnd) && !g.sc_stale) return false;
     if (!create_layouts()) return false;
     // emplacements de soumission (voir Vk::Slot) et sémaphore chronologique des soumissions
@@ -1127,10 +1271,16 @@ uint64_t import_budget() {
     static const uint64_t budget = [] {
         if (!settings().memory_saver) return (uint64_t)UINT64_MAX;   // recomp.ini : comme en 1.0.2, rien n'est rendu
         if (const char* e = getenv("RECOMP_IMPORT_MAX_MO")) return (uint64_t)strtoull(e, nullptr, 10) << 20;
+#ifdef _WIN32
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
         GlobalMemoryStatusEx(&ms);
         return (uint64_t)(ms.ullTotalPhys * 0.4);
+#else
+        struct sysinfo si{};
+        sysinfo(&si);
+        return (uint64_t)((double)si.totalram * si.mem_unit * 0.4);
+#endif
     }();
     return budget;
 }
@@ -1183,7 +1333,10 @@ PoolBuf* import_range(uint64_t base, uint64_t size, const nvn::Pool& found) {
     // pages du jeu engagées à la demande (memory.cpp) : le pilote ne verrouille que des pages engagées. Garde du noyau
     // de l'engagement à l'épinglage de la fenêtre : aucune page vide n'en est rendue à Windows entre-temps.
     MemNoyau garde;
-    if (!mem_ensure(base, size)) return refus("not enough PC memory", 0);
+    t_vbw_muet = true;   // engagement seulement : rien n'est écrit (RECOMP_VB_VRAM)
+    const bool engagee = mem_ensure(base, size);
+    t_vbw_muet = false;
+    if (!engagee) return refus("not enough PC memory", 0);
     VkMemoryHostPointerPropertiesEXT hpp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult r = vkGetMemoryHostPointerPropertiesEXT(g.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                      (void*)base, &hpp);
@@ -1376,6 +1529,7 @@ void ref_image(Image& o) {
 
 void pools_released_locked(uint64_t addr, uint64_t size) {
     if (!size) return;
+    vbw_oublie(addr, size);   // RECOMP_VB_VRAM : la mémoire sera remappée, ses copies ne valent plus rien
     // Images dont la mémoire est dans le pool : la ressource n'existe plus. Elles n'étaient jamais détruites :
     // au fil des niveaux, 6 170 images et 15 Go de textures sur une carte de 16 Go (2026-11-09) ; les créations
     // finissaient par échouer sans bruit et des textures manquaient (icônes en carrés pleins, vignettes
@@ -1588,6 +1742,14 @@ void imports_init() {
 // de quelques blocs des classes les plus lourdes (texte, code SPIR-V, flottants… : de quoi reconnaître leur
 // propriétaire, notre code ou le pilote). Le tas est verrouillé pendant le parcours : le jeu se fige une à deux
 // secondes, d'où le déclenchement seulement quand le tas a grossi de 512 Mo depuis la carte précédente.
+#ifndef _WIN32
+// Linux : pas de tas parcourable ni de carte VirtualQuery ; la mémoire du processus est dans ram_text
+void tas_histogramme() {}
+uint64_t tas_defaut_engage() { return 0; }
+void mem_map_log(uint64_t frame) {
+    HLOG("mem", "frame %llu, committed memory map: not available on Linux", (unsigned long long)frame);
+}
+#else
 void tas_histogramme() {
     const HANDLE h = GetProcessHeap();
     if (!HeapLock(h)) return;
@@ -1789,6 +1951,8 @@ void mem_map_log(uint64_t frame) {
     }
 }
 
+#endif  // _WIN32
+
 std::string ram_text() {
     PROCESS_MEMORY_COUNTERS pmc{};
     pmc.cb = sizeof pmc;
@@ -1896,6 +2060,7 @@ std::atomic<uint64_t> g_wait_us{0};   // RECOMP_PERF : attentes du GPU par le th
 // tout le travail soumis avant lui sur la file).
 void wait_serial(uint64_t val, const char* where) {
     if (!val || g.lost) return;
+    Phase ph("waiting for the graphics card to finish a submission");
     auto t0 = std::chrono::steady_clock::now();
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
@@ -2057,17 +2222,150 @@ struct TransitLibre { Vk::Staging s; uint64_t vu; };
 std::vector<TransitLibre> g_transit_libres;
 uint64_t g_transit_reserve = 0, g_transit_crees = 0, g_transit_repris = 0;
 constexpr uint64_t TRANSIT_RESERVE_MAX = 128ull << 20, TRANSIT_CLASSE_MAX = 64ull << 20;
+// Réserve agrandie (2026-11-18, run 22) : un changement de scène envoie 200 à 300 Mo d'un coup ; avec 128 Mo de réserve
+// et les tampons de plus de 64 Mo créés puis détruits à chaque envoi, l'essentiel des envois écrivait dans de la
+// mémoire neuve (désentrelacement 34 à 57 ms quel que soit le nombre de fils) et vkFreeMemory coûtait jusqu'à 31 ms.
+// Au niveau de mémoire 0 (plus de 5 Go validables libres) : réserve de 512 Mo, classes jusqu'à 256 Mo, tampons gardés
+// 10 min sans resservir (600 images avant : la réserve était vide au chargement suivant). Niveaux 1 et 2 : inchangés.
+// RECOMP_STAGING_POOL_MB=n : réserve de n Mo au niveau 0 (128 : comportement d'avant pour la taille).
+constexpr uint64_t TRANSIT_CLASSE_ABS = 256ull << 20;
+uint64_t transit_reserve_n0() {
+    static const uint64_t v = [] {
+        return (uint64_t)std::max(0, settings().staging_pool_mb) << 20;   // recomp.ini ou RECOMP_STAGING_POOL_MB
+    }();
+    return v;
+}
 // Mémoire validable libre du PC, relevée toutes les 60 images (memory_saver) : 0 au-delà de 5 Go, 1 sous 5 Go, 2 sous
 // 3 Go — les mêmes seuils que le cache des images sans objet. Les parties de l'utilisateur tournent souvent au niveau
 // 1 (≈ 2 à 3 Go libres en jeu) : à ce niveau, la réserve et la file des rendus différés sont réduites, pas vidées.
 int g_memoire_niveau = 0;
-uint64_t transit_reserve_max() { return g_memoire_niveau >= 2 ? 0 : g_memoire_niveau == 1 ? 64ull << 20 : TRANSIT_RESERVE_MAX; }
+uint64_t arene_octets();
+// Hystérésis (2026-11-20, revue de la PR) : le niveau descend dès que la mémoire libre passe sous un seuil, mais ne
+// remonte qu'avec une marge au-dessus : 3,5 Go pour quitter le niveau 2 ; pour revenir au niveau 0, 5 Go plus la taille
+// de l'arène de transit plus 0,25 Go. Sans marge, près de 5 Go, l'arène se recréait (512 Mo pris), faisait repasser le
+// PC sous 5 Go, était détruite, et ainsi de suite toutes les ~10 s ; la réserve de tampons changeait de taille avec.
+// Avec la marge, l'arène recréée laisse encore au moins 5,25 Go libres. RECOMP_MEM_NO_HYSTERESIS=1 : sans marge.
+void memoire_niveau_suivre(double libre) {
+    static const bool sans_marge = getenv("RECOMP_MEM_NO_HYSTERESIS") != nullptr;
+    const int brut = libre < 3.0 ? 2 : libre < 5.0 ? 1 : 0;
+    if (sans_marge || brut >= g_memoire_niveau) {
+        g_memoire_niveau = brut;
+        return;
+    }
+    int n = g_memoire_niveau;
+    if (n == 2 && libre >= 3.5) n = 1;
+    if (n == 1 && libre >= 5.25 + arene_octets() / 1073741824.0) n = 0;
+    g_memoire_niveau = n;
+}
+uint64_t transit_reserve_max() { return g_memoire_niveau >= 2 ? 0 : g_memoire_niveau == 1 ? 64ull << 20 : transit_reserve_n0(); }
+uint64_t transit_classe_max() { return g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? TRANSIT_CLASSE_ABS : TRANSIT_CLASSE_MAX; }
+uint64_t transit_garde() { return g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? 36000 : 600; }
+
+// Arène de transit préchauffée (E, 2026-11-18, run 26). Les envois vers un tampon de transit neuf payaient une faute de
+// page par page de 4 Ko au premier contact (92 448 fautes pour 302 Mo au chargement de 31 s ; 97 % du temps des fils
+// du désentrelacement sur le processeur) : 0,22 ms/Mo contre 0,13 en tampon repris. Au niveau de mémoire 0, un tampon
+// unique de 512 Mo est créé dès la première image, et un fil de fond en touche chaque page avant qu'il serve ; les
+// envois y prennent un morceau (grain de 64 Ko, meilleur ajustement, trous voisins fusionnés au retour), et la réserve
+// d'avant ne sert plus que quand l'arène est pleine. L'arène est détruite (si vide) sous 5 Go validables libres ou quand
+// Windows refuse de la mémoire, et recréée 600 images au plus tôt après le retour au niveau 0.
+// RECOMP_NO_STAGING_ARENA=1 : pas d'arène ; RECOMP_STAGING_ARENA_MB=n : taille.
+struct AreneTransit {
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    uint8_t* p = nullptr;
+    uint64_t taille = 0, pris = 0, detruite = 0;
+    std::map<uint64_t, uint64_t> trous;   // décalage → longueur
+    std::atomic<bool> pret{false};
+    bool echec = false;
+};
+AreneTransit g_arene;
+constexpr uint64_t ARENE_GRAIN = 64ull << 10;
+uint64_t arene_octets() {
+    static const uint64_t v = [] {
+        // recomp.ini (staging_arena_mb) ou RECOMP_STAGING_ARENA_MB / RECOMP_NO_STAGING_ARENA : -1 auto (512 Mo), 0 aucune
+        const int mo = settings().staging_arena_mb;
+        return (uint64_t)(mo < 0 ? 512ull : (uint64_t)mo) << 20;
+    }();
+    return v;
+}
+void arene_creer() {
+    const uint64_t t = arene_octets();
+    if (g_arene.b || g_arene.echec || !t || g_memoire_niveau != 0) return;
+    if (g_arene.detruite && g.cur_frame < g_arene.detruite + 600) return;
+    VkBuffer b;
+    VkDeviceMemory m;
+    if (!make_buffer(t, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     &b, &m)) {
+        g_arene.echec = true;
+        HLOG("vk", "texture staging arena: %llu MB refused by the driver, pool only", (unsigned long long)(t >> 20));
+        return;
+    }
+    uint8_t* p = nullptr;
+    if (vkMapMemory(g.dev, m, 0, VK_WHOLE_SIZE, 0, (void**)&p) != VK_SUCCESS || !p) {
+        vkDestroyBuffer(g.dev, b, nullptr);
+        vkFreeMemory(g.dev, m, nullptr);
+        g_arene.echec = true;
+        return;
+    }
+    g_arene.b = b, g_arene.m = m, g_arene.p = p, g_arene.taille = t, g_arene.pris = 0;
+    g_arene.trous.clear();
+    g_arene.trous[0] = t;
+    g_arene.pret = false;
+    std::thread([p, t] {   // préchauffage : une écriture par page, hors du fil du GPU
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const auto t0 = std::chrono::steady_clock::now();
+        volatile uint8_t* q = p;
+        for (uint64_t o = 0; o < t; o += 4096) q[o] = 0;
+        g_arene.pret.store(true, std::memory_order_release);
+        HLOG("vk", "texture staging arena: %llu MB ready (pages touched in %.0f ms, off the GPU thread)",
+             (unsigned long long)(t >> 20), hz_ns(t0) / 1e6);
+    }).detach();
+}
+void arene_detruire() {
+    if (!g_arene.b || !g_arene.pret.load(std::memory_order_acquire) || g_arene.pris) return;
+    vkDestroyBuffer(g.dev, g_arene.b, nullptr);
+    vkFreeMemory(g.dev, g_arene.m, nullptr);
+    g_arene.b = VK_NULL_HANDLE, g_arene.m = VK_NULL_HANDLE, g_arene.p = nullptr;
+    g_arene.trous.clear();
+    g_arene.detruite = g.cur_frame;
+    HLOG("vk", "texture staging arena released (less than 5 GB of commit free or memory refused)");
+}
+bool arene_prendre(uint64_t octets, Vk::Staging* st) {
+    if (!g_arene.b || !g_arene.pret.load(std::memory_order_acquire)) return false;
+    const uint64_t n = (octets + ARENE_GRAIN - 1) & ~(ARENE_GRAIN - 1);
+    auto best = g_arene.trous.end();
+    for (auto it = g_arene.trous.begin(); it != g_arene.trous.end(); ++it)
+        if (it->second >= n && (best == g_arene.trous.end() || it->second < best->second)) best = it;
+    if (best == g_arene.trous.end()) return false;
+    const uint64_t off = best->first, len = best->second;
+    g_arene.trous.erase(best);
+    if (len > n) g_arene.trous[off + n] = len - n;
+    g_arene.pris += n;
+    st->b = g_arene.b, st->m = VK_NULL_HANDLE, st->p = g_arene.p + off, st->taille = n, st->off = off;
+    st->arene = true;
+    return true;
+}
+void arene_rendre(const Vk::Staging& x) {
+    g_arene.pris -= x.taille;
+    uint64_t off = x.off, len = x.taille;
+    auto nx = g_arene.trous.lower_bound(off);
+    if (nx != g_arene.trous.end() && off + len == nx->first) len += nx->second, nx = g_arene.trous.erase(nx);
+    if (nx != g_arene.trous.begin()) {
+        auto pv = std::prev(nx);
+        if (pv->first + pv->second == off) {
+            pv->second += len;
+            return;
+        }
+    }
+    g_arene.trous[off] = len;
+}
 
 bool transit_prendre(uint64_t octets, Vk::Staging* st) {
     static const bool sans = getenv("RECOMP_NO_STAGING_POOL") != nullptr;
+    if (arene_prendre(octets, st)) return true;
     uint64_t taille = 64ull << 10;
     while (taille < octets) taille <<= 1;
-    if (sans || taille > TRANSIT_CLASSE_MAX) taille = octets;   // tampon à part
+    if (sans || taille > transit_classe_max()) taille = octets;   // tampon à part
     else
         for (size_t i = g_transit_libres.size(); i-- > 0;)
             if (g_transit_libres[i].s.taille == taille) {
@@ -2083,6 +2381,16 @@ bool transit_prendre(uint64_t octets, Vk::Staging* st) {
         return false;
     st->taille = taille;
     st->p = nullptr;
+    static bool dit = false;   // type de mémoire des tampons de transit, une fois (mise en cache ou combinée en écriture)
+    if (!dit) {
+        dit = true;
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(g.dev, st->b, &mr);
+        const uint32_t t = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        HLOG("vk", "texture staging: memory type %u (properties 0x%x), pool up to %llu MB, classes up to %llu MB", t,
+             t < g.memprops.memoryTypeCount ? (unsigned)g.memprops.memoryTypes[t].propertyFlags : 0u,
+             (unsigned long long)(transit_reserve_max() >> 20), (unsigned long long)(transit_classe_max() >> 20));
+    }
     if (vkMapMemory(g.dev, st->m, 0, VK_WHOLE_SIZE, 0, (void**)&st->p) != VK_SUCCESS || !st->p) {
         vkDestroyBuffer(g.dev, st->b, nullptr);
         vkFreeMemory(g.dev, st->m, nullptr);
@@ -2095,7 +2403,11 @@ bool transit_prendre(uint64_t octets, Vk::Staging* st) {
 // Tampon de transit que le GPU a fini de lire : à la réserve si c'en est un et qu'il y a la place, sinon détruit
 void transit_rendre(const Vk::Staging& x) {
     static const bool sans = getenv("RECOMP_NO_STAGING_POOL") != nullptr;
-    if (!sans && x.taille && x.taille <= TRANSIT_CLASSE_MAX && (x.taille & (x.taille - 1)) == 0 &&
+    if (x.arene) {
+        arene_rendre(x);
+        return;
+    }
+    if (!sans && x.taille && x.taille <= TRANSIT_CLASSE_ABS && (x.taille & (x.taille - 1)) == 0 &&
         g_transit_reserve + x.taille <= transit_reserve_max()) {
         g_transit_libres.push_back({x, g.cur_frame});
         g_transit_reserve += x.taille;
@@ -2112,10 +2424,12 @@ void transit_tailler() {
     const int pression = mem_pression();
     const bool tout = pression != pression_vue || g_memoire_niveau >= 2;
     pression_vue = pression;
+    if (tout || g_memoire_niveau >= 1) arene_detruire();
+    else arene_creer();
     if (g_transit_libres.empty() || (!tout && g.cur_frame % 60)) return;
     for (size_t i = g_transit_libres.size(); i-- > 0;) {
         const TransitLibre& t = g_transit_libres[i];
-        if (!tout && g.cur_frame < t.vu + 600 && g_transit_reserve <= transit_reserve_max()) continue;
+        if (!tout && g.cur_frame < t.vu + transit_garde() && g_transit_reserve <= transit_reserve_max()) continue;
         vkDestroyBuffer(g.dev, t.s.b, nullptr);
         vkFreeMemory(g.dev, t.s.m, nullptr);
         g_transit_reserve -= t.s.taille;
@@ -2166,6 +2480,164 @@ void tex_write(uint32_t binding, uint32_t element, VkDescriptorType type, const 
     if (!groupe) flush_tex_writes();
 }
 
+// ---- temps GPU réel de chaque image (RECOMP_PERF, RECOMP_GPU_PROFILE=auto)
+// Somme des durées GPU des enregistrements de l'image (début : après la barrière complète de tête, donc après
+// le travail précédent ; fin : dernière commande). Les trous entre enregistrements (GPU sans travail) ne
+// comptent pas : c'est le temps où la carte est occupée par l'image, copies et effacements compris.
+// Relu sans attente à la réutilisation de l'emplacement (le GPU l'a fini) : bilan en retard de quelques images.
+struct FtAcc {
+    double sum = 0, mx = 0;
+    int n = 0, slow = 0;
+};
+FtAcc g_ft;                    // fenêtre de la ligne [perf]
+double g_ft_cur = 0;           // image en cours de bilan
+double g_ft_last = 0;          // dernière image complète (ms GPU)
+uint64_t g_ft_last_frame = 0;  // son numéro
+bool gpu_profile_auto() {
+    static const bool on = getenv("RECOMP_GPU_PROFILE") && !strcmp(getenv("RECOMP_GPU_PROFILE"), "auto");
+    return on;
+}
+bool ft_enabled() {
+    static const bool on = getenv("RECOMP_PERF") || gpu_profile_auto();
+    return on;
+}
+double frame_budget_ms() { return 1000.0 / std::max(1, settings().refresh_rate); }
+void ft_collect(Vk::Slot& s) {
+    if (!s.ft_written) return;
+    s.ft_written = false;
+    uint64_t ts[2] = {};
+    const uint32_t q = 2 * (uint32_t)(&s - g.slots);
+    if (vkGetQueryPoolResults(g.dev, g.ftpool, q, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        ts[1] > ts[0])
+        g_ft_cur += (ts[1] - ts[0]) * g.ts_period * 1e-6;
+    if (!s.ft_present) return;
+    g_ft_last = g_ft_cur, g_ft_last_frame = s.ft_frame, g_ft_cur = 0;
+    g_ft.sum += g_ft_last, g_ft.mx = std::max(g_ft.mx, g_ft_last), g_ft.n++;
+    if (g_ft_last > frame_budget_ms()) g_ft.slow++;
+}
+// en tête d'enregistrement, l'emplacement étant fini sur le GPU (begin_frame)
+void ft_start() {
+    if (!ft_enabled()) return;
+    if (!g.ftpool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * Vk::NSLOT;
+        if (vkCreateQueryPool(g.dev, &qi, nullptr, &g.ftpool) != VK_SUCCESS) {
+            g.ftpool = VK_NULL_HANDLE;
+            return;
+        }
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(g.pd, &pp);
+        g.ts_period = pp.limits.timestampPeriod;
+        vkResetQueryPool(g.dev, g.ftpool, 0, 2 * Vk::NSLOT);
+    }
+    Vk::Slot& s = g.slots[g.slot];
+    ft_collect(s);
+    vkResetQueryPool(g.dev, g.ftpool, 2 * (uint32_t)g.slot, 2);
+    vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.ftpool, 2 * (uint32_t)g.slot);
+    s.ft_written = true;
+    s.ft_present = false;
+}
+// avant vkEndCommandBuffer ; present : dernier enregistrement de l'image `frame`
+void ft_end(bool present, uint64_t frame) {
+    Vk::Slot& s = g.slots[g.slot];
+    if (!g.ftpool || !s.ft_written) return;
+    vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.ftpool, 2 * (uint32_t)g.slot + 1);
+    s.ft_present = present;
+    s.ft_frame = frame;
+}
+
+// ---- blocs de mémoire vidéo des textures (2026-11-18, runs 22-24)
+// Un vkAllocateMemory par image coûtait ≈ 0,1 à 2 ms (5 à 28 ms par changement de scène, 82 images à ≈ 48 s). Les
+// textures du jeu (packagées ou compressées, 16 Mo au plus) sont taillées dans des blocs de 64 Mo : premier trou
+// assez grand, trous voisins fusionnés au retour ; un seul bloc vide est gardé. RECOMP_NO_IMAGE_BLOCKS=1 : une
+// allocation par image, comme avant.
+constexpr uint64_t VRAM_BLOC = 64ull << 20, VRAM_BLOC_IMAGE_MAX = 16ull << 20;
+struct BlocVram {
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint32_t type = 0;
+    uint64_t utilise = 0;
+    std::map<uint64_t, uint64_t> trous;   // décalage → taille
+};
+std::vector<BlocVram> g_blocs_vram;
+uint64_t g_blocs_vram_n = 0;
+bool vram_prendre(uint32_t type, uint64_t taille, uint64_t align, VkDeviceMemory* mem, int32_t* bloc, uint64_t* off) {
+    align = std::max<uint64_t>(1, align);
+    auto essayer = [&](size_t i) {
+        BlocVram& b = g_blocs_vram[i];
+        if (!b.mem || b.type != type) return false;
+        for (auto it = b.trous.begin(); it != b.trous.end(); ++it) {
+            const uint64_t d = (it->first + align - 1) / align * align;
+            if (d + taille > it->first + it->second) continue;
+            const uint64_t t0 = it->first, fin = it->first + it->second;
+            b.trous.erase(it);
+            if (d > t0) b.trous[t0] = d - t0;
+            if (d + taille < fin) b.trous[d + taille] = fin - (d + taille);
+            b.utilise += taille;
+            *mem = b.mem, *bloc = (int32_t)i, *off = d;
+            return true;
+        }
+        return false;
+    };
+    for (size_t i = 0; i < g_blocs_vram.size(); i++)
+        if (essayer(i)) return true;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = VRAM_BLOC;
+    ai.memoryTypeIndex = type;
+    BlocVram nb;
+    nb.type = type;
+    if (vkAllocateMemory(g.dev, &ai, nullptr, &nb.mem) != VK_SUCCESS) return false;
+    nb.trous[0] = VRAM_BLOC;
+    size_t i = 0;
+    while (i < g_blocs_vram.size() && g_blocs_vram[i].mem) i++;
+    if (i == g_blocs_vram.size()) g_blocs_vram.push_back(nb);
+    else g_blocs_vram[i] = nb;
+    if (g_blocs_vram_n++ == 0) HLOG("vk", "texture video memory: blocks of %llu MB (images up to %llu MB)",
+                                    (unsigned long long)(VRAM_BLOC >> 20), (unsigned long long)(VRAM_BLOC_IMAGE_MAX >> 20));
+    return essayer(i);
+}
+void vram_rendre(int32_t bloc, uint64_t off, uint64_t taille) {
+    if (bloc < 0 || (size_t)bloc >= g_blocs_vram.size() || !g_blocs_vram[bloc].mem) return;
+    BlocVram& b = g_blocs_vram[bloc];
+    b.utilise -= std::min(b.utilise, taille);
+    auto it = b.trous.emplace(off, taille).first;
+    auto suiv = std::next(it);
+    if (suiv != b.trous.end() && it->first + it->second == suiv->first) it->second += suiv->second, b.trous.erase(suiv);
+    if (it != b.trous.begin()) {
+        auto prec = std::prev(it);
+        if (prec->first + prec->second == it->first) prec->second += it->second, b.trous.erase(it);
+    }
+    if (b.utilise == 0) {   // bloc vide : rendu s'il en reste un autre vide du même type
+        for (size_t i = 0; i < g_blocs_vram.size(); i++)
+            if ((int32_t)i != bloc && g_blocs_vram[i].mem && g_blocs_vram[i].type == b.type && g_blocs_vram[i].utilise == 0) {
+                vkFreeMemory(g.dev, b.mem, nullptr);
+                b = BlocVram{};
+                return;
+            }
+    }
+}
+// Blocs vides gardés (un par type) rendus quand la mémoire manque (2026-11-20, revue de la PR) : moins de 3 Go
+// validables libres, mémoire vidéo au-delà de 85 % de son budget, ou mémoire refusée au jeu (fin_image). Ils étaient
+// gardés en toutes circonstances. Un bloc entamé reste : le rendre demanderait de déplacer ses images.
+// RECOMP_IMAGE_BLOCKS_KEEP=1 : les blocs vides restent gardés, comme avant.
+void vram_blocs_vides_rendre(const char* raison) {
+    static const bool garder = getenv("RECOMP_IMAGE_BLOCKS_KEEP") != nullptr;
+    if (garder) return;
+    unsigned n = 0;
+    for (BlocVram& b : g_blocs_vram)
+        if (b.mem && b.utilise == 0) {
+            vkFreeMemory(g.dev, b.mem, nullptr);
+            b = BlocVram{};
+            n++;
+        }
+    static unsigned journal = 0;
+    if (n && journal < 20) {
+        journal++;
+        HLOG("vk", "texture video memory: %u empty block(s) of %llu MB released (%s)", n,
+             (unsigned long long)(VRAM_BLOC >> 20), raison);
+    }
+}
+
 void begin_frame() {
     if (g.recording) return;
     free_done_staging();
@@ -2183,7 +2655,8 @@ void begin_frame() {
                 if (v) vkDestroyImageView(g.dev, v, nullptr);
             if (im.view) vkDestroyImageView(g.dev, im.view, nullptr);
             if (im.img) vkDestroyImage(g.dev, im.img, nullptr);
-            if (im.mem) vkFreeMemory(g.dev, im.mem, nullptr);
+            if (im.bloc >= 0) vram_rendre(im.bloc, im.moff, im.mtaille);
+            else if (im.mem) vkFreeMemory(g.dev, im.mem, nullptr);
             g.dead_images.erase(g.dead_images.begin() + i);
         }
     }
@@ -2217,6 +2690,8 @@ void begin_frame() {
     // Les soumissions s'exécutaient une à une (attente du GPU entre elles) : une barrière complète en tête
     // garde cet ordre sur le GPU (sa première portée couvre tout le travail soumis avant sur la file).
     barrier_all();
+    if (vbv_actif()) vbw_copier();   // RECOMP_VB_VRAM : morceaux demandés, avant tout dessin
+    ft_start();   // RECOMP_PERF : temps GPU de l'image (après la barrière : le travail précédent est fini)
     if (!g.dummies) fill_dummy_descriptors();
 }
 
@@ -2380,6 +2855,93 @@ void deswizzle_level(const uint8_t* src, uint8_t* dst, uint32_t wbytes, uint32_t
     deswizzle_lignes(src, dst, wbytes, bh, std::max(y, ya), y1);   // fin d'une bande
 }
 
+// Envoi « dans l'ordre de la source » (2026-11-18, runs 23-24) : un travail = un morceau de 1 Mo de la source (celui de
+// l'empreinte) ; chaque GOB est lu une seule fois, recopié vers ses 8 lignes (écritures non temporelles de 64 o quand
+// la destination est alignée) puis ajouté à l'empreinte du morceau tant qu'il est dans le cache L1. Avant : bandes de
+// lignes désentrelacées, puis une seconde lecture complète de la source pour l'empreinte ; la mémoire était le
+// facteur limitant (runs 23-24 : ≈ 0,15 à 0,23 ms/Mo sur 4 fils, quel que soit le type mémoire du tampon). Banc
+// d'essai, 320 Mo sur 4 fils : 56 → 31 ms, mêmes octets et mêmes empreintes. RECOMP_DESWIZZLE_OLD=1 : ancien chemin.
+struct Hacheur {   // hash_bloc par étapes (mêmes résultats) : suite() par multiples de 32 octets, fin() pour le reste
+    uint64_t h;
+    explicit Hacheur(uint64_t n) : h(0x9E3779B97F4A7C15ull ^ n) {}
+    inline void suite(const uint8_t* p, uint64_t n) {
+        uint64_t a, b, c, d;
+        for (uint64_t i = 0; i < n; i += 32) {
+            memcpy(&a, p + i, 8), memcpy(&b, p + i + 8, 8), memcpy(&c, p + i + 16, 8), memcpy(&d, p + i + 24, 8);
+            h = (h ^ (a * 0x87C37B91114253D5ull)) * 0x4CF5AD432745937Full;
+            h = (h ^ (b * 0x52DCE729DA3ED6A5ull)) * 0x87C37B91114253D5ull;
+            h = (h ^ (c * 0x4CF5AD432745937Full)) * 0x52DCE729DA3ED6A5ull;
+            h = (h ^ (d * 0x9E3779B97F4A7C15ull)) * 0x4CF5AD432745937Full;
+            h ^= h >> 29;
+        }
+    }
+    uint64_t fin(const uint8_t* p, uint64_t n) {
+        for (uint64_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+        return h ^ (h >> 31);
+    }
+};
+struct RegionBL { uint64_t soff, taille; uint8_t* dst; uint32_t wbytes, rows, bh; };   // un niveau d'une couche
+inline void gob_vers_lignes(const RegionBL& R, const uint8_t* q, uint32_t x, uint32_t y, bool nt) {
+    if (y >= R.rows) return;   // lignes de remplissage du dernier bloc
+    const uint32_t nr = std::min<uint32_t>(8, R.rows - y);
+    static const uint32_t YO[8] = {0, 16, 32, 48, 128, 144, 160, 176};   // ligne r du GOB (bits y0 → 4, y1 → 5, y2 → 7)
+    uint8_t* d = R.dst + (uint64_t)y * R.wbytes + x;
+    if (x + 64 <= R.wbytes) {
+        for (uint32_t r = 0; r < nr; r++, d += R.wbytes) {
+            const uint8_t* s = q + YO[r];   // octets x[0..15] / [16..31] / [32..47] / [48..63] : +0, +64, +256, +320
+            const __m256i a = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)s)),
+                                                      _mm_loadu_si128((const __m128i*)(s + 64)), 1);
+            const __m256i b = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*)(s + 256))),
+                                                      _mm_loadu_si128((const __m128i*)(s + 320)), 1);
+            if (nt) {
+                _mm256_stream_si256((__m256i*)d, a);
+                _mm256_stream_si256((__m256i*)(d + 32), b);
+            } else {
+                _mm256_storeu_si256((__m256i*)d, a);
+                _mm256_storeu_si256((__m256i*)(d + 32), b);
+            }
+        }
+    } else {   // fin de ligne de moins de 64 octets
+        static const uint32_t PO[4] = {0, 64, 256, 320};
+        for (uint32_t r = 0; r < nr; r++, d += R.wbytes)
+            for (uint32_t i = 0; i < 4 && x + 16 * i < R.wbytes; i++)
+                memcpy(d + 16 * i, q + YO[r] + PO[i], std::min<uint32_t>(16, R.wbytes - x - 16 * i));
+    }
+}
+// Morceau [m0, m1) de la source (offsets depuis src) : désentrelacé vers les régions qu'il recouvre (triées, disjointes,
+// commençant sur un GOB), empreinte hash_bloc(src + m0, m1 − m0) rendue.
+uint64_t envoi_morceau_source(const uint8_t* src, const RegionBL* rg, size_t nrg, uint64_t m0, uint64_t m1) {
+    Hacheur H(m1 - m0);
+    uint64_t o = m0;
+    bool nt_fait = false;
+    for (size_t i = 0; i < nrg && o < m1; i++) {
+        const RegionBL& R = rg[i];
+        const uint64_t a = std::max(o, R.soff), b = std::min(m1, R.soff + R.taille);
+        if (a >= b) continue;
+        if (a > o) H.suite(src + o, a - o);   // entre deux couches : empreinte seulement
+        const uint64_t wg = (R.wbytes + 63) / 64, col = 512ull * R.bh, lb = wg * col;
+        const bool nt = (R.wbytes % 64) == 0 && ((uintptr_t)R.dst % 64) == 0;
+        nt_fait |= nt;
+        const uint64_t rel = a - R.soff;
+        uint32_t br = (uint32_t)(rel / lb), c = (uint32_t)(rel % lb / col), gg = (uint32_t)(rel % col / 512);
+        for (uint64_t off = a; off < b; off += 512) {   // GOB par GOB, dans l'ordre de la source
+            const uint8_t* q = src + off;
+            gob_vers_lignes(R, q, c * 64, br * 8 * R.bh + gg * 8, nt);
+            H.suite(q, 512);
+            if (++gg == R.bh) {
+                gg = 0;
+                if (++c == wg) c = 0, br++;
+            }
+        }
+        o = b;
+    }
+    const uint64_t r = (m1 - o) & ~31ull;
+    H.suite(src + o, r);
+    o += r;
+    if (nt_fait) _mm_sfence();   // écritures non temporelles visibles avant la copie par le GPU
+    return H.fin(src + o, m1 - o);
+}
+
 // Captures de cibles de rendu (RECOMP_RT_SNAPSHOT) : relues après l'attente du GPU.
 struct Readback {
     VkBuffer b;
@@ -2409,39 +2971,89 @@ int prof_begin() {
     vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.qpool, (uint32_t)q);
     return q;
 }
-void prof_end(int q, const std::string& label) {
+void prof_end(int q, const std::string& label, const std::string& pass = "compute", uint64_t verts = 0) {
     if (q < 0) return;
     vkCmdWriteTimestamp2(g.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g.qpool, (uint32_t)q + 1);
     g.qlabel.push_back(label);
+    g.qpass.push_back(pass);
+    g.qverts.push_back(verts);
 }
-// à la présentation, après l'attente du GPU : bilan de l'image profilée, puis armement de la suivante
-void prof_frame(uint64_t frame) {
-    static const long pf = getenv("RECOMP_GPU_PROFILE") ? atol(getenv("RECOMP_GPU_PROFILE")) : -1;
-    if (pf < 0) return;
+// à la présentation, après l'attente du GPU : bilan de l'image profilée, puis armement de la suivante.
+// RECOMP_GPU_PROFILE=N : l'image N ; RECOMP_GPU_PROFILE=auto : l'image qui suit une image lente (temps GPU au-delà
+// d'une période d'écran, ou acquisition de l'image d'écran au-delà d'une demi-période), 100 fois au plus, 5 s d'écart
+// (un profil toutes les 5 s pendant tout un creux, au lieu des seuls premiers).
+void prof_frame(uint64_t frame, double acquire_ms) {
+    static const char* pe = getenv("RECOMP_GPU_PROFILE");
+    static const bool autom = gpu_profile_auto();
+    static const long pf = pe && !autom ? atol(pe) : -1;
+    if (pf < 0 && !autom) return;
     if (g.prof) {
         g.prof = false;
         std::vector<uint64_t> ts(g.qn, 0);
         if (g.qn && vkGetQueryPoolResults(g.dev, g.qpool, 0, g.qn, ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT) ==
                         VK_SUCCESS) {
-            std::map<std::string, std::pair<double, int>> acc;
+            struct Acc {
+                double ms = 0;
+                int n = 0;
+                uint64_t verts = 0;
+            };
+            std::map<std::string, Acc> acc, pass;
             double total = 0;
+            uint64_t t0 = ~0ull, t1 = 0;   // premier début, dernière fin
             for (size_t k = 0; k < g.qlabel.size() && 2 * k + 1 < ts.size(); k++) {
                 const double ms = ts[2 * k + 1] > ts[2 * k] ? (ts[2 * k + 1] - ts[2 * k]) * g.ts_period * 1e-6 : 0.0;
+                if (ts[2 * k] && ts[2 * k + 1] > ts[2 * k]) t0 = std::min(t0, ts[2 * k]), t1 = std::max(t1, ts[2 * k + 1]);
+                const uint64_t nv = k < g.qverts.size() ? g.qverts[k] : 0;
                 auto& a = acc[g.qlabel[k]];
-                a.first += ms, a.second++;
+                a.ms += ms, a.n++, a.verts += nv;
+                auto& p = pass[k < g.qpass.size() ? g.qpass[k] : std::string("?")];
+                p.ms += ms, p.n++, p.verts += nv;
                 total += ms;
             }
-            std::vector<std::pair<double, std::string>> v;
-            for (auto& [l, a] : acc) v.push_back({a.first, l + " ×" + std::to_string(a.second)});
-            std::sort(v.rbegin(), v.rend());
-            HLOG("gpuprof", "frame %llu: %zu draws / computes measured, %.2f ms GPU in total", (unsigned long long)frame,
-                 g.qlabel.size(), total);
+            auto liste = [](const std::map<std::string, Acc>& m) {
+                std::vector<std::pair<double, std::string>> v;
+                for (auto& [l, a] : m) {
+                    char b[64];
+                    snprintf(b, sizeof b, " ×%d", a.n);
+                    std::string t = l + b;
+                    if (a.verts) snprintf(b, sizeof b, ", %.0fk vertices", a.verts / 1000.0), t += b;
+                    v.push_back({a.ms, t});
+                }
+                std::sort(v.rbegin(), v.rend());
+                return v;
+            };
+            const auto v = liste(acc), vp = liste(pass);
+            // span : du premier dessin au dernier ; l'écart avec le total = copies, effacements, barrières, attentes
+            HLOG("gpuprof", "frame %llu%s: %zu draws / computes measured, %.2f ms GPU in total, span %.2f ms",
+                 (unsigned long long)frame, g.prof_why.c_str(), g.qlabel.size(), total,
+                 t1 > t0 ? (t1 - t0) * g.ts_period * 1e-6 : 0.0);
             for (size_t k = 0; k < v.size() && k < 30; k++)
                 HLOG("gpuprof", "  %6.2f ms  %4.1f %%  %s", v[k].first, total > 0 ? 100.0 * v[k].first / total : 0.0,
                      v[k].second.c_str());
+            for (size_t k = 0; k < vp.size() && k < 12; k++)   // par cible : passes d'ombres, prépasse, rendu principal…
+                HLOG("gpuprof", "  target %6.2f ms  %4.1f %%  %s", vp[k].first, total > 0 ? 100.0 * vp[k].first / total : 0.0,
+                     vp[k].second.c_str());
         }
     }
-    if ((long)frame + 1 == pf) {
+    bool arm = (long)frame + 1 == pf;
+    if (autom) {
+        constexpr int MAXCAP = 100;
+        static int ncap = 0;
+        static std::chrono::steady_clock::time_point last{};
+        const auto now = std::chrono::steady_clock::now();
+        const double budget = frame_budget_ms();
+        const bool slow_gpu = g_ft_last > budget && g_ft_last_frame + 8 >= frame;   // bilan récent (en retard)
+        const bool slow_acq = acquire_ms > budget * 0.5;
+        if ((slow_gpu || slow_acq) && ncap < MAXCAP && (!ncap || now - last > std::chrono::seconds(5))) {
+            ncap++, last = now, arm = true;
+            char b[256];
+            snprintf(b, sizeof b, " (auto %d/%d after frame %llu: GPU %.2f ms of frame %llu, acquire %.2f ms, budget %.2f ms)",
+                     ncap, MAXCAP, (unsigned long long)frame, g_ft_last, (unsigned long long)g_ft_last_frame, acquire_ms,
+                     budget);
+            g.prof_why = b;
+        }
+    }
+    if (arm) {
         if (!g.qpool) {
             VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -2454,6 +3066,8 @@ void prof_frame(uint64_t frame) {
         vkResetQueryPool(g.dev, g.qpool, 0, QMAX);
         g.qn = 0;
         g.qlabel.clear();
+        g.qpass.clear();
+        g.qverts.clear();
         g.prof = true;
     }
 }
@@ -2572,6 +3186,7 @@ void free_staging() {   // après une attente de la barrière du GPU
 // centaines de fois par changement de scène. lancer(n, f) exécute f(0) … f(n − 1) sur les fils et sur l'appelant et
 // rend la main quand tout est fait ; un lot à la fois, jamais depuis un travail d'un lot. Un fil qui se réveille en
 // retard ne peut prendre aucun travail d'un autre lot que le sien (numéro du lot dans le compteur des prises).
+unsigned nb_ouvriers();   // fils du désentrelacement (plus bas)
 struct Ouvriers {
     std::mutex appel, mx;
     std::condition_variable cv_lot, cv_fin;
@@ -2611,7 +3226,7 @@ struct Ouvriers {
         std::lock_guard<std::mutex> a(appel);
         if (!partis) {
             partis = true;
-            const unsigned nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
+            const unsigned nt = nb_ouvriers();
             for (unsigned t = 1; t < nt; t++) std::thread([this] { boucle(); }).detach();
         }
         uint32_t lt;
@@ -2627,6 +3242,22 @@ struct Ouvriers {
         cv_fin.wait(lk, [&] { return restants.load() == 0; });
     }
 };
+// Fils du désentrelacement et des empreintes (le fil appelant compris). Jusqu'au 2026-11-17 : la moitié des fils du
+// processeur (4 sur un i7-9700) ; pendant les chargements les fils du jeu attendent surtout le disque, et le
+// désentrelacement prenait encore 22 à 65 ms par changement de scène (run 20). Essai à tous les fils moins deux (6) au
+// run 22 : aucun gain (52 → 52 ms pour 303 Mo), retour à la moitié, 8 au plus. RECOMP_DESWIZZLE_THREADS=n : n fils.
+unsigned nb_ouvriers() {
+    static const unsigned n = [] {
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        unsigned v = std::min(8u, std::max(1u, hw / 2));
+        const int voulu = settings().deswizzle_threads;   // recomp.ini ou RECOMP_DESWIZZLE_THREADS ; 0 : auto
+        if (voulu > 0) v = std::max(1u, std::min(16u, (unsigned)voulu));
+        HLOG("vk", "texture deswizzle and hashing: %u threads%s", v, voulu > 0 ? " (deswizzle_threads)" : "");
+        return v;
+    }();
+    return n;
+}
+
 Ouvriers& ouvriers() {
     static Ouvriers* o = new Ouvriers;   // jamais détruit : ses fils l'attendent jusqu'à la fin du processus
     return *o;
@@ -2700,23 +3331,34 @@ uint64_t edges_hash(uint64_t addr, uint64_t n, uint64_t d, uint64_t f) {
     return hash_mem((const uint8_t*)addr, d - addr) ^ (hash_mem((const uint8_t*)f, addr + n - f) * 0x9E3779B97F4A7C15ull);
 }
 
+// [d, f) touche un import (pool vivant ou en attente de retrait) : le GPU lit ces pages directement, on n'y touche pas
+bool plage_importee(uint64_t d, uint64_t f) {
+    for (auto& p : g.pools)
+        if (d < p.base + p.size && p.base < f) return true;
+    for (auto& dp : g.dead_pools)
+        if (d < dp.second.base + dp.second.size && dp.second.base < f) return true;
+    return false;
+}
+
 // Rend les pages entières de la source de l'image, qui vient d'être lue en entier (envoi, ou empreinte inchangée).
+// Pages entières [*d, *f) de la source de l'image, si elles peuvent être rendues (fichier ouvert, assez grosses, hors
+// des imports que le GPU lit directement)
+bool tex_release_plage(Image& im, uint64_t* d_, uint64_t* f_) {
+    if (!mem_release_actif() || !im.src_bytes || !im.addr || im.rel_n >= 3) return false;
+    const uint64_t d = (im.addr + 0xfff) & ~0xfffull, f = (im.addr + im.src_bytes) & ~0xfffull;
+    if (f < d + (64ull << 10)) return false;   // petite texture : rien à gagner
+    if (plage_importee(d, f)) {
+        g.tex_rel_import += f - d;
+        return false;
+    }
+    *d_ = d, *f_ = f;
+    return true;
+}
+
 void tex_release(Image& im) {
     im.rel_d = im.rel_f = im.rel_id = 0;
-    if (!mem_release_actif() || !im.src_bytes || !im.addr || im.rel_n >= 3) return;
-    const uint64_t d = (im.addr + 0xfff) & ~0xfffull, f = (im.addr + im.src_bytes) & ~0xfffull;
-    if (f < d + (64ull << 10)) return;   // petite texture : rien à gagner
-    // pages verrouillées par un import (le GPU les lit directement) : on n'y touche pas
-    for (auto& p : g.pools)
-        if (d < p.base + p.size && p.base < f) {
-            g.tex_rel_import += f - d;
-            return;
-        }
-    for (auto& dp : g.dead_pools)
-        if (d < dp.second.base + dp.second.size && dp.second.base < f) {
-            g.tex_rel_import += f - d;
-            return;
-        }
+    uint64_t d = 0, f = 0;
+    if (!tex_release_plage(im, &d, &f)) return;
     uint64_t id = 0;
     if (mem_release(d, f - d, &id) != f - d) return;
     im.rel_d = d, im.rel_f = f, im.rel_id = id, im.rel_n++;
@@ -2742,6 +3384,9 @@ void tex_release(Image& im) {
 // Toute la plage est engagée et lisible : la lire ne fait ni faute ni engagement (pages à la demande pas encore
 // touchées, pages rendues à Windows ou rangées dans le fichier temporaire : non)
 bool plage_engagee(uint64_t a, uint64_t n) {
+#ifndef _WIN32
+    return mem_valid(a, n);   // Linux : pas d'engagement à la demande, les plages engagées sont tenues par memory.cpp
+#else
     uint64_t p = a & ~0xfffull;
     const uint64_t f = a + n;
     while (p < f) {
@@ -2751,6 +3396,7 @@ bool plage_engagee(uint64_t a, uint64_t n) {
         p = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return true;
+#endif
 }
 
 struct RenduDiffere { uint64_t addr, octets, serie; };
@@ -2776,10 +3422,80 @@ void tex_release_later(Image& im) {
     if (g_rendus_octets > 2 * RENDUS_ATTENTE_MAX) tex_release_pending(0);
 }
 
+// Rendu par morceaux (2026-11-17). Écrire d'un bloc la source d'une très grosse texture bloquait le fil du GPU : 204 ms
+// pour l'atlas de 171 Mo des changements de scène de la cinématique d'ouverture (≈ 1,2 ms par Mo écrit), 46 à 60 ms
+// pour les textures de 43 Mo (RTX 2070 SUPER, mesure [hitch] du run 20). Au-delà de REL_MORCEAU, la source est rendue
+// par morceaux, sous un seul numéro de rendu (mem_release_part), un ou plusieurs par fin d'image selon le budget.
+// L'empreinte de chaque morceau est relevée au départ (le tout comparé à celle de l'envoi), puis recomparée juste
+// avant de rendre le morceau : une source réécrite entre-temps arrête le rendu, l'image n'est pas marquée comme rendue
+// (les morceaux déjà rendus restent lisibles, relus à l'accès). L'image n'est marquée rendue qu'au dernier morceau.
+// Les imports sont aussi revérifiés avant chaque morceau, comme avant chaque mem_release : un import créé pendant que
+// les morceaux s'étalent sur les fins d'image a ses pages épinglées, qui ne doivent pas être désengagées.
+// RECOMP_TEX_RELEASE_WHOLE=1 : ancien comportement, la source d'un bloc.
+constexpr uint64_t REL_MORCEAU = 4ull << 20;
+// hash_mem d'un morceau reste sur un seul fil (moins de 8 morceaux de 1 Mo) : pas d'appel imbriqué de ouvriers()
+static_assert(REL_MORCEAU < 8 * HASH_MORCEAU, "hash_mem d'un morceau lancerait les ouvriers depuis un ouvrier");
+struct RenduPartiel {
+    bool actif = false;
+    uint64_t addr = 0, serie = 0, d = 0, f = 0, pos = 0, id = 0;
+    std::vector<uint64_t> h;   // empreinte de chaque morceau, relevée au départ
+};
+RenduPartiel g_partiel;
+uint64_t g_rendus_morceaux = 0, g_rendus_arretes = 0;
+
+// image de la demande (addr, serie) si elle existe encore et n'a pas été renvoyée depuis
+Image* rendu_image(uint64_t addr, uint64_t serie) {
+    auto ba = g.by_addr.find(addr);
+    if (ba == g.by_addr.end()) return nullptr;
+    for (uint64_t k : ba->second) {
+        auto it = g.images.find(k);
+        if (it != g.images.end() && it->second.rel_serie == serie) return &it->second;
+    }
+    return nullptr;
+}
+
+// un morceau du rendu en cours ; faux quand il est fini ou arrêté
+bool rendu_partiel_pas() {
+    RenduPartiel& r = g_partiel;
+    Image* im = rendu_image(r.addr, r.serie);
+    const uint64_t k = (r.pos - r.d) / REL_MORCEAU;
+    const uint64_t n = std::min(REL_MORCEAU, r.f - r.pos);
+    bool ok = im && im->addr == r.addr && im->initialized && plage_engagee(r.pos, n);
+    if (ok && plage_importee(r.pos, r.f)) {   // import créé depuis le départ : le reste n'est pas rendu
+        g.tex_rel_import += r.f - r.pos;
+        ok = false;
+    }
+    if (ok) {
+        ok = hash_mem((const uint8_t*)r.pos, n) == r.h[k];
+        if (!ok) g_rendus_changes++;
+    }
+    if (ok) {
+        ok = mem_release_part(r.pos, n, &r.id) == n;
+        g_rendus_morceaux++;
+    }
+    if (!ok) {   // arrêté : l'image ne compte pas comme rendue
+        if (im) im->rel_serie = 0;
+        g_rendus_arretes++;
+        r.actif = false;
+        return false;
+    }
+    r.pos += n;
+    if (r.pos < r.f) return true;
+    im->rel_d = r.d, im->rel_f = r.f, im->rel_id = r.id, im->rel_n++;
+    im->edge_hash = edges_hash(im->addr, im->src_bytes, r.d, r.f);
+    im->rel_serie = 0;
+    g.tex_rel_rendus++;
+    g_rendus_faits++;
+    if (!im->refs) mem_release_vivant(r.d, r.f - r.d, r.id, false);
+    r.actif = false;
+    return false;
+}
+
 // Fin d'image affichée (fil du GPU, verrou pris) : demandes de rendu en attente, budget_us au plus (plus quand la file
 // s'allonge), ou plus longtemps tant que plus de RENDUS_ATTENTE_MAX attendent.
 void tex_release_pending(uint64_t budget_us) {
-    if (g_rendus.empty()) return;
+    if (g_rendus.empty() && !g_partiel.actif) return;
+    static const bool d_un_bloc = getenv("RECOMP_TEX_RELEASE_WHOLE") != nullptr;
     // Windows vient de refuser de la mémoire au jeu (mem_pression), ou le PC en manque : toute la file d'un coup
     static int pression_vue = 0;
     const int pression = mem_pression();
@@ -2788,22 +3504,18 @@ void tex_release_pending(uint64_t budget_us) {
     const uint64_t borne = rendus_attente_max();
     if (budget_us) budget_us += g_rendus_octets * 4000 / RENDUS_ATTENTE_MAX;
     const auto t0 = std::chrono::steady_clock::now();
-    while (!g_rendus.empty()) {
+    for (;;) {
         const auto ecoule = std::chrono::steady_clock::now() - t0;
         if (!tout && g_rendus_octets <= borne && ecoule >= std::chrono::microseconds(budget_us)) break;
+        if (g_partiel.actif) {
+            rendu_partiel_pas();
+            continue;
+        }
+        if (g_rendus.empty()) break;
         const RenduDiffere r = g_rendus.front();
         g_rendus.pop_front();
         g_rendus_octets -= r.octets;
-        Image* im = nullptr;
-        auto ba = g.by_addr.find(r.addr);
-        if (ba != g.by_addr.end())
-            for (uint64_t k : ba->second) {
-                auto it = g.images.find(k);
-                if (it != g.images.end() && it->second.rel_serie == r.serie) {
-                    im = &it->second;
-                    break;
-                }
-            }
+        Image* im = rendu_image(r.addr, r.serie);
         // Source entièrement engagée, sinon oubliée : quand le jeu décharge un niveau puis remappe sa mémoire, la
         // plage redevient « à la demande » ; la relire pour l'empreinte l'engageait (des dizaines de Mo de zéros) et
         // prenait jusqu'à 0,4 s dans une image (partie d'essai du 2026-11-12, à 148 s).
@@ -2812,13 +3524,39 @@ void tex_release_pending(uint64_t budget_us) {
             g_rendus_perdus++;
             continue;
         }
-        im->rel_serie = 0;
-        if (hash_mem((const uint8_t*)im->addr, im->src_bytes) != im->content_hash) {
+        uint64_t d = 0, f = 0;
+        const bool morceaux = !d_un_bloc && tex_release_plage(*im, &d, &f) && f - d > REL_MORCEAU;
+        if (!morceaux) {
+            im->rel_serie = 0;
+            const bool change = hash_mem((const uint8_t*)im->addr, im->src_bytes) != im->content_hash;
+            if (change) {
+                g_rendus_changes++;
+                continue;
+            }
+            tex_release(*im);
+            g_rendus_faits++;
+            continue;
+        }
+        // Gros rendu : empreinte de la source entière (comparée à l'envoi), et de chaque morceau pour la suite.
+        // L'ancien rendu de l'image ne compte plus (la source vient d'être relue en entier).
+        const bool change = hash_mem((const uint8_t*)im->addr, im->src_bytes) != im->content_hash;
+        RenduPartiel& p = g_partiel;
+        p.h.clear();
+        if (!change) {   // morceaux de 4 Mo : en parallèle (hash_mem de chacun reste sur un seul fil)
+            p.h.assign((f - d + REL_MORCEAU - 1) / REL_MORCEAU, 0);
+            const std::function<void(size_t)> fh = [&](size_t k) {
+                const uint64_t a = d + k * REL_MORCEAU;
+                p.h[k] = hash_mem((const uint8_t*)a, std::min(REL_MORCEAU, f - a));
+            };
+            ouvriers().lancer(p.h.size(), fh);
+        }
+        if (change) {
+            im->rel_serie = 0;
             g_rendus_changes++;
             continue;
         }
-        tex_release(*im);
-        g_rendus_faits++;
+        im->rel_d = im->rel_f = im->rel_id = 0;
+        p.actif = true, p.addr = r.addr, p.serie = r.serie, p.d = d, p.f = f, p.pos = d, p.id = 0;
     }
     g_rendus_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -2904,12 +3642,18 @@ void flush_recheck(Image& im) {
     static const bool off = getenv("RECOMP_NO_FLUSH_CHECK") != nullptr;
     if (off) return;
     int cause = flush_last(im.addr, im.addr + im.src_bytes) > im.chk_serial ? 1 : 0;
-    if (!cause && im.refs == 0) {
+    // Source en cours de rendu par morceaux (tex_release_pending) : ni contrôle périodique ni empreinte éparse. Leurs
+    // lectures tombaient sur les morceaux déjà rendus et les restauraient ; le rendu fini n'était plus intact, la
+    // source entière était relue (170 Mo, ≈ 200 ms) puis rendue de nouveau, en boucle (run 21 : gels de 100 à 240 ms
+    // toutes les 0,5 s pendant les chargements, 866 Mo relus par le runtime contre 0 au run 20). Chaque morceau est
+    // recomparé à son empreinte juste avant d'être rendu ; un vidage du jeu (cas 1) reste contrôlé.
+    const bool en_rendu = g_partiel.actif && im.rel_serie && g_partiel.serie == im.rel_serie && g_partiel.addr == im.addr;
+    if (!cause && im.refs == 0 && !en_rendu) {
         if (im.rel_id) cause = mem_released_intact(im.rel_d, im.rel_f - im.rel_d, im.rel_id) ? 0 : 2;
         else if ((g.cur_frame + (im.addr >> 16)) % 30 == 0) cause = 3;
     }
     static const bool sans_revue = getenv("RECOMP_NO_TEX_RECHECK") != nullptr;
-    if (!cause && !sans_revue) {
+    if (!cause && !sans_revue && !en_rendu) {
         if (im.rel_id) {
             if (im.refs && !mem_released_intact(im.rel_d, im.rel_f - im.rel_d, im.rel_id)) cause = 4;
         } else if (im.eparse && g.cur_frame >= im.eparse_due) {
@@ -3005,9 +3749,12 @@ void tex_release_log(uint64_t frame) {
          (unsigned long long)s.n[5], s.octets[5] / 1048576.0, (unsigned long long)g.tex_rel_intactes, s.ns_ecrit / 1e6,
          s.ns_lu / 1e6);
     HLOG("vk", "frame %llu, deferred texture releases: %llu done, %llu skipped (source rewritten), %llu dropped (image "
-               "gone or sent again), %zu waiting (%.0f MB), %.0f ms at frame ends",
+               "gone or sent again), %zu waiting (%.0f MB), %.0f ms at frame ends; %llu pieces of %llu MB, %llu split "
+               "releases stopped",
          (unsigned long long)frame, (unsigned long long)g_rendus_faits, (unsigned long long)g_rendus_changes,
-         (unsigned long long)g_rendus_perdus, g_rendus.size(), g_rendus_octets / 1048576.0, g_rendus_ns / 1e6);
+         (unsigned long long)g_rendus_perdus, g_rendus.size(), g_rendus_octets / 1048576.0, g_rendus_ns / 1e6,
+         (unsigned long long)g_rendus_morceaux, (unsigned long long)(REL_MORCEAU >> 20),
+         (unsigned long long)g_rendus_arretes);
 }
 
 // RECOMP_PERF : temps des étapes d'envoi des textures packagées (ns cumulés) : source (validité, restauration),
@@ -3072,7 +3819,7 @@ bool upload_packaged(Image& im) {
             const uint32_t band = std::max<uint32_t>(8 * v.bh, (uint32_t)((1u << 20) / std::max<uint32_t>(1, v.wbytes)));
             for (uint32_t y = 0; y < v.rows; y += band) jobs.push_back({s, p + dst, v.wbytes, v.rows, v.bh, y, std::min(v.rows, y + band)});
             VkBufferImageCopy r{};
-            r.bufferOffset = dst;
+            r.bufferOffset = st.off + dst;
             r.bufferRowLength = v.wbytes / im.bpu * unit;
             r.bufferImageHeight = v.rows * unit;
             r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, layer, 1};
@@ -3084,6 +3831,27 @@ bool upload_packaged(Image& im) {
     const uint8_t* src0 = (const uint8_t*)im.addr;
     const size_t nm = hash_morceaux(src_total);
     std::vector<uint64_t> hm(nm);
+    static const bool desw_ancien = getenv("RECOMP_DESWIZZLE_OLD") != nullptr;
+    static const unsigned NT = nb_ouvriers();
+    uint64_t hash_source = 0;
+    if (!desw_ancien) {   // ordre de la source, empreinte comprise (envoi_morceau_source)
+        std::vector<RegionBL> rg;
+        for (uint32_t layer = 0; layer < im.layers; layer++)
+            for (const Lv& v : lv)
+                rg.push_back({layer * layer_stride + v.soff, bl_level_size(v.wbytes, v.rows, v.bh), p + layer * doff + v.doff,
+                              v.wbytes, v.rows, v.bh});
+        const size_t nmc = std::max<size_t>(1, nm);
+        if (!nm) hm.resize(1);
+        const std::function<void(size_t)> run = [&](size_t k) {
+            hm[k] = envoi_morceau_source(src0, rg.data(), rg.size(), k * HASH_MORCEAU, std::min(src_total, (k + 1) * HASH_MORCEAU));
+        };
+        if (NT == 1 || nmc < 4) {
+            for (size_t k = 0; k < nmc; k++) run(k);
+        } else {
+            ouvriers().lancer(nmc, run);
+        }
+        hash_source = nm ? hash_combiner(hm.data(), nm, src_total) : hm[0];
+    } else {
     const std::function<void(size_t)> run = [&](size_t k) {
         if (k < jobs.size()) {
             const Job& j = jobs[k];
@@ -3092,11 +3860,11 @@ bool upload_packaged(Image& im) {
             hm[k - jobs.size()] = hash_morceau(src0, src_total, k - jobs.size());
         }
     };
-    static const unsigned NT = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
     if (NT == 1 || jobs.size() + nm < 4 || doff * im.layers < (4u << 20)) {
         for (size_t k = 0; k < jobs.size() + nm; k++) run(k);
     } else {
         ouvriers().lancer(jobs.size() + nm, run);
+    }
     }
     pas(2);
     vkCmdCopyBufferToImage(g.cb, st.b, im.img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)regions.size(), regions.data());
@@ -3107,7 +3875,7 @@ bool upload_packaged(Image& im) {
     g.tex_upload_bytes += src_total;
     im.src_bytes = src_total;
     pas(3);
-    im.content_hash = nm ? hash_combiner(hm.data(), nm, src_total) : hash_bloc(src0, src_total);
+    im.content_hash = !desw_ancien ? hash_source : nm ? hash_combiner(hm.data(), nm, src_total) : hash_bloc(src0, src_total);
     im.up_frame = g.cur_frame;
     pas(4);
     tex_release_later(im);
@@ -3381,7 +4149,11 @@ Image* get_image(uint64_t texkey) {
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
     ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (VkResult ar = vkAllocateMemory(g.dev, &ai, nullptr, &im.mem); ar != VK_SUCCESS) {
+    static const bool sans_blocs = getenv("RECOMP_NO_IMAGE_BLOCKS") != nullptr;
+    if (!sans_blocs && (im.packaged || is_compressed(fi.vk)) && !is_depth(fi.vk) && mr.size <= VRAM_BLOC_IMAGE_MAX &&
+        ai.memoryTypeIndex != UINT32_MAX && vram_prendre(ai.memoryTypeIndex, mr.size, mr.alignment, &im.mem, &im.bloc, &im.moff)) {
+        im.mtaille = mr.size;   // taillée dans un bloc partagé
+    } else if (VkResult ar = vkAllocateMemory(g.dev, &ai, nullptr, &im.mem); ar != VK_SUCCESS) {
         // échec autrefois silencieux : la texture manquait (descripteur factice, icônes en carrés pleins)
         static int nf = 0;
         if (nf++ < 16)
@@ -3390,7 +4162,7 @@ Image* get_image(uint64_t texkey) {
         vkDestroyImage(g.dev, im.img, nullptr);
         return nullptr;
     }
-    vkBindImageMemory(g.dev, im.img, im.mem, 0);
+    vkBindImageMemory(g.dev, im.img, im.mem, im.bloc >= 0 ? im.moff : 0);
     im.bytes = mr.size;
     im.refs = 1;   // l'objet texture qui la crée
     im.last_use = g.cur_frame;
@@ -3759,7 +4531,7 @@ std::string exe_dir() {   // dossier de l'exécutable, avec la barre finale
     std::string d = exe;
     return d.substr(0, d.find_last_of("\\/") + 1);
 }
-std::string cache_dir() { return exe_dir() + "shader_cache\\"; }
+std::string cache_dir() { return exe_dir() + "shader_cache" PSEP; }
 
 // modèle d'exécution du premier OpEntryPoint (0 sommets, 4 fragments, 5 calcul), -1 si illisible
 int spirv_model(const std::vector<char>& code) {
@@ -4293,9 +5065,11 @@ void pcache_save_later() {
 // ---- bibliothèques
 // (par référence : GCC copiait la structure passée par valeur avec une écriture AVX alignée sur 32 octets, alors que
 // Windows n'aligne la pile que sur 16 → plantage ; voir aussi -muse-unaligned-vector-move dans link.py)
-// Le pilote compile (création d'un pipeline ou d'une bibliothèque de shaders) : au-delà de 5 s, le compteur du jeu
-// s'arrête jusqu'à la fin, pour que le chien de garde de son moteur n'arrête pas le jeu (runtime.cpp, rt_stall_begin).
+// Le pilote compile (création d'un pipeline ou d'une bibliothèque de shaders) : au-delà de 5 s de blocage cumulé
+// (crédit rechargé de 5 s par minute), le compteur du jeu s'arrête jusqu'à la fin, pour que le chien de garde de son
+// moteur n'arrête pas le jeu (runtime.cpp, rt_stall_begin ; cumulé depuis l'issue n° 26).
 struct Blocage {
+    Phase ph{"the driver is compiling a pipeline or a shader library"};
     Blocage() { rt_stall_begin(); }
     ~Blocage() { rt_stall_end(); }
     Blocage(const Blocage&) = delete;
@@ -4592,7 +5366,11 @@ size_t warm_up(const std::function<void(size_t, size_t)>& avance) {
         for (size_t i; (i = next++) < jobs.size();) {
             Job& j = jobs[i];
             suivre('+', j.sm->hash);
+#ifdef _WIN32
             if (plante && j.sm->hash == plante) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+#else
+            if (plante && j.sm->hash == plante) raise(SIGSEGV);
+#endif
             if (j.sm->model == 0) j.out = create_vs_library(j.sm->mod, VK_POLYGON_MODE_FILL, neg_one);
             else if (j.sm->model == 4) j.out = create_fs_library(j.sm->mod);
             else j.out = create_compute_pipeline(j.sm->mod);
@@ -4779,6 +5557,82 @@ int precompile_travail() {
 // Sa mémoire est surveillée dix fois par seconde : au-delà de `plafond` octets engagés, ou quand il reste moins de
 // 2 Go validables libres sur le PC, il est arrêté (*manque : 1 plafond dépassé, 2 mémoire du PC presque épuisée) avant
 // que le compilateur du pilote ne plante faute de mémoire, ou ne fasse tomber d'autres programmes.
+#ifndef _WIN32
+// Linux : même rôle, par fork/exec ; sortie de l'enfant lue par un tube, mémoire relevée dans /proc/<pid>/status.
+DWORD precompile_enfant(const std::vector<std::pair<std::string, std::string>>& envs, bool relayer, const std::string& journal,
+                        std::string& pilote, uint64_t plafond, int* manque) {
+    *manque = 0;
+    const std::string exe = plat_exe_path();
+    int tube[2];
+    if (pipe(tube)) {
+        printf("@erreur recomp_main --precompile not started (pipe %d)\n", errno);
+        fflush(stdout);
+        return 1;
+    }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        dup2(tube[1], 1);
+        dup2(tube[1], 2);
+        close(tube[0]);
+        close(tube[1]);
+        setenv("RECOMP_PRECOMPILE_ENFANT", "1", 1);
+        for (auto& [k, v] : envs) setenv(k.c_str(), v.c_str(), 1);
+        execl(exe.c_str(), exe.c_str(), "--log", journal.c_str(), "--precompile", (char*)nullptr);
+        _exit(127);
+    }
+    close(tube[1]);
+    if (pid < 0) {
+        close(tube[0]);
+        printf("@erreur recomp_main --precompile not started (%d)\n", errno);
+        fflush(stdout);
+        return 1;
+    }
+    std::atomic<bool> fini{false};
+    std::atomic<int> arret{0};
+    std::thread veille([&] {
+        while (!fini.load()) {
+            PROCESS_MEMORY_COUNTERS pmc{};
+            pmc.cb = sizeof pmc;
+            const bool lu = K32GetProcessMemoryInfo((HANDLE)(intptr_t)pid, &pmc, sizeof pmc) != 0;
+            const double libre = memoire_validable_libre_go();
+            if ((lu && pmc.PagefileUsage > plafond) || libre < 2.0) {
+                arret = lu && pmc.PagefileUsage > plafond ? 1 : 2;
+                HLOG("vk", "--precompile: compiler process stopped, %.1f GB committed, %.1f GB available memory on the PC",
+                     pmc.PagefileUsage / 1073741824.0, libre);
+                kill(pid, SIGKILL);
+                return;
+            }
+            Sleep(100);
+        }
+    });
+    std::string ligne;
+    auto traiter = [&](const std::string& l) {
+        if (l.rfind("@pilote ", 0) == 0) pilote = l.substr(1);
+        else if (relayer) printf("%s\n", l.c_str()), fflush(stdout);
+    };
+    char buf[4096];
+    for (ssize_t n; (n = read(tube[0], buf, sizeof buf)) != 0;) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == '\n') traiter(ligne), ligne.clear();
+            else if (buf[i] != '\r') ligne += buf[i];
+        }
+    }
+    if (!ligne.empty()) traiter(ligne);
+    close(tube[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    fini = true;
+    veille.join();
+    *manque = arret.load();
+    // code de sortie, ou 0xC0000005-like pour un signal : « plantage » pour le superviseur (ni 0 ni 1)
+    if (WIFEXITED(st)) return (DWORD)WEXITSTATUS(st);
+    return 0xC0000000ul | (DWORD)WTERMSIG(st);
+}
+#else
 DWORD precompile_enfant(const std::vector<std::pair<std::string, std::string>>& envs, bool relayer, const std::string& journal,
                         std::string& pilote, uint64_t plafond, int* manque) {
     *manque = 0;
@@ -4850,6 +5704,7 @@ DWORD precompile_enfant(const std::vector<std::pair<std::string, std::string>>& 
     CloseHandle(pi.hThread);
     return code;
 }
+#endif
 
 // Shaders commencés et pas finis au moment d'un plantage (precompile_en_cours.txt)
 std::vector<std::string> precompile_en_cours() {
@@ -5026,6 +5881,7 @@ uint64_t submit_cb(const char* where, VkSemaphore wait_bin = VK_NULL_HANDLE, VkS
 uint64_t submit_locked(const char* where) {
     if (!g.ok || !g.recording) return 0;
     end_render();
+    ft_end(false, 0);
     vkEndCommandBuffer(g.cb);
     g.recording = false;
     return submit_cb(where);
@@ -5038,8 +5894,10 @@ void flush_locked(const char* where) {
 }
 // Entre deux dessins : au-delà de 256 Mo de tampons de transit dans l'enregistrement en cours, il est soumis, le GPU
 // attendu et les tampons rendus (voir free_done_staging). memory_saver = false : comme en 1.0.2, pas de borne.
+// Borne relevée au niveau de mémoire 0 (2026-11-18) : les classes de tampons vont jusqu'à 256 Mo (arrondi à la
+// puissance de 2), et à 256 Mo un chargement de 300 Mo soumettait et attendait le GPU au milieu de son image.
 void borner_transit() {
-    constexpr uint64_t TRANSIT_MAX = 256ull << 20;
+    const uint64_t TRANSIT_MAX = g_memoire_niveau == 0 && transit_reserve_n0() > TRANSIT_RESERVE_MAX ? 768ull << 20 : 256ull << 20;
     if (g.staging_bytes <= TRANSIT_MAX || !settings().memory_saver) return;
     flush_locked("texture uploads");
     free_done_staging();
@@ -5072,6 +5930,16 @@ bool soumettre_morceau() {
 bool sync_each() {
     static const long from = getenv("RECOMP_SYNC_FROM") ? atol(getenv("RECOMP_SYNC_FROM")) : -1;
     return from >= 0 && g.cur_frame + 1 >= (uint64_t)from;
+}
+
+// RECOMP_SHADER_USED=1 (diagnostic) : une ligne au premier usage de chaque shader par un dessin ou un calcul. Sert à
+// savoir quels shaders une partie d'essai exerce vraiment (vérification d'un changement du traducteur : PR 40).
+void shader_servi(const ShaderMod* sm, const std::string& label) {
+    static const bool actif = getenv("RECOMP_SHADER_USED") != nullptr;
+    if (!actif || !sm || sm->servi) return;
+    sm->servi = true;
+    HLOG("watch", "frame %llu: shader %s first used by '%s'", (unsigned long long)g.cur_frame + 1, sm->hash.c_str(),
+         label.c_str());
 }
 
 // dessin ou calcul ignoré : compté par image ; chaque couple (cause, programme) est journalisé une fois
@@ -5815,6 +6683,398 @@ void draw(const DrawCall& d) {
     draw_verrouille(d, dtm);
 }
 // corps de draw, verrou pris (rappelé aussi par dlss_taa pour la comparaison en écran partagé)
+// ---- RECOMP_VB_VRAM=1 : sommets et index lus en mémoire vidéo (2b ; désactivé par défaut tant qu'il est à l'essai).
+// Mesuré (2026-11-16, runs 7 et 8) : le GPU lit les sommets et les index dans la mémoire du jeu importée, donc dans la
+// RAM du PC à travers le PCIe ; les passes limitées par les sommets (ombres, personnages animés) y plafonnaient à
+// 0,3-1 G sommets/s, et allaient 3 à 8 fois plus vite sur une copie en mémoire vidéo. Une copie faite une fois pour
+// toutes fige les tampons que le jeu réécrit (clignotements), et un filtre par contenu sur de grandes plages n'en
+// gardait presque rien (run 9 : 3 Mo copiés). Ici, la mémoire du jeu est suivie par morceaux de 64 Ko, dans des
+// cellules de 32 Mo alignées (une copie en mémoire vidéo par cellule) :
+//   * un dessin dit les octets qu'il lit (index : count × taille ; sommets : bornes des index, mises en cache, ou
+//     first + count ; flux par instance : base_instance + instances). Tous propres : il lit la copie ; sinon il lit
+//     l'import comme avant, et les morceaux qui manquent sont demandés ;
+//   * en tête du tampon de commandes suivant (begin_frame), les morceaux demandés passent en lecture seule
+//     (VirtualProtect) puis sont copiés depuis l'import (vkCmdCopyBuffer), par suites ;
+//   * une écriture du jeu ou du runtime dans un morceau protégé faute (vbw_faute, gestionnaire de host_main.cpp) :
+//     le morceau repasse en lecture-écriture, sa copie est périmée, les dessins relisent l'import jusqu'à la copie
+//     suivante. Écritures sans faute : noyau (ReadFile, IPC : mem_ensure), remappage (mem_commit_lazy, mem_decommit),
+//     données de textures rendues (mem_release), copies GPU (CopyBufferToBuffer), tampons de stockage des calculs à
+//     mémoire globale : vbw_ecriture. Pools libérés : vbw_oublie. Fenêtres des calculs : copiées (RECOMP_VB_VRAM_CALC=0 : jamais) ;
+//   * un morceau réécrit trois fois de suite moins de 30 images après sa copie est « chaud » (tampon dynamique) :
+//     laissé sur l'import pendant 1200 images ;
+//   * la protection n'est posée que garde du noyau libre (aucun ReadFile en cours dans la mémoire du jeu).
+// RECOMP_VB_VRAM_MO : plafond de mémoire vidéo (2048 Mo par défaut, soit 64 cellules).
+constexpr uint64_t VBW_CELL = 32ull << 20, VBW_P = 64ull << 10;
+constexpr uint32_t VBW_NP = (uint32_t)(VBW_CELL / VBW_P);
+enum : uint8_t { VW_ABSENT, VW_DEMANDE, VW_PROPRE, VW_SALE, VW_CHAUD };
+struct VbCell {
+    uint64_t base = 0;
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    uint8_t st[VBW_NP] = {};
+    uint8_t coups[VBW_NP] = {};      // réécritures de suite peu après une copie
+    uint32_t gen[VBW_NP] = {};       // réécritures (cache des bornes d'index)
+    uint32_t copie[VBW_NP] = {};     // image de la dernière copie
+    uint32_t attente[VBW_NP] = {};   // chaud ou refusé : pas redemandé avant cette image
+    std::atomic<uint64_t> propre[VBW_NP / 64] = {};   // copie à jour et protégée : lu sans verrou par les dessins
+};
+SRWLOCK g_vbw_lk = SRWLOCK_INIT;   // états des morceaux (fil de rendu, gestionnaire d'exceptions, noyau)
+std::map<uint64_t, VbCell*> g_vbw;   // par base ; insertion par le fil de rendu seul, verrou tenu
+std::atomic<int> g_vbw_n{0};
+std::atomic<uint32_t> g_vbw_img{0};
+std::vector<uint64_t> g_vbw_dem;   // morceaux demandés (fil de rendu)
+thread_local bool t_vbw_muet = false;   // import d'une fenêtre : mem_ensure n'écrit rien
+std::atomic<uint64_t> g_vbw_fautes{0}, g_vbw_ecrits{0}, g_vbw_chauds{0};
+uint64_t g_vbw_copie = 0, g_vbw_servis = 0, g_vbw_repli = 0, g_vbw_refus = 0, g_vbw_hors = 0, g_vbw_reportes = 0;
+// liaisons restées sur l'import, par raison : bornes des index inconnues (index pas encore copiés), plage qui touche
+// un morceau chaud, refusé (fenêtre de calcul, hors import), pas encore copié (demandé)
+uint64_t g_vbw_r_bornes = 0, g_vbw_r_chaud = 0, g_vbw_r_refus = 0, g_vbw_r_attente = 0;
+struct VbIdx { uint32_t count = 0, isz = 0; uint64_t gsum = 0; uint32_t mn = 0, mx = 0; };
+std::unordered_map<uint64_t, VbIdx> g_vbw_idx;
+
+bool vbv_actif() {
+#ifdef _WIN32
+    static const bool on = settings().vertex_buffers_vram;   // recomp.ini ou RECOMP_VB_VRAM
+#else
+    // Linux : toujours désactivé. Le suivi protège les morceaux en écriture et compte sur le gestionnaire de fautes
+    // pour les rendre ; celui de Linux ne le fait pas, et la première écriture du jeu plantait à l'écran titre.
+    static const bool on = [] {
+        if (settings().vertex_buffers_vram) HLOG("vk", "vertex_buffers_vram ignored: not supported on Linux");
+        return false;
+    }();
+#endif
+    return on;
+}
+
+inline void vbw_bit(VbCell& c, uint32_t i, bool on) {
+    const uint64_t m = 1ull << (i & 63);
+    if (on) c.propre[i >> 6].fetch_or(m, std::memory_order_release);
+    else c.propre[i >> 6].fetch_and(~m, std::memory_order_release);
+}
+
+bool vbw_propres(const VbCell& c, uint32_t i0, uint32_t i1) {   // [i0, i1]
+    for (uint32_t w = i0 >> 6; w <= (i1 >> 6); w++) {
+        uint64_t m = ~0ull;
+        if (w == (i0 >> 6)) m &= ~0ull << (i0 & 63);
+        if (w == (i1 >> 6)) m &= ~0ull >> (63 - (i1 & 63));
+        if ((c.propre[w].load(std::memory_order_acquire) & m) != m) return false;
+    }
+    return true;
+}
+
+// [i0, i1) de la cellule, verrou tenu : morceaux protégés rendus en lecture-écriture ; nouvel état VW_SALE (écrits
+// sans faute) ou VW_ABSENT (mémoire libérée)
+void vbw_marquer_cellule(VbCell& c, uint32_t i0, uint32_t i1, uint8_t nouvel) {
+    DWORD av = 0;
+    for (uint32_t i = i0; i < i1;) {
+        if (c.st[i] != VW_PROPRE) {
+            if (nouvel == VW_ABSENT && c.st[i] != VW_DEMANDE) c.st[i] = VW_ABSENT, c.coups[i] = 0, c.attente[i] = 0;
+            i++;
+            continue;
+        }
+        uint32_t j = i;
+        while (j < i1 && c.st[j] == VW_PROPRE) j++;
+        if (!VirtualProtect((void*)(c.base + i * VBW_P), (j - i) * VBW_P, PAGE_READWRITE, &av))
+            for (uint32_t k = i; k < j; k++)   // une partie n'est plus engagée : le reste quand même
+                VirtualProtect((void*)(c.base + k * VBW_P), VBW_P, PAGE_READWRITE, &av);
+        for (uint32_t k = i; k < j; k++) {
+            c.st[k] = nouvel;
+            c.gen[k]++;
+            vbw_bit(c, k, false);
+        }
+        i = j;
+    }
+}
+
+void vbw_marquer(uint64_t addr, uint64_t size, uint8_t nouvel) {
+    if (!size || !g_vbw_n.load(std::memory_order_acquire)) return;
+    const uint64_t fin = addr + size;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    for (auto it = g_vbw.lower_bound(addr & ~(VBW_CELL - 1)); it != g_vbw.end() && it->first < fin; ++it) {
+        VbCell& c = *it->second;
+        const uint32_t i0 = addr > c.base ? (uint32_t)((addr - c.base) / VBW_P) : 0;
+        const uint32_t i1 = (uint32_t)std::min<uint64_t>(VBW_NP, (fin - c.base + VBW_P - 1) / VBW_P);
+        vbw_marquer_cellule(c, i0, i1, nouvel);
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+}
+
+void vbw_ecriture(uint64_t addr, uint64_t size) {
+    if (t_vbw_muet || !g_vbw_n.load(std::memory_order_acquire)) return;
+    g_vbw_ecrits++;
+    vbw_marquer(addr, size, VW_SALE);
+}
+
+void vbw_oublie(uint64_t base, uint64_t size) { vbw_marquer(base, size, VW_ABSENT); }
+
+bool vbw_faute(uint64_t addr) {
+    if (!g_vbw_n.load(std::memory_order_acquire)) return false;
+    thread_local uint64_t der = 0;
+    thread_local int rep = 0;
+    const uint64_t page = addr & ~0xfffull;
+    bool ok = false;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    auto it = g_vbw.find(addr & ~(VBW_CELL - 1));
+    if (it != g_vbw.end()) {
+        VbCell& c = *it->second;
+        const uint32_t i = (uint32_t)((addr - c.base) / VBW_P);
+        DWORD av = 0;
+        if (c.st[i] == VW_PROPRE) {
+            ok = VirtualProtect((void*)(c.base + i * VBW_P), VBW_P, PAGE_READWRITE, &av) != 0;
+            c.gen[i]++;
+            vbw_bit(c, i, false);
+            c.st[i] = ok ? VW_SALE : VW_ABSENT;
+            if (ok) {
+                g_vbw_fautes++;
+                const uint32_t img = g_vbw_img.load(std::memory_order_relaxed);
+                if (img - c.copie[i] < 30) {
+                    if (++c.coups[i] >= 3) {
+                        c.st[i] = VW_CHAUD;
+                        c.attente[i] = img + 1200;
+                        c.coups[i] = 0;
+                        g_vbw_chauds++;
+                    }
+                } else {
+                    c.coups[i] = 0;
+                }
+            }
+            der = page, rep = 0;
+        } else if (page != der || rep < 2) {
+            // déjà rendu en écriture par un autre fil au même instant : l'instruction reprend (deux fois au plus :
+            // une page qui faute encore est protégée par autre chose, mem_fault s'en occupe)
+            rep = page == der ? rep + 1 : 1;
+            der = page;
+            ok = VirtualProtect((void*)(c.base + i * VBW_P), VBW_P, PAGE_READWRITE, &av) != 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    return ok;
+}
+
+VbCell* vbw_cellule(uint64_t cb) {
+    auto it = g_vbw.find(cb);
+    if (it != g_vbw.end()) return it->second;
+    static const uint64_t plafond =
+        (uint64_t)std::max(32, settings().vertex_buffers_vram_mb) << 20;   // recomp.ini ou RECOMP_VB_VRAM_MO
+    if ((g_vbw.size() + 1) * VBW_CELL > plafond) return nullptr;
+    VbCell* c = new VbCell;
+    c->base = cb;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    g_vbw[cb] = c;
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    g_vbw_n.store((int)g_vbw.size(), std::memory_order_release);
+    return c;
+}
+
+// Copie à lier pour lire [lo, hi) d'un tampon qui commence à `addr` (décalage de liaison). Faux : lire l'import ;
+// les morceaux qui manquent sont demandés pour le tampon de commandes suivant.
+bool vbw_lier(uint64_t addr, uint64_t lo, uint64_t hi, VkBuffer* b, uint64_t* off) {
+    if (hi <= lo || addr > lo) return false;
+    const uint64_t cb = lo & ~(VBW_CELL - 1);
+    if (((hi - 1) & ~(VBW_CELL - 1)) != cb || (addr & ~(VBW_CELL - 1)) != cb) {
+        g_vbw_hors++, g_vbw_repli++;
+        return false;
+    }
+    VbCell* c = vbw_cellule(cb);
+    if (!c) {
+        g_vbw_repli++, g_vbw_r_refus++;
+        return false;
+    }
+    const uint32_t i0 = (uint32_t)((lo - cb) / VBW_P), i1 = (uint32_t)((hi - 1 - cb) / VBW_P);
+    if (c->b && vbw_propres(*c, i0, i1)) {
+        *b = c->b, *off = addr - cb;
+        g_vbw_servis++;
+        return true;
+    }
+    g_vbw_repli++;
+    const uint32_t img = (uint32_t)g.cur_frame;
+    bool chaud = false, refuse = false;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    for (uint32_t i = i0; i <= i1; i++) {
+        uint8_t& e = c->st[i];
+        if ((e == VW_ABSENT || e == VW_CHAUD) && (int32_t)(img - c->attente[i]) < 0) {
+            (e == VW_CHAUD ? chaud : refuse) = true;
+            continue;
+        }
+        if (e == VW_ABSENT || e == VW_SALE || e == VW_CHAUD) {
+            e = VW_DEMANDE;
+            g_vbw_dem.push_back(cb + i * VBW_P);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    (chaud ? g_vbw_r_chaud : refuse ? g_vbw_r_refus : g_vbw_r_attente)++;
+    return false;
+}
+
+// Plus petit et plus grand index de [addr, addr + count × isz) (valeur de redémarrage exclue), quand ces index sont
+// déjà copiés et protégés : en cache tant qu'aucun de leurs morceaux n'a été réécrit. Faux : bornes inconnues.
+bool vbw_index_bornes(uint64_t addr, uint32_t count, uint32_t isz, uint32_t* mn, uint32_t* mx) {
+    if (!count || (isz != 2 && isz != 4)) return false;
+    const uint64_t fin = addr + (uint64_t)count * isz, cb = addr & ~(VBW_CELL - 1);
+    if (((fin - 1) & ~(VBW_CELL - 1)) != cb) return false;
+    auto it = g_vbw.find(cb);
+    if (it == g_vbw.end() || !it->second->b) return false;
+    const VbCell& c = *it->second;
+    const uint32_t i0 = (uint32_t)((addr - cb) / VBW_P), i1 = (uint32_t)((fin - 1 - cb) / VBW_P);
+    if (!vbw_propres(c, i0, i1)) return false;
+    uint64_t gs = 0;
+    for (uint32_t i = i0; i <= i1; i++) gs += c.gen[i];
+    auto e = g_vbw_idx.find(addr);
+    if (e != g_vbw_idx.end() && e->second.count == count && e->second.isz == isz && e->second.gsum == gs) {
+        *mn = e->second.mn, *mx = e->second.mx;
+        return true;
+    }
+    uint32_t a = UINT32_MAX, z = 0;
+    if (isz == 2) {
+        const uint16_t* p = (const uint16_t*)addr;
+        for (uint32_t k = 0; k < count; k++)
+            if (p[k] != 0xffff) a = std::min<uint32_t>(a, p[k]), z = std::max<uint32_t>(z, p[k]);
+    } else {
+        const uint32_t* p = (const uint32_t*)addr;
+        for (uint32_t k = 0; k < count; k++)
+            if (p[k] != 0xffffffffu) a = std::min(a, p[k]), z = std::max(z, p[k]);
+    }
+    if (a > z || !vbw_propres(c, i0, i1)) return false;   // réécrits pendant la lecture : pas de cache
+    if (g_vbw_idx.size() > 200000) g_vbw_idx.clear();
+    g_vbw_idx[addr] = {count, isz, gs, a, z};
+    *mn = a, *mx = z;
+    return true;
+}
+
+// Flux de sommets `st` du dessin : copie en mémoire vidéo si les octets lus y sont à jour.
+bool vbw_flux(const nvn::GfxState& s, uint32_t st, const DrawCall& d, int64_t vmin, int64_t vmax, VkBuffer* b,
+              uint64_t* o) {
+    const uint64_t addr = s.vb[st].addr, size = s.vb[st].size;
+    const uint64_t stride = st < (uint32_t)s.nstream ? s.streams[st][0] : 0;
+    const bool inst = st < (uint32_t)s.nstream && s.streams[st][1];
+    int64_t e0 = vmin, e1 = vmax;
+    if (inst) e0 = d.base_instance, e1 = (int64_t)d.base_instance + std::max(1u, d.instances) - 1;
+    if (e0 < 0 || e1 < e0) {   // index pas encore copiés (ou réécrits) : bornes inconnues, flux lu sur l'import
+        g_vbw_r_bornes++, g_vbw_repli++;
+        return false;
+    }
+    uint64_t lo = addr + (uint64_t)e0 * stride, hi = addr + ((uint64_t)e1 + 1) * stride + 64;   // + décalage d'attribut
+    if (!stride) lo = addr, hi = addr + 64;
+    if (size) hi = std::min(hi, addr + size);
+    return vbw_lier(addr, lo, hi, b, o);
+}
+
+void vbw_bilan() {
+    static uint64_t prochain = 600;
+    if (g.cur_frame < prochain) return;
+    prochain = g.cur_frame + 600;
+    uint64_t propres = 0, sales = 0, chauds = 0, cellules = 0;
+    for (auto& [cb, c] : g_vbw) {   // lecture sans verrou : ordre de grandeur
+        if (c->b) cellules++;
+        for (uint32_t i = 0; i < VBW_NP; i++) {
+            const uint8_t e = c->st[i];
+            propres += e == VW_PROPRE, sales += e == VW_SALE || e == VW_DEMANDE, chauds += e == VW_CHAUD;
+        }
+    }
+    const uint64_t liaisons = g_vbw_servis + g_vbw_repli;
+    HLOG("vk", "VB_VRAM: %llu cells (%.0f MB of video memory), %.0f MB copied and watched, %llu pieces waiting for a "
+               "copy, %llu hot (left on the import); last 600 frames: %.0f MB copied, %llu write faults, %llu writes "
+               "outside the processor, %.1f %% of the bindings from video memory (%llu on the import), %llu refused, "
+               "%llu outside a cell, %llu protections postponed (kernel busy); left on the import because of: index bounds "
+               "unknown %llu, hot pieces %llu, refused pieces %llu, not copied yet %llu",
+         (unsigned long long)cellules, cellules * (VBW_CELL / 1048576.0), propres * (VBW_P / 1048576.0),
+         (unsigned long long)sales, (unsigned long long)chauds, g_vbw_copie / 1048576.0,
+         (unsigned long long)g_vbw_fautes.exchange(0), (unsigned long long)g_vbw_ecrits.exchange(0),
+         liaisons ? 100.0 * g_vbw_servis / liaisons : 0.0, (unsigned long long)g_vbw_repli,
+         (unsigned long long)g_vbw_refus, (unsigned long long)g_vbw_hors, (unsigned long long)g_vbw_reportes,
+         (unsigned long long)g_vbw_r_bornes, (unsigned long long)g_vbw_r_chaud, (unsigned long long)g_vbw_r_refus,
+         (unsigned long long)g_vbw_r_attente);
+    g_vbw_copie = g_vbw_servis = g_vbw_repli = g_vbw_refus = g_vbw_hors = g_vbw_reportes = 0;
+    g_vbw_r_bornes = g_vbw_r_chaud = g_vbw_r_refus = g_vbw_r_attente = 0;
+}
+
+// Tête d'un tampon de commandes (begin_frame, après la barrière) : morceaux demandés protégés puis copiés.
+void vbw_copier() {
+    g_vbw_img.store((uint32_t)g.cur_frame, std::memory_order_relaxed);
+    vbw_bilan();
+    if (g_vbw_dem.empty()) return;
+    std::sort(g_vbw_dem.begin(), g_vbw_dem.end());
+    g_vbw_dem.erase(std::unique(g_vbw_dem.begin(), g_vbw_dem.end()), g_vbw_dem.end());
+    // sources, hors verrou (un import peut se faire ici : mem_ensure) ; tampons des cellules créés au besoin
+    struct Src { uint64_t p; VbCell* c; VkBuffer buf; uint64_t base; };
+    std::vector<Src> srcs;
+    srcs.reserve(g_vbw_dem.size());
+    for (uint64_t p : g_vbw_dem) {
+        VbCell* c = g_vbw.find(p & ~(VBW_CELL - 1))->second;
+        if (!c->b && !make_buffer(VBW_CELL, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &c->b, &c->m))
+            c->b = VK_NULL_HANDLE;
+        VkBuffer buf = VK_NULL_HANDLE;
+        uint64_t base = 0;
+        // Fenêtres des calculs : 9 des 26 fenêtres au run 10. Ce que les calculs écrivent par la mémoire globale
+        // est déjà marqué par vbw_ecriture. RECOMP_VB_VRAM_CALC=0 :
+        // fenêtres des calculs jamais copiées (le GPU pourrait y écrire ailleurs, par adresse).
+        static const bool sans_calc = getenv("RECOMP_VB_VRAM_CALC") && atoi(getenv("RECOMP_VB_VRAM_CALC")) == 0;
+        PoolBuf* pb = c->b ? find_import(p, VBW_P) : nullptr;
+        if (pb && !(sans_calc && pb->calc) && p + VBW_P <= pb->base + pb->size) {
+            buf = pb->buf, base = pb->base;
+            if (sans_calc)
+                for (const PoolBuf& q : g.pools)   // une fenêtre de calcul couvre ce morceau : le GPU peut y écrire
+                    if (q.calc && q.base < p + VBW_P && p < q.base + q.size) buf = VK_NULL_HANDLE;
+        }
+        srcs.push_back({p, c, buf, base});
+    }
+    if (!mem_noyau_essayer()) {   // un ReadFile écrit peut-être dans ces pages : au tampon suivant
+        g_vbw_reportes++;
+        return;
+    }
+    std::map<std::pair<VkBuffer, VkBuffer>, std::vector<VkBufferCopy>> lots;
+    const uint32_t img = (uint32_t)g.cur_frame;
+    AcquireSRWLockExclusive(&g_vbw_lk);
+    auto idx = [](const Src& s) { return (uint32_t)((s.p - s.c->base) / VBW_P); };
+    for (size_t k = 0; k < srcs.size();) {
+        VbCell& c = *srcs[k].c;
+        const uint32_t ik = idx(srcs[k]);
+        if (c.st[ik] != VW_DEMANDE) {   // oublié ou écrit entre-temps
+            k++;
+            continue;
+        }
+        if (!srcs[k].buf) {
+            c.st[ik] = VW_ABSENT;
+            c.attente[ik] = img + 600;
+            g_vbw_refus++;
+            k++;
+            continue;
+        }
+        size_t j = k;
+        while (j + 1 < srcs.size() && srcs[j + 1].c == srcs[k].c && srcs[j + 1].p == srcs[j].p + VBW_P &&
+               srcs[j + 1].buf == srcs[k].buf && srcs[j + 1].base == srcs[k].base && c.st[idx(srcs[j + 1])] == VW_DEMANDE)
+            j++;
+        const uint64_t a = srcs[k].p, n = (j - k + 1) * VBW_P;
+        DWORD av = 0;
+        const bool ok = VirtualProtect((void*)a, n, PAGE_READONLY, &av) != 0;
+        for (size_t q = k; q <= j; q++) {
+            const uint32_t i = idx(srcs[q]);
+            if (ok) {
+                c.st[i] = VW_PROPRE;
+                c.copie[i] = img;
+                vbw_bit(c, i, true);
+            } else {
+                c.st[i] = VW_ABSENT;
+                c.attente[i] = img + 600;
+                g_vbw_refus++;
+            }
+        }
+        if (ok) {
+            lots[{srcs[k].buf, c.b}].push_back({a - srcs[k].base, a - c.base, n});
+            g_vbw_copie += n;
+        }
+        k = j + 1;
+    }
+    ReleaseSRWLockExclusive(&g_vbw_lk);
+    mem_noyau_liberer();
+    g_vbw_dem.clear();
+    if (lots.empty()) return;
+    for (auto& [bb, cps] : lots) vkCmdCopyBuffer(g.cb, bb.first, bb.second, (uint32_t)cps.size(), cps.data());
+    barrier_all();   // copies finies avant les lectures de sommets et d'index qui suivent
+}
+
 void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
     ensure_init();
     if (!g.ok) return;
@@ -5918,6 +7178,8 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
         for (int i = 0; i < s.nrt; i++) dbg_tex("rt", i, s.rt[i]);
         if (s.depth) dbg_tex("ds", 0, s.depth);
     }
+    shader_servi(vs, prog.label);
+    shader_servi(fs, prog.label);
     {   // RECOMP_SHADER_WATCH=hash,hash : où ces shaders sont employés (diagnostic)
         static const std::string suivis = getenv("RECOMP_SHADER_WATCH") ? std::string(",") + getenv("RECOMP_SHADER_WATCH") + "," : std::string();
         if (!suivis.empty()) {
@@ -6511,6 +7773,15 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
     vkCmdBindDescriptorSets(g.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 3, all, 0, nullptr);
     dtm.mark();   // 4 : descripteurs
     // ---- tampons de sommets (chaque flux une fois par dessin : plusieurs attributs lisent souvent le même)
+    // RECOMP_VB_VRAM : sommets lus par ce dessin (bornes des index, ou first + count), base_vertex compris
+    const bool vbw = vbv_actif();
+    int64_t vmin = 0, vmax = -1;
+    if (vbw) {
+        uint32_t a, z;
+        if (d.kind == DrawCall::Arrays) vmin = d.first, vmax = (int64_t)d.first + d.count - 1;
+        else if (d.index_type != 0 && vbw_index_bornes(d.index_addr, d.count, d.index_type == 1 ? 2 : 4, &a, &z))
+            vmin = (int64_t)a + d.base_vertex, vmax = (int64_t)z + d.base_vertex;
+    }
     uint32_t flux_lies = 0;
     for (int loc : vs->vin) {
         uint32_t a = loc < s.nattr ? s.attribs[loc] : 0;
@@ -6519,7 +7790,9 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
         flux_lies |= 1u << st;
         VkBuffer b = g.ring;
         uint64_t o = 0;
-        if (st < 32 && s.vb[st].addr && !find_pool(s.vb[st].addr, std::max<uint64_t>(s.vb[st].size, 1), &b, &o)) {
+        if (st < 32 && s.vb[st].addr &&
+            !(vbw && vbw_flux(s, st, d, vmin, vmax, &b, &o)) &&
+            !find_pool(s.vb[st].addr, std::max<uint64_t>(s.vb[st].size, 1), &b, &o)) {
             static std::set<std::string> seen;
             if (seen.size() < 64 && seen.insert(prog.label + "|" + std::to_string(st)).second)
                 HLOG("vk", "vertex buffer not found: stream %u at 0x%llx ('%s')", st,
@@ -6588,15 +7861,22 @@ void draw_verrouille(const DrawCall& d, DrawTimer& dtm) {
         VkBuffer b;
         uint64_t o;
         uint32_t isz = d.index_type == 0 ? 1 : d.index_type == 1 ? 2 : 4;
-        if (!find_pool(d.index_addr, (uint64_t)d.count * isz, &b, &o) || d.index_type == 0) {
+        if (d.index_type == 0 ||
+            (!(vbw && vbw_lier(d.index_addr, d.index_addr, d.index_addr + (uint64_t)d.count * isz, &b, &o)) &&
+             !find_pool(d.index_addr, (uint64_t)d.count * isz, &b, &o))) {
             skip(d.index_type == 0 ? "8-bit index" : "index buffer not found", prog.label);
-            prof_end(pq, "(draw skipped)");
+            prof_end(pq, "(draw skipped)", "skipped");
             return;
         }
         vkCmdBindIndexBuffer(g.cb, b, o, d.index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(g.cb, d.count, d.instances, 0, d.base_vertex, d.base_instance);
     }
-    if (pq >= 0) prof_end(pq, prog.label + (fs ? " [fs " + fs->hash + "]" : " [no fs]"));
+    if (pq >= 0) {   // sans fragment shader : le vertex shader identifie le programme (20 variantes du même fichier)
+        char pass[64];
+        snprintf(pass, sizeof pass, "%ux%u%s", W, H, rts[0] ? "" : " depth only");
+        prof_end(pq, prog.label + (fs ? " [fs " + fs->hash + "]" : " [no fs, vs " + vs->hash + "]"), pass,
+                 (uint64_t)d.count * std::max(1u, (uint32_t)d.instances));
+    }
     if (g.checkpoints) mark("after " + mk);
     if (watch_ring != ~0ull) {   // banque 2 vue par le GPU à l'exécution, contre son contenu à l'enregistrement
         static int nw = 0;
@@ -6725,6 +8005,7 @@ void dispatch(const nvn::GfxState& s, uint32_t gx, uint32_t gy, uint32_t gz) {
                  prog.label.c_str(), gx, gy, gz, cs->c0[0], cs->c0[4], cs->c0[3], cs->glob ? ", global memory" : "");
     }
     end_render();
+    shader_servi(cs, prog.label);
     if (g.dbg) {
         g.dbg_dump = false;
         HLOG("vkdbg", "dispatch %ux%ux%u '%s'", gx, gy, gz, prog.label.c_str());
@@ -6814,6 +8095,7 @@ void dispatch(const nvn::GfxState& s, uint32_t gx, uint32_t gy, uint32_t gz) {
             }
             for (uint32_t k = 0; k < nssbo && k < 32; k++) {
                 const nvn::Range& r = s.ssbo[5][k];
+                if (cs->glob && r.addr && r.size) vbw_ecriture(r.addr, r.size);   // RECOMP_VB_VRAM : écrit par le GPU
                 const uint64_t d[2] = {r.addr, r.size};
                 if (ssbo_base + 16 * k + 16 <= GTAB) memcpy(p + ssbo_base + 16 * k, d, 16);
                 if (cs->glob && r.addr && r.size && !getenv("RECOMP_GLOB_RETOUR_SEUL") && !guest_devaddr(r.addr, r.size)) {   // importe sa fenêtre au besoin
@@ -7198,6 +8480,7 @@ bool copy_buffer(uint64_t src, uint64_t dst, uint64_t size) {
     VkBufferCopy c{so, dof, size};
     vkCmdCopyBuffer(g.cb, sb, db, 1, &c);
     barrier_all();
+    vbw_ecriture(dst, size);   // RECOMP_VB_VRAM : écrit par le GPU, sans faute
     static int nlog = 0;
     if (nlog++ < 6) HLOG("vk", "CopyBufferToBuffer 0x%llx → 0x%llx (%llu bytes): on the GPU", (unsigned long long)src,
                          (unsigned long long)dst, (unsigned long long)size);
@@ -7497,7 +8780,76 @@ inline double ms_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
 }
 
+// RECOMP_STALL_SERIES=image,nombre,ms (essai) : à cette image, une série de blocages simulés de ms chacun, comme
+// autant de pipelines compilés en entier par un pilote sans bibliothèques (issue n° 26).
+void stall_series(uint64_t frame) {
+    static const char* e = getenv("RECOMP_STALL_SERIES");
+    if (!e) return;
+    static unsigned long long image = 0;
+    static int nombre = 0, ms = 0, lu = sscanf(e, "%llu,%d,%d", &image, &nombre, &ms);
+    static bool fait = false;
+    if (lu != 3 || fait || frame < image) return;
+    fait = true;
+    HLOG("vk", "simulated series of %d stalls of %d ms (RECOMP_STALL_SERIES), frame %llu", nombre, ms,
+         (unsigned long long)frame);
+    for (int i = 0; i < nombre; i++) {
+        Blocage bl;
+        Sleep((DWORD)ms);
+    }
+    HLOG("vk", "simulated series over: %llu ms hidden from the game clock so far",
+         (unsigned long long)rt_stall_cache_ms());
+}
+
+// Fil de surveillance : sans image livrée depuis 5, 20 puis 50 s, une ligne dit où en est le fil du GPU et ce que la
+// carte n'a pas fini. Le chien de garde du moteur arrête le jeu à 60 s : la dernière ligne le précède.
+void surveillance_blocages() {
+    uint64_t vu = 0;
+    auto depuis = std::chrono::steady_clock::now();
+    int palier = 0;
+    static const int paliers[] = {5, 20, 50};
+    for (;;) {
+        Sleep(1000);
+        const uint64_t n = g_gpu_images.load();
+        const auto la = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(la - depuis).count();
+        if (n != vu) {
+            if (palier) HLOG("vk", "frames are delivered again after %.0f s without one", s);
+            vu = n, depuis = la, palier = 0;
+            continue;
+        }
+        if (!n || palier >= 3 || s < paliers[palier]) continue;   // pas encore de première image, ou tout est dit
+        palier++;
+        std::string lot = " (not read: the renderer is busy)", prog = "?";
+        {
+            std::unique_lock<std::mutex> lk(g_vk_lk, std::defer_lock);
+            for (int k = 0; k < 30 && !lk.try_lock(); k++) Sleep(10);
+            if (lk.owns_lock()) lot = batch_desc(), prog = g.last_label;
+        }
+        HLOG("vk", "NO FRAME DELIVERED BY THE GAME FOR %.0f s. Graphics thread: %s. Submissions: %llu sent, %llu finished by "
+                   "the graphics card. Last program: '%s'. Shaders of the unfinished submissions (* = never completed "
+                   "before):%s",
+             s, g_gpu_phase.load(), (unsigned long long)g.submitted, (unsigned long long)gpu_done_serial(), prog.c_str(),
+             lot.c_str());
+    }
+}
+
 bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
+    {
+        g_gpu_images++;
+        static std::once_flag une;
+        std::call_once(une, [] { std::thread(surveillance_blocages).detach(); });
+        // RECOMP_HANG_TEST=image,secondes (essai) : le fil du GPU dort à cette image, pour voir la surveillance
+        static long img = -1, sec = 0;
+        static const bool essai = [] {
+            const char* e = getenv("RECOMP_HANG_TEST");
+            return e && sscanf(e, "%ld,%ld", &img, &sec) == 2;
+        }();
+        if (essai && (long)frame == img) {
+            Phase ph("RECOMP_HANG_TEST (simulated hang)");
+            Sleep((DWORD)sec * 1000);
+        }
+    }
+    stall_series(frame);
     static const bool perf = getenv("RECOMP_PERF") != nullptr;
     auto t_in = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(g_vk_lk);
@@ -7519,12 +8871,24 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
             caps.currentExtent.width != UINT32_MAX &&
             (caps.currentExtent.width != g.scext.width || caps.currentExtent.height != g.scext.height))
             g.sc_stale = true;
+#ifndef _WIN32
+        // Wayland : la surface n'a pas de taille (currentExtent vaut UINT32_MAX), c'est la swapchain qui la donne.
+        // Taille de la fenêtre en pixels comparée à celle de la swapchain : sans cela, une fenêtre redimensionnée par
+        // le bureau (cadre libdecor de GNOME, F11, à la main) gardait une swapchain d'une autre taille, et le pilote
+        // NVIDIA n'en montrait rien (fond gris du cadre).
+        else if (caps.currentExtent.width == UINT32_MAX) {
+            int pw = 0, ph = 0;
+            gfx_window_pixels(&pw, &ph);
+            if (pw > 0 && ph > 0 && ((uint32_t)pw != g.scext.width || (uint32_t)ph != g.scext.height)) g.sc_stale = true;
+        }
+#endif
     }
     if (g.sc_stale && g.hwnd) {
         VkSurfaceCapabilitiesKHR caps;
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.pd, g.surf, &caps) == VK_SUCCESS && caps.currentExtent.width &&
             caps.currentExtent.height) {
             vkDeviceWaitIdle(g.dev);
+            menu::vk::images_fenetre(VK_FORMAT_UNDEFINED, {});   // vues des images de l'ancienne swapchain (menu en jeu)
             for (VkSemaphore sm : g.sem_img) vkDestroySemaphore(g.dev, sm, nullptr);   // recréés avec les images
             g.sem_img.clear();
             VkSwapchainKHR old = g.sc;
@@ -7538,6 +8902,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     bool have = false;
     Vk::Slot& sl = g.slots[g.slot];   // emplacement de l'enregistrement en cours (begin_frame ci-dessus)
     if (g.sc && !g.sc_stale) {
+        Phase ph("vkAcquireNextImageKHR (waiting for a free display image)");
         VkResult ar = vkAcquireNextImageKHR(g.dev, g.sc, UINT64_MAX, sl.sem_acq, VK_NULL_HANDLE, &idx);
         have = ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR;
         if (ar == VK_SUBOPTIMAL_KHR || ar == VK_ERROR_OUT_OF_DATE_KHR) g.sc_stale = true;
@@ -7604,6 +8969,9 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
         VkClearColorValue c{{0.1f, 0.0f, 0.1f, 1.0f}};
         vkCmdClearColorImage(g.cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &ib.subresourceRange);
     }
+    // Menu en jeu (menu.h, F1), compteur d'images : par-dessus l'image du jeu, à la taille de la fenêtre. L'image
+    // d'écran est en TRANSFER_DST_OPTIMAL avant et après ; rien n'est enregistré quand rien ne se montre.
+    if (have) menu::vk::presenter(g.cb, idx, g.scext.width, g.scext.height);
     ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     ib.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -7611,6 +8979,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     if (have) vkCmdPipelineBarrier2(g.cb, &di);
     static const long audit_every = getenv("RECOMP_POOL_AUDIT") ? atol(getenv("RECOMP_POOL_AUDIT")) : 0;
     if (audit_every > 0 && frame % (uint64_t)audit_every == 0) pool_audit(frame);
+    ft_end(true, frame);
     vkEndCommandBuffer(g.cb);
     g.recording = false;
     // fin de copie vers l'image d'écran : un sémaphore par image (réutilisé quand l'image revient)
@@ -7635,7 +9004,30 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     pi.pSwapchains = &g.sc;
     pi.pImageIndices = &idx;
     auto t_pr = std::chrono::steady_clock::now();
+    if (perf) {
+        // Régularité des présentations à l'écran réel (issue n° 41) : écart de chaque intervalle entre deux appels à
+        // la période de l'écran virtuel. Les temps d'image du jeu peuvent être plats et ces instants irréguliers : sur
+        // un écran à fréquence fixe, une image dure alors un balayage de plus ou de moins que sa voisine.
+        static std::chrono::steady_clock::time_point avant;
+        static double s1 = 0, s2 = 0, pire = 0;
+        static int n = 0, hors1 = 0, hors2 = 0, demi = 0;
+        if (avant.time_since_epoch().count()) {
+            const double per = 1000.0 / settings().refresh_rate;
+            const double e = std::chrono::duration<double, std::milli>(t_pr - avant).count() - per;
+            s1 += e, s2 += e * e, n++;
+            pire = std::max(pire, fabs(e));
+            hors1 += fabs(e) > 1.0, hors2 += fabs(e) > 2.0, demi += fabs(e) > per / 2;
+            if (n == 120) {
+                HLOG("perf", "present calls: interval error sd %.2f ms, worst %.2f ms; off by more than 1 ms: %d, 2 ms: %d, "
+                             "half a period: %d (of 120, period %.2f ms)",
+                     sqrt(std::max(0.0, s2 / n - (s1 / n) * (s1 / n))), pire, hors1, hors2, demi, per);
+                s1 = s2 = pire = 0, n = hors1 = hors2 = demi = 0;
+            }
+        }
+        avant = t_pr;
+    }
     if (have) {
+        Phase ph("vkQueuePresentKHR (handing the frame to the display)");
         VkResult pr = vkQueuePresentKHR(g.q, &pi);
         if (pr == VK_SUBOPTIMAL_KHR || pr == VK_ERROR_OUT_OF_DATE_KHR) g.sc_stale = true;
     }
@@ -7643,7 +9035,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     auto t_f = std::chrono::steady_clock::now();
     // soumissions asynchrones : pas d'attente, sauf pour relire l'état du GPU (profileur, tampon de débogage)
     if (!g.async || g.prof || g.dbgptr) wait_serial(serial, "presentation");
-    prof_frame(frame);   // RECOMP_GPU_PROFILE : bilan de l'image profilée, armement de la suivante
+    prof_frame(frame, d_acq);   // RECOMP_GPU_PROFILE : bilan de l'image profilée, armement de la suivante
     if (g.dbgptr && g.dbgptr[1]) {   // RECOMP_DBG_SSBO : enregistrements (4 mots) rangés par le shader surveillé
         static int nd = 0;
         uint32_t n = std::min<uint32_t>(g.dbgptr[1], 4000);
@@ -7687,6 +9079,11 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
                  o.c_str(), (unsigned long long)g.frame_draws, g_flush_us.exchange(0) / 120e3, (unsigned long long)g_flush_n.exchange(0),
                  g_wait_us.exchange(0) / 120e3, g.ring_peak / 1048576.0);
             g.ring_peak = 0;
+            // temps GPU réel des images dont le bilan est arrivé dans la fenêtre (en retard de quelques images)
+            if (g_ft.n)
+                HLOG("perf", "GPU time per frame: %.2f ms avg, %.2f ms max; %d of %d frames over %.2f ms",
+                     g_ft.sum / g_ft.n, g_ft.mx, g_ft.slow, g_ft.n, frame_budget_ms());
+            g_ft = FtAcc();
             HLOG("perf", "draw: %.1f calls/frame, ms/frame: prog %.3f textures %.3f pass %.3f pipeline %.3f descriptors %.3f end %.3f",
                  g_dn.exchange(0) / 120.0, g_dt[0].exchange(0) / 120e6, g_dt[1].exchange(0) / 120e6, g_dt[2].exchange(0) / 120e6,
                  g_dt[3].exchange(0) / 120e6, g_dt[4].exchange(0) / 120e6, g_dt[5].exchange(0) / 120e6);
@@ -7731,6 +9128,29 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     if ((long)frame == tex3d_frame) tex3d_dump(frame);
     static const long nan_every = getenv("RECOMP_NAN_SCAN") ? atol(getenv("RECOMP_NAN_SCAN")) : 0;
     if (nan_every > 0 && frame % (uint64_t)nan_every == 0) nan_scan(frame);
+    // RECOMP_SNAPSHOT_CAMPAIGN=pas[,début[,fin]] (diagnostic) : un instantané tous les `pas` secondes comptées depuis
+    // le début de campagne (2e écriture de la sauvegarde), de `début` à `fin`. Deux parties d'essai se comparent alors
+    // au même endroit à une image près ; les numéros d'image, eux, ne s'alignent pas d'une partie à l'autre.
+    {
+        static double pas = 0, debut = 0, fin = 1e9;
+        static const bool camp = [] {
+            const char* e = getenv("RECOMP_SNAPSHOT_CAMPAIGN");
+            return e && sscanf(e, "%lf,%lf,%lf", &pas, &debut, &fin) >= 1 && pas > 0;
+        }();
+        static long k = 0;
+        const uint64_t t0 = camp ? g_campagne_ns.load() : 0;
+        if (t0 && src) {
+            const double t = ((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count() - t0) / 1e9;
+            if (t >= debut + k * pas && t <= fin) {
+                while (t >= debut + (k + 1) * pas) k++;   // instants manqués (chargement) : un seul instantané
+                HLOG("vk", "campaign snapshot %ld at +%.3f s (target +%.2f s): frame %llu", k, t, debut + k * pas,
+                     (unsigned long long)frame);
+                snapshot(*src, frame, crop);
+                k++;
+            }
+        }
+    }
     // RECOMP_SNAPSHOT_EVERY=n : un instantané toutes les n images (aperçu vidéo, voir RECOMP_SNAPSHOT_DIR)
     static const long snap_every = getenv("RECOMP_SNAPSHOT_EVERY") ? atol(getenv("RECOMP_SNAPSHOT_EVERY")) : 0;
     if (snap_every > 0 && src && frame % (uint64_t)snap_every == 0) snapshot(*src, frame, crop);
@@ -7757,13 +9177,15 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
     // memory_saver = false : plafond fixe, comme en 1.0.2.
     if (frame % 60 == 0) {
         int niveau = 0;
+        bool vram_pleine = false;
         if (settings().memory_saver) {
             const double libre = memoire_validable_libre_go();
             uint64_t used = 0, budget = 0;
             const bool video_pleine = vram_usage(&used, &budget) && used > budget / 100 * 85;
+            vram_pleine = video_pleine;
             niveau = libre < 3.0 ? 2 : libre < 5.0 || video_pleine ? 1 : 0;
             // rendus des textures en attente et réserve de tampons : réduits sous 5 Go, vidés sous 3 Go
-            g_memoire_niveau = libre < 3.0 ? 2 : libre < 5.0 ? 1 : 0;
+            memoire_niveau_suivre(libre);
             static int niveau_vu = 0;
             if (niveau != niveau_vu) {
                 HLOG("vk", "orphaned-image cache: %s (%.1f GB available commit, video memory %.0f / %.0f MB)",
@@ -7775,6 +9197,8 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
         evict_unreferenced(niveau == 2 ? 0 : niveau == 1 ? std::min<uint64_t>(UNREF_CAP, 256ull << 20) : UNREF_CAP);
         if (niveau == 2)
             while (evict_import(120)) {}
+        if (g_memoire_niveau >= 2) vram_blocs_vides_rendre("less than 3 GB of commit free");
+        else if (vram_pleine) vram_blocs_vides_rendre("video memory over 85 % of its budget");
     }
     // Windows a refusé de la mémoire au jeu (memory.cpp, mem_pression) : les images sans objet et les fenêtres d'import
     // qui ne servent pas à l'image en cours sont rendues tout de suite, pendant que le fil fautif réessaie.
@@ -7785,6 +9209,7 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
         const uint64_t avant = g.unref_bytes, imp = g.imported;
         evict_unreferenced(0);
         while (evict_import(2)) {}
+        vram_blocs_vides_rendre("memory refused");
         if (premier)
             HLOG("vk", "memory pressure: %.0f MB of orphaned images and %.0f MB of import windows released",
                  (avant - g.unref_bytes) / 1048576.0, (imp - g.imported) / 1048576.0);
@@ -7838,4 +9263,12 @@ bool present(uint64_t texkey, uint64_t frame, const int32_t* crop) {
 }
 
 }  // namespace vkr
+
+// Menu en jeu (menu.h) : la technique en service, dite sous les lignes de l'onglet Graphismes
+std::string menu::hote::technique() {
+    if (!dlss::pret()) return "";
+    const char* d = dlss::description();
+    return d && *d ? d : dlss::technique();
+}
+
 }  // namespace hos

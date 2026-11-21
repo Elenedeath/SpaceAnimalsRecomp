@@ -14,7 +14,11 @@
 #include "settings.h"
 #include "vk_render.h"
 
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include "plat_linux.h"
+#endif
 
 #include <array>
 #include <atomic>
@@ -155,10 +159,22 @@ void vi_swap_interval(CPUState* ctx) {   // (Layer*, int, int)
     if (n++ < 20) HLOG("gfx", "nn::vi::SetLayerExtendedSwapInterval(%d, %d)", (int32_t)A(1), (int32_t)A(2));
     R(ctx, 0);
 }
+// Écran HDR ? Non : la fenêtre du jeu est en sRGB 8 bits (vk_render.cpp). Le jeu a pourtant tout un rendu HDR
+// (render.hdr_*, nvnWindowSetHdrContentMetadata) qu'il n'active que si cette fonction dit oui.
+// RECOMP_HDR_PROBE=format,nits (essai, issue n° 30) : répond « HDR actif » avec ce format (nn::vi::HdrOutputFormat) et
+// cette valeur, pour voir ce que le jeu change ; l'image n'est PAS présentée en HDR, elle sera donc fausse à l'écran.
 void vi_hdr_status(CPUState* ctx) {   // (bool*, HdrOutputFormat*, u16*, Display const*)
-    if (A(0)) *P<uint8_t>(A(0)) = 0;
-    if (A(1)) *P<uint32_t>(A(1)) = 0;
-    if (A(2)) *P<uint16_t>(A(2)) = 0;
+    static unsigned sonde_fmt = 0, sonde_nits = 0;
+    static const bool sonde = [] {
+        const char* e = getenv("RECOMP_HDR_PROBE");
+        return e && sscanf(e, "%u,%u", &sonde_fmt, &sonde_nits) == 2;
+    }();
+    static int dits = 0;
+    if (dits++ < 3)
+        HLOG("vi", "the game asks whether the display is HDR: %s", sonde ? "yes (RECOMP_HDR_PROBE)" : "no");
+    if (A(0)) *P<uint8_t>(A(0)) = sonde ? 1 : 0;
+    if (A(1)) *P<uint32_t>(A(1)) = sonde ? sonde_fmt : 0;
+    if (A(2)) *P<uint16_t>(A(2)) = sonde ? (uint16_t)sonde_nits : 0;
     R(ctx, 0);
 }
 void vi_paper_white(CPUState* ctx) {
@@ -190,7 +206,7 @@ int g_nstub = 0;
 void nvn_trace_impl(const char* name, CPUState* ctx, bool stub) {
     HLOG("nvn", "%s%s(0x%llx, 0x%llx, 0x%llx, 0x%llx) from %s [thread %u]", stub ? "[stub] " : "", name,
          (unsigned long long)A(0), (unsigned long long)A(1), (unsigned long long)A(2), (unsigned long long)A(3),
-         symbolize(ctx->x[30]).c_str(), current_thread_id());
+         symbolize(ctx->x[30]).c_str(), (unsigned)current_thread_id());
 }
 
 void stub_call(int i, CPUState* ctx) {

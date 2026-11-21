@@ -19,7 +19,14 @@
 #include "hos.h"   // avant <windows.h>, comme settings.cpp (GPTR)
 #include "settings.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#include <dirent.h>
+#include <dlfcn.h>
+#include <sys/stat.h>
+#endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -105,15 +112,23 @@ static_assert(sizeof(Identite) == 32 && sizeof(Decouverte) == 56 && sizeof(InfoC
 // Table de paramètres de NGX : objet C++ du pilote, appelé par sa table virtuelle (convention x64 de Windows, `this`
 // en premier). Emplacements : Set(void*) 0, Set(int) 3, Set(unsigned) 4, Set(float) 6, Get(void**) 8, Get(int*) 11,
 // Get(unsigned*) 12.
+// Linux : pilote compilé par GCC (ABI Itanium) : les fonctions virtuelles sont dans l'ordre de leur déclaration
+// (nvsdk_ngx_params.h : Set ull, float, double, unsigned, int, D3D11, D3D12, void* ; puis les Get), alors que MSVC
+// range chaque groupe de surcharges à l'envers ; `this` reste en premier (convention System V).
+#ifdef _WIN32
+enum { V_SET_PTR = 0, V_SET_I = 3, V_SET_UI = 4, V_SET_F = 6, V_GET_I = 11, V_GET_UI = 12 };
+#else
+enum { V_SET_PTR = 7, V_SET_I = 4, V_SET_UI = 3, V_SET_F = 1, V_GET_I = 12, V_GET_UI = 11 };
+#endif
 struct Parametres;
 void** vt(Parametres* p) { return *(void***)p; }
-void p_ptr(Parametres* p, const char* n, void* v) { ((void (*)(Parametres*, const char*, void*))vt(p)[0])(p, n, v); }
-void p_i(Parametres* p, const char* n, int v) { ((void (*)(Parametres*, const char*, int))vt(p)[3])(p, n, v); }
-void p_ui(Parametres* p, const char* n, unsigned v) { ((void (*)(Parametres*, const char*, unsigned))vt(p)[4])(p, n, v); }
-void p_f(Parametres* p, const char* n, float v) { ((void (*)(Parametres*, const char*, float))vt(p)[6])(p, n, v); }
-Res g_i(Parametres* p, const char* n, int* v) { return ((Res(*)(Parametres*, const char*, int*))vt(p)[11])(p, n, v); }
+void p_ptr(Parametres* p, const char* n, void* v) { ((void (*)(Parametres*, const char*, void*))vt(p)[V_SET_PTR])(p, n, v); }
+void p_i(Parametres* p, const char* n, int v) { ((void (*)(Parametres*, const char*, int))vt(p)[V_SET_I])(p, n, v); }
+void p_ui(Parametres* p, const char* n, unsigned v) { ((void (*)(Parametres*, const char*, unsigned))vt(p)[V_SET_UI])(p, n, v); }
+void p_f(Parametres* p, const char* n, float v) { ((void (*)(Parametres*, const char*, float))vt(p)[V_SET_F])(p, n, v); }
+Res g_i(Parametres* p, const char* n, int* v) { return ((Res(*)(Parametres*, const char*, int*))vt(p)[V_GET_I])(p, n, v); }
 Res g_ui(Parametres* p, const char* n, unsigned* v) {
-    return ((Res(*)(Parametres*, const char*, unsigned*))vt(p)[12])(p, n, v);
+    return ((Res(*)(Parametres*, const char*, unsigned*))vt(p)[V_GET_UI])(p, n, v);
 }
 
 typedef Res (*F_Init)(const char*, int, const char*, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice,
@@ -124,6 +139,10 @@ typedef Res (*F_Evaluer)(VkCommandBuffer, void*, Parametres*, void*);
 typedef Res (*F_Liberer)(void*);
 typedef Res (*F_ExtInst)(const Decouverte*, uint32_t*, VkExtensionProperties**);
 typedef Res (*F_ExtPer)(VkInstance, VkPhysicalDevice, const Decouverte*, uint32_t*, VkExtensionProperties**);
+// NVSDK_NGX_VULKAN_RequiredExtensions, la question d'avant (sans fonction ni carte) : nombres et noms des extensions
+// d'instance, puis de périphérique ; les noms restent à NGX
+typedef Res (*F_ExtAvant)(unsigned*, const char***, unsigned*, const char***);
+constexpr Res PAS_FAIT = 0xBAD00012u;   // « not implemented » (NVSDK_NGX_Result_FAIL_NotImplemented)
 
 struct Etat {
     bool tente = false;      // cœur NGX cherché
@@ -135,6 +154,7 @@ struct Etat {
     F_Liberer liberer = nullptr;
     F_ExtInst ext_inst = nullptr;
     F_ExtPer ext_per = nullptr;
+    F_ExtAvant ext_avant = nullptr;   // facultative (extensions_peripherique)
     bool extensions_ok = false;   // extensions de périphérique demandées par NGX toutes ajoutées
     bool pret = false;
     VkDevice dev = VK_NULL_HANDLE;
@@ -164,6 +184,108 @@ void journal_ngx(const char* message, int niveau, int fonction) {
     HLOG("dlss", "NGX [%d/%d] %s", niveau, fonction, s.c_str());
 }
 
+#ifndef _WIN32
+// Linux : le cœur NGX est libnvidia-ngx.so.1, installé avec le pilote NVIDIA (mêmes fonctions NVSDK_NGX_VULKAN_* que
+// _nvngx.dll : c'est ce que charge libnvsdk_ngx.a, la bibliothèque Linux du SDK) ; le DLSS, libnvidia-ngx-dlss.so.<version>
+// (SDK DLSS, lib/Linux_x86_64/rel), cherché dans les mêmes dossiers que nvngx_dlss.dll sous Windows.
+std::string utf8(const std::wstring& w) {
+    std::string s;
+    for (wchar_t c : w) {
+        const uint32_t u = (uint32_t)c;
+        if (u < 0x80) s += (char)u;
+        else if (u < 0x800) s += (char)(0xC0 | u >> 6), s += (char)(0x80 | (u & 63));
+        else if (u < 0x10000) s += (char)(0xE0 | u >> 12), s += (char)(0x80 | ((u >> 6) & 63)), s += (char)(0x80 | (u & 63));
+        else s += (char)(0xF0 | u >> 18), s += (char)(0x80 | ((u >> 12) & 63)), s += (char)(0x80 | ((u >> 6) & 63)), s += (char)(0x80 | (u & 63));
+    }
+    return s;
+}
+std::wstring large(const std::string& s) {   // (chemins : UTF-8 → wchar_t de Linux, 32 bits, comme l'attend NGX)
+    std::wstring w;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        uint32_t v = c;
+        int k = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : 3;
+        if (k) v = c & (0x3F >> k);
+        i++;
+        for (int j = 0; j < k && i < s.size(); j++, i++) v = v << 6 | ((unsigned char)s[i] & 63);
+        w += (wchar_t)v;
+    }
+    return w;
+}
+bool a_le_dlss(const std::string& d) {   // libnvidia-ngx-dlss.so.<version> dans ce dossier ?
+    DIR* r = opendir(d.c_str());
+    if (!r) return false;
+    bool ok = false;
+    while (dirent* e = readdir(r))
+        if (!strncmp(e->d_name, "libnvidia-ngx-dlss.so.", 22)) ok = true;
+    closedir(r);
+    return ok;
+}
+bool charger_coeur() {
+    if (g.tente) return g.coeur != nullptr;
+    g.tente = true;
+    char exe[4096] = {};
+    const ssize_t k = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    std::string dossier = k > 0 ? std::string(exe, (size_t)k) : std::string(".");
+    dossier = dossier.substr(0, dossier.find_last_of('/'));
+    std::string racine = dossier;   // <racine>/recomp/build/full
+    for (int i = 0; i < 3 && racine.find_last_of('/') != std::string::npos; i++) racine = racine.substr(0, racine.find_last_of('/'));
+    std::string candidats[5];
+    int nc = 0;
+    if (const char* e = getenv("RECOMP_DLSS_DIR")) candidats[nc++] = e;
+    candidats[nc++] = dossier;
+    candidats[nc++] = dossier + "/dlss";
+    candidats[nc++] = racine + "/outils/dlss";
+    candidats[nc++] = racine + "/recomp/outils/dlss";
+    for (int i = 0; i < nc; i++)
+        if (a_le_dlss(candidats[i])) g.chemins_s[g.nchemins++] = large(candidats[i]);
+    if (!g.nchemins) {
+        HLOG("dlss", "libnvidia-ngx-dlss.so not found (next to recomp_main, in its dlss folder, in outils/dlss, or "
+                     "RECOMP_DLSS_DIR): DLSS off, the game's anti-aliasing stays");
+        return false;
+    }
+    for (unsigned i = 0; i < g.nchemins; i++) g.chemins[i] = g.chemins_s[i].c_str();
+    g.coeur = dlopen("libnvidia-ngx.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!g.coeur) {
+        HLOG("dlss", "NVIDIA NGX not installed (libnvidia-ngx.so.1: %s): DLSS off; it comes with the NVIDIA driver",
+             dlerror());
+        return false;
+    }
+#define NGXF(champ, T, nom) g.champ = (T)dlsym(g.coeur, "NVSDK_NGX_VULKAN_" nom)
+    NGXF(init, F_Init, "Init_ProjectID_Ext");
+    NGXF(capacites, F_Params, "GetCapabilityParameters");
+    NGXF(allouer, F_Params, "AllocateParameters");
+    NGXF(creer, F_Creer, "CreateFeature1");
+    NGXF(evaluer, F_Evaluer, "EvaluateFeature");
+    NGXF(liberer, F_Liberer, "ReleaseFeature");
+    NGXF(ext_inst, F_ExtInst, "GetFeatureInstanceExtensionRequirements");
+    NGXF(ext_per, F_ExtPer, "GetFeatureDeviceExtensionRequirements");
+    NGXF(ext_avant, F_ExtAvant, "RequiredExtensions");
+#undef NGXF
+    if (!g.init || !g.capacites || !g.allouer || !g.creer || !g.evaluer || !g.liberer || !g.ext_inst || !g.ext_per) {
+        HLOG("dlss", "NVIDIA NGX core too old (missing Vulkan functions): DLSS off; update the NVIDIA driver");
+        dlclose(g.coeur);
+        g.coeur = nullptr;
+        return false;
+    }
+    g.dossier_exe = large(dossier);
+    g.donnees = g.dossier_exe + L"/ngx";
+    mkdir((dossier + "/ngx").c_str(), 0755);
+    static const bool journal = getenv("RECOMP_DLSS_LOG") != nullptr;   // journal détaillé de NGX
+    g.info.chemins = {g.chemins, g.nchemins};
+    g.info.journal = {journal ? journal_ngx : nullptr, journal ? 1 : 0, false};
+    g.decouverte.version_api = VERSION_API;
+    g.decouverte.fonction = FONCTION_SUPER_RESOLUTION;
+    g.decouverte.ident.type = 1;
+    g.decouverte.ident.v.projet = {PROJET, 0, "1.0"};
+    g.decouverte.donnees = g.donnees.c_str();
+    g.decouverte.info = &g.info;
+    Dl_info di{};
+    const char* ou = dladdr((void*)g.init, &di) && di.dli_fname ? di.dli_fname : "libnvidia-ngx.so.1";
+    HLOG("dlss", "NVIDIA NGX core: %s; libnvidia-ngx-dlss.so in %s", ou, utf8(g.chemins_s[0]).c_str());
+    return true;
+}
+#else
 std::wstring registre(const wchar_t* cle, const wchar_t* valeur) {
     wchar_t b[1024];
     DWORD t = sizeof b;
@@ -238,6 +360,7 @@ bool charger_coeur() {
     NGXF(liberer, F_Liberer, "ReleaseFeature");
     NGXF(ext_inst, F_ExtInst, "GetFeatureInstanceExtensionRequirements");
     NGXF(ext_per, F_ExtPer, "GetFeatureDeviceExtensionRequirements");
+    NGXF(ext_avant, F_ExtAvant, "RequiredExtensions");
 #undef NGXF
     if (!g.init || !g.capacites || !g.allouer || !g.creer || !g.evaluer || !g.liberer || !g.ext_inst || !g.ext_per) {
         HLOG("dlss", "NVIDIA NGX core too old (missing Vulkan functions): DLSS off; update the NVIDIA driver");
@@ -259,6 +382,7 @@ bool charger_coeur() {
     HLOG("dlss", "NVIDIA NGX core: %s; nvngx_dlss.dll in %s", utf8(dll).c_str(), utf8(g.chemins_s[0]).c_str());
     return true;
 }
+#endif
 
 const char* nom_modele(char m) {
     switch (m) {
@@ -277,6 +401,8 @@ const char* nom_modele(char m) {
 // (extensions_peripherique, puis NGX).
 bool carte_dlss() {
     static const bool ok = [] {
+        // (Linux : en service depuis le 2026-11-21. Il était coupé parce que le cœur NGX y répond « pas fait » à la
+        // question des extensions de périphérique : voir extensions_peripherique.)
         std::string nom;
         uint32_t fabricant = 0;
         if (!vkr::carte_prevue(&nom, &fabricant)) return true;
@@ -351,20 +477,40 @@ void extensions_peripherique(VkInstance inst, VkPhysicalDevice pd, const VkPhysi
     uint32_t n = 0;
     VkExtensionProperties* e = nullptr;
     const Res r = g.ext_per(inst, pd, &g.decouverte, &n, &e);
-    if (!reussi(r)) {
+    std::vector<const char*> demandees;   // noms gardés par NGX
+    if (reussi(r)) {
+        for (uint32_t i = 0; i < n && e; i++) demandees.push_back(e[i].extensionName);
+    } else if (r == PAS_FAIT && g.ext_avant) {
+        // Linux (pilote 595, DLSS 310.9) : libnvidia-ngx-dlss.so n'a pas cette question, le cœur NGX répond « pas
+        // fait ». La question d'avant, elle, donne la liste (VK_NVX_binary_import, VK_NVX_image_view_handle…).
+        unsigned ni = 0, np = 0;
+        const char** li = nullptr;
+        const char** lp = nullptr;
+        const Res r2 = g.ext_avant(&ni, &li, &np, &lp);
+        if (!reussi(r2)) {
+            HLOG("dlss", "NGX device extension queries failed (0x%08x, then 0x%08x): DLSS off", r, r2);
+            return;
+        }
+        std::string noms;
+        for (unsigned i = 0; i < np && lp; i++)
+            if (lp[i]) demandees.push_back(lp[i]), noms += std::string(noms.empty() ? "" : ", ") + lp[i];
+        HLOG("dlss", "device extensions from NGX's older query (the newer one is not implemented here): %s",
+             noms.empty() ? "none" : noms.c_str());
+    } else {
         HLOG("dlss", "NGX device extension query failed (0x%08x): DLSS off", r);
         return;
     }
     std::vector<const char*> ajout;
-    for (uint32_t i = 0; i < n && e; i++) {
+    for (const char* nom : demandees) {
         bool offerte = false, deja = false;
-        for (auto& x : dispo) offerte |= !strcmp(x.extensionName, e[i].extensionName);
-        for (const char* x : ext) deja |= !strcmp(x, e[i].extensionName);
+        for (auto& x : dispo) offerte |= !strcmp(x.extensionName, nom);
+        for (const char* x : ext) deja |= !strcmp(x, nom);
+        for (const char* x : ajout) deja |= !strcmp(x, nom);
         if (!offerte) {
-            HLOG("dlss", "device extension %s requested by NGX not available: DLSS off", e[i].extensionName);
+            HLOG("dlss", "device extension %s requested by NGX not available: DLSS off", nom);
             return;
         }
-        if (!deja) ajout.push_back(e[i].extensionName);
+        if (!deja) ajout.push_back(nom);
     }
     ext.insert(ext.end(), ajout.begin(), ajout.end());
     g.extensions_ok = true;

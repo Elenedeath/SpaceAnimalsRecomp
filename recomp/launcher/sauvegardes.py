@@ -24,7 +24,11 @@ ANCIEN = os.path.join(RECOMP, "build", "full", "save")   # emplacement jusqu'à 
 
 
 def racine_profil():
-    """%APPDATA%\\SpaceAnimalsRecomp (None si APPDATA n'est pas défini)."""
+    """%APPDATA%\\SpaceAnimalsRecomp (None si APPDATA n'est pas défini) ; Linux : ~/.local/share/SpaceAnimalsRecomp."""
+    if sys.platform.startswith("linux"):
+        sys.path.insert(0, RECOMP)
+        import plateforme
+        return plateforme.dossier_donnees()
     appdata = os.environ.get("APPDATA")
     return os.path.join(appdata, "SpaceAnimalsRecomp") if appdata else None
 

@@ -6,11 +6,16 @@
 // Syncs NVN : un objet est « en attente » entre sa soumission dans un FenceSync et la fin, sur le GPU, du
 // travail Vulkan soumis avant ce FenceSync. Le thread GPU soumet sans attendre (vkr::flush_async) ; le fil
 // de complétion de vk_render.cpp signale le sync quand le sémaphore chronologique atteint la soumission.
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#endif
 
 #include "nvn_exec.h"
 #include "gfx.h"
 #include "vk_render.h"
+#include "settings.h"
 
 #include <atomic>
 #include <chrono>
@@ -19,6 +24,7 @@
 #include <thread>
 
 namespace hos {
+extern std::atomic<const char*> g_gpu_phase;   // ce que fait le fil du GPU (vk_render.cpp, surveillance des blocages)
 namespace nvn {
 extern std::atomic<uint64_t> g_exec_ns;
 void perf_report_ops();
@@ -64,17 +70,25 @@ int max_in_flight() {
 
 // Attente précise jusqu'à un tick (minuteur haute résolution, puis attente active < 0,3 ms).
 void wait_until_tick(uint64_t tick) {
+#ifdef _WIN32
     static thread_local HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
     const uint64_t f = rt_cntfrq();
     for (;;) {
         uint64_t now = rt_cntvct();
         if (now >= tick) return;
         int64_t ns = (int64_t)((tick - now) * 1000000000ull / f);
+#ifdef _WIN32
         if (ns > 300000 && tm) {
             LARGE_INTEGER due;
             due.QuadPart = -((ns - 250000) / 100);
             if (SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(tm, INFINITE);
         } else {
+#else
+        if (ns > 300000) {
+            plat_sleep_ns(ns - 250000);   // clock_nanosleep : précis à quelques dizaines de µs
+        } else {
+#endif
             YieldProcessor();
         }
     }
@@ -101,9 +115,12 @@ void run_item(Item& it) {
         vkr::when_done(v, [sy] { signal_done(sy, false); });
         break;
     }
-    case Item::Wait:    // nvnQueueWaitSync
+    case Item::Wait: {  // nvnQueueWaitSync
+        const char* avant = g_gpu_phase.exchange("waiting for a sync of the game (nvnQueueWaitSync): the graphics card has not finished");
         sync_wait(it.a, 100000000);
+        g_gpu_phase.store(avant);
         break;
+    }
     case Item::Flush:   // nvnQueueFinish : travail Vulkan enregistré soumis et terminé
         vkr::flush();
         break;
@@ -120,11 +137,36 @@ void run_item(Item& it) {
         // l'acquisition d'une texture de fenêtre (gpu_acquire_wait), comme sur la console.
         uint64_t per = vi_vblank_period(), now = rt_cntvct();
         uint64_t vb = (now / per + 1) * per;
+        bool a_l_heure;   // l'image suit la précédente d'un seul vblank (ou c'est la première)
         {
             std::lock_guard<std::mutex> lk(g_q_lk);
             if (vb <= g_last_vb) vb = g_last_vb + per;
+            a_l_heure = !g_last_vb || vb == g_last_vb + per;
             g_last_vb = vb;
             g_disp.push_back(vb);
+        }
+        {
+            // Cadence régulière (recomp.ini : frame_pacing, issue n° 41). L'image n'est montrée à l'écran réel qu'à
+            // l'instant de son vblank virtuel, comme dans la file d'affichage de la console, au lieu de l'être dès
+            // qu'elle est prête : le jeu la présentait avec 1 à 3 ms d'avance ou de retard selon le travail de l'image,
+            // et sur un écran à fréquence fixe une image durait alors un balayage de plus ou de moins que sa voisine.
+            // Mesuré le 2026-11-19 (60 Hz, 1440p) : images décalées de plus de 1 ms 39 % → 0,8 %, même débit ; à 120 Hz
+            // et sur 4 cœurs, pas de perte non plus. Le fil du GPU attend ici au lieu de prendre de l'avance.
+            // Seulement quand le PC tient la fréquence : après une demi-seconde d'images à l'heure. Une image qui a
+            // manqué son vblank est montrée tout de suite, et les suivantes aussi tant que le rythme n'est pas revenu.
+            // Sur un PC qui ne tient pas la fréquence, attendre retire l'avance d'une image qui lui évite de manquer
+            // le vblank suivant : un calage sans condition coûtait 8 % d'images sur la carte AMD intégrée (35 img/s
+            // pour 60 demandées). Essayé aussi : ne caler que si l'image est prête un quart de période avant son
+            // vblank ; cela annulait le gain à 120 Hz sans rien rendre à cette carte.
+            const bool cale = settings().frame_pacing;   // (lu à chaque image : le menu en jeu le change en direct)
+            static int suite = 0;   // images à l'heure de suite (fil du GPU seulement)
+            suite = a_l_heure ? std::min(suite + 1, 100000) : 0;
+            if (cale && suite > (int)(rt_cntfrq() / per) / 2) {
+                const uint64_t marge = rt_cntfrq() * 3 / 10000;   // 0,3 ms : préparation de la présentation
+                const char* avant = g_gpu_phase.exchange("waiting for the virtual vblank before showing the frame");
+                if (vb > marge) wait_until_tick(vb - marge);
+                g_gpu_phase.store(avant);
+            }
         }
         if (!vkr::present(it.a, it.b, it.crop)) gfx_present(it.clear, it.b);
         else gfx_count_frame(it.b);
@@ -139,10 +181,12 @@ void gpu_thread() {
         Item it;
         {
             std::unique_lock<std::mutex> lk(g_q_lk);
+            g_gpu_phase.store("idle, waiting for graphics commands from the game (the game itself is not sending any)");
             g_q_cv.wait(lk, [] { return !g_q.empty(); });
             it = std::move(g_q.front());
             g_q.pop_front();
             g_busy = true;
+            g_gpu_phase.store("translating the game's graphics commands");
         }
         uint64_t t0 = now_us();
         run_item(it);

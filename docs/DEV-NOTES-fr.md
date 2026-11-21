@@ -378,7 +378,7 @@ python link.py                                   # après modification du runtim
 | `RECOMP_FRAMES_IN_FLIGHT` | images en attente d'affichage avant blocage de l'acquisition (2 par défaut) |
 | `RECOMP_NO_VSYNC_EMU=1` | pas de contre-pression au vblank virtuel (cadence libre) |
 | `RECOMP_FH_MODE=9` | `ListFrameHistory` vide (régulateur du moteur en boucle ouverte) |
-| `RECOMP_PERF=1` | temps par image : présentation, thread GPU, opérations, étapes de `draw`, attentes de syncs |
+| `RECOMP_PERF=1` | temps par image : présentation, thread GPU, opérations, étapes de `draw`, attentes de syncs ; temps GPU réel par image (moyenne, maximum, images au-delà d'une période d'écran) |
 | `RECOMP_FRAME_TRACE=N`, `RECOMP_FRAME_TRACE_MS=x` | appels système de plus de x ms (1 par défaut) des images N à N+2 |
 | `RECOMP_TS_LOG=N` | horodatages GPU écrits et relus par le jeu (images N à N+3) |
 | `RECOMP_AUTOPRESS=1` | appuie sur A 100 ms toutes les 2 s (écran titre) |
@@ -416,7 +416,19 @@ python link.py                                   # après modification du runtim
 | `RECOMP_FINISH_NO_FLUSH=1` | `nvnQueueFinish` sans soumission du travail Vulkan enregistré (ancienne cause du texte en pavés) |
 | `RECOMP_COPY_IN_PLACE=1` | `CopyBufferToTexture` lit la source au moment de l'exécution GPU au lieu d'un instantané pris à l'enregistrement |
 | `RECOMP_CPU_BUFFER_COPY=1` | `CopyBufferToBuffer` par le processeur à l'enregistrement (ancien comportement) au lieu d'une copie GPU ordonnée |
-| `RECOMP_GPU_PROFILE=N` | à l'image N, durée GPU de chaque dessin et calcul (horodatages), sommée par programme : 30 plus coûteux au journal |
+| `RECOMP_GPU_PROFILE=N` | à l'image N, durée GPU de chaque dessin et calcul (horodatages), sommée par programme : 30 plus coûteux au journal, avec l'étendue du premier au dernier dessin |
+| `RECOMP_GPU_PROFILE=auto` | même profil, pris à l'image qui suit une image lente (temps GPU au-delà d'une période d'écran, ou acquisition de l'image d'écran au-delà d'une demi-période) ; 100 profils au plus, 5 s d'écart, la raison sur chaque ligne ; les dessins sans fragment shader donnent leur vertex shader, chaque ligne le nombre de sommets, et les lignes `target` totalisent le temps par cible de rendu (taille, `depth only` pour les passes de profondeur et d'ombres) |
+| `RECOMP_VB_VRAM=1` | aussi `recomp.ini` `vertex_buffers_vram` / `vertex_buffers_vram_mb` (les variables passent devant) ; essai, désactivé par défaut, Windows seulement (ignoré sous Linux) : sommets et index lus dans une copie en mémoire vidéo au lieu de la mémoire du jeu importée (PCIe). La mémoire du jeu est suivie par morceaux de 64 Ko : copiés en tête du tampon de commandes suivant et protégés en écriture ; une écriture du jeu faute et renvoie les dessins sur l'import jusqu'à la copie suivante ; les morceaux réécrits juste après chaque copie restent sur l'import. `RECOMP_VB_VRAM_MO` : plafond de mémoire vidéo (2048 Mo). `RECOMP_VB_VRAM_CALC=0` : ne jamais copier les fenêtres utilisées par les calculs. Une ligne `VB_VRAM:` au journal toutes les 600 images |
+| `RECOMP_NO_HOST_LIBC=1` | garder les `memmove` / `memcpy` / `strcmp` recompilés du SDK du jeu (par défaut les appels qui passent par le dispatch utilisent la bibliothèque C de l'hôte, mêmes résultats) |
+| `RECOMP_MEMVALID_VQ=1` | `mem_valid` vérifie chaque plage par `VirtualQuery`, comme avant (par défaut les plages à la demande sont reconnues dans la table du runtime, sans appel à Windows) |
+| `RECOMP_TEX_RELEASE_WHOLE=1` | la source d'une grosse texture est rendue d'un bloc, comme avant (par défaut, au-delà de 4 Mo, par morceaux de 4 Mo répartis sur les fins d'image, chaque morceau recomparé à son empreinte juste avant d'être rendu) |
+| `RECOMP_DESWIZZLE_THREADS=n` | aussi `recomp.ini` `deswizzle_threads` (la variable passe devant) ; fils du désentrelacement et des empreintes des textures (par défaut : la moitié des processeurs logiques, 8 au plus) |
+| `RECOMP_DESWIZZLE_OLD=1` | ancien désentrelacement (bandes de lignes, puis seconde lecture de la source pour l'empreinte) ; par défaut chaque morceau de 1 Mo de la source est lu une fois, désentrelacé en écritures non temporelles et haché tant qu'il est dans le cache |
+| `RECOMP_STAGING_POOL_MB=n` | aussi `recomp.ini` `staging_pool_mb` (la variable passe devant) ; taille de la réserve des tampons de transit des textures au-delà de 5 Go validables libres (512 Mo par défaut ; 128 = taille d'avant la 1.1.0.2) |
+| `RECOMP_NO_STAGING_ARENA=1` | aussi `recomp.ini` `staging_arena_mb = off` (taille : `staging_arena_mb`, `RECOMP_STAGING_ARENA_MB` ; les variables passent devant) ; pas d'arène de transit préchauffée (par défaut, au-delà de 5 Go validables libres : un tampon de transit de 512 Mo dont un fil de fond à priorité basse touche chaque page une fois, pour que les envois de textures ne paient plus une faute de page par 4 Ko ; libérée sous 5 Go libres ou quand Windows refuse de la mémoire). `RECOMP_STAGING_ARENA_MB=n` : sa taille |
+| `RECOMP_MEM_NO_HYSTERESIS=1` | niveaux de mémoire (taille de la réserve de transit, arène de transit, rendus différés des textures) qui suivent la mémoire validable libre sans marge, comme avant. Par défaut un niveau descend dès que la mémoire libre passe sous 5 Go (ou 3 Go), mais ne remonte qu'au-delà de 3,5 Go, ou de 5 Go + la taille de l'arène + 0,25 Go : près de 5 Go, l'arène n'est plus créée puis détruite toutes les ~10 s |
+| `RECOMP_NO_IMAGE_BLOCKS=1` | une allocation de mémoire vidéo par texture, comme avant (par défaut les textures de 16 Mo au plus sont taillées dans des blocs partagés de 64 Mo) |
+| `RECOMP_IMAGE_BLOCKS_KEEP=1` | les blocs d'images vides de 64 Mo (un gardé par type de mémoire) restent gardés quelle que soit la mémoire, comme avant. Par défaut ils sont rendus sous 3 Go validables libres, au-delà de 85 % du budget de mémoire vidéo, ou quand de la mémoire est refusée au jeu (une ligne au journal à chaque fois, 20 au plus) |
 | `RECOMP_SYNC_SUBMIT=1` | soumissions synchrones : le thread GPU attend la fin de chaque soumission (avant la 8e passe) |
 | `RECOMP_SNAPSHOT_EVERY=n`, `RECOMP_SNAPSHOT_DIR=d` | un instantané toutes les n images ; dossier (existant) des instantanés |
 | `RECOMP_VOLUME=0..100` | volume de sortie (100 par défaut ; 0 : muet, la carte son rythme quand même l'audio du jeu) |
@@ -435,6 +447,8 @@ python link.py                                   # après modification du runtim
 | `RECOMP_KEY_SCRIPT="38:A,43:-A"` | appuis scriptés : bouton (A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LSTICK RSTICK) appuyé, ou relâché avec `-`, à l'instant donné en secondes. Tenir A 5 s passe une cinématique ; « 38:A,43:-A,52:A,57:-A » mène en général à l'entraînement en 70 s (selon les temps de chargement) |
 | `RECOMP_BACKGROUND_INPUT=1` | lit la manette XInput même quand la fenêtre n'a pas le focus (ancien comportement) |
 | `RECOMP_INPUT_LOG=1` | journal de chaque changement de bouton et de présence de la manette XInput |
+| `RECOMP_MOUSE_KEYBOARD=0\|1` | remplace `mouse_keyboard` de `recomp.ini` (mode souris du jeu, `hle_kbm.cpp`) |
+| `RECOMP_JCMS_CONTACT=0\|1` | mode souris : Joy-Con 2 droit levé ou posé, quel que soit le focus de la fenêtre (essais sans joueur) |
 | `RECOMP_CNTFRQ=hz` | fréquence du compteur invité (31 250 000 par défaut, celle de la Switch 2) |
 | `RECOMP_ALIAS_PACKAGED=1` | ancienne réutilisation, par adresse, d'une image packagée sans comparer son contenu (textures périmées) |
 | `SHADERC_NO_CLIP=1` | (`shaderc.py`) traduit sans `gl_ClipDistance` |
@@ -3742,3 +3756,350 @@ lent). `RECOMP_NAN_SCAN=n` : compte les pixels NaN ou infinis des cibles flottan
 remplissait la mémoire de zéros en silence. `nvn_exec.cpp` : `CopyTextureToBuffer`, jamais exécutée, est notée si le
 jeu l'émet. `RECOMP_SHADER_WATCH=hash,hash` : les dessins qui emploient ces shaders (image, matériau, première cible),
 la première fois puis toutes les 600 images.
+
+**Issue n° 26 (Radeon RX 580, 1.0.3) : trois défauts d'un pilote AMD ancien (2026-11-14).** Le pilote de cette carte
+(branche « legacy » de Polaris) n'offre ni `VK_EXT_graphics_pipeline_library` ni `VK_KHR_shader_quad_control`.
+- *Lignes de fil de fer sur les modèles* : c'est le défaut du point 3 de la section « Cartes AMD » (votes des pixels
+  auxiliaires), que seule `VK_KHR_shader_quad_control` corrige aujourd'hui. Confirmé par le journal du joueur : aucune
+  ligne « fragment shaders: full pixel quads ». Pas corrigé ; il faudrait écrire ces votes sans sous-groupes dans le
+  traducteur. Reproductible avec `RECOMP_GPU=AMD RECOMP_QUAD_CONTROL=0`.
+- *Gel à la première apparition d'un personnage* : sans bibliothèques, chaque pipeline est compilé en entier à son
+  premier dessin, et la précompilation du launcher ne peut pas le préparer. Pas corrigé (piste : une liste d'états de
+  pipelines relevée d'avance).
+- *Arrêt du jeu à la fin de Corneria* (« System vgame_sim appears dead: last reported in 71899 ms ago », puis Abort) :
+  le chien de garde du moteur. La pause du compteur de l'issue n° 13 donnait 5 s de grâce à CHAQUE blocage : des
+  dizaines de pipelines compilés l'un après l'autre, 1 à 4 s chacun, au lancement de la cinématique du débriefing, ne
+  la déclenchaient jamais. Corrigé dans `runtime.cpp` : le crédit de 5 s est cumulé et se recharge d'1 s par 12 s
+  hors blocage (`STALL_RECHARGE`). `RECOMP_STALL_PER_CALL=1` remet l'ancien calcul ;
+  `RECOMP_STALL_SERIES=image,nombre,ms` simule en jeu une série de blocages.
+  Vérifié hors du jeu seulement (`scratchpad/essai_stall.py` : le texte de ces fonctions, extrait de `runtime.cpp`,
+  compilé avec une horloge factice) : 30 blocages de 3 s donnent 5,32 s au compteur du jeu au lieu de 90,3 s ; un
+  blocage de 100 s, 5 s comme avant ; des saccades de 0,3 s toutes les 20 s, rien de caché ; compteur toujours
+  croissant. Puis en jeu (`RECOMP_STALL_SERIES=6000,30,3000`, 30 blocages de 3 s pendant la cinématique d'ouverture) :
+  avec l'ancien calcul (`RECOMP_STALL_PER_CALL=1`), le jeu s'arrête 68 s après le début de la série, avec le message
+  du joueur (« System vgame_sim appears dead: last reported in 65436 ms ago », même `svcBreak`, même argument
+  0x711309f474) ; avec le nouveau, 85 011 ms sont cachées au jeu et la partie continue jusqu'à sa fermeture normale.
+  Le mécanisme est donc reproduit ; que ce soit bien des compilations de pipelines chez le joueur reste une lecture de
+  son journal. La 1.1.0 publiée a encore l'ancien calcul.
+- À faire aussi : la ligne « build: » de `lanceur.log` contient le nom de fichier de la copie du jeu (le dossier du
+  profil est masqué, pas ce nom) ; le joueur l'a rendu public en joignant son journal.
+
+**Outils manquants réparés par la construction (issue n° 3, 2026-11-14).** Un joueur avait le launcher 1.1.0 avec
+« SDL3 missing (outils\sdl3) » et une manette Pro inutilisable en jeu. À la lecture, la mise à jour faite par le
+launcher installe bien les outils ajoutés par une version (`maj.py` exécute le `outils.py` de la nouvelle version avant
+d'écrire `pret.txt`, et s'arrête si un téléchargement échoue ; script identique de la 1.0.0 à la 1.1.0). Mais rien ne
+réparait une installation où il en manque : `update.zip` extrait à la main par-dessus l'ancienne version (le plus
+vraisemblable ici, pas confirmé), fichier supprimé ou mis en quarantaine. Le téléchargement réel par une mise à jour
+n'a jamais été essayé (le contrôle `maj` pose les archives d'avance).
+- `preparer.py`, `outils_manquants` : outils dont la marque `outils/.installe/<nom>` manque ou vient d'une autre
+  archive, ou dont le fichier témoin a disparu (`"temoin"` dans `outils.py` : `SDL3.dll` ; le fichier lui-même pour le
+  FSR et le DLSS). Python et ses modules sont exclus (c'est le Python en cours).
+- `installer_outils_manquants`, au début de chaque construction : relance `outils.py --dest`, qui télécharge ce qui
+  manque. Un échec n'arrête pas la construction (ces outils sont facultatifs) ; il est retenu dans
+  `outils/.installe/_echec.txt` pour que le launcher ne redemande pas une reconstruction à chaque démarrage chez un
+  joueur sans réseau.
+- `--a-refaire` met « outils » en tête de sa liste tant qu'il en manque : le launcher affiche alors « à
+  reconstruire », et la reconstruction les installe (les étapes déjà faites sont sautées).
+- Vérifié sans réseau et sans le jeu (`scratchpad/essai_outils_manquants.py`, fausse installation par paquet) :
+  installation saine, dossier `sdl3` absent, `SDL3.dll` supprimée avec sa marque restée, DLL du DLSS absente sans
+  réseau. Pas vérifié : dans le launcher lui-même, et avec un vrai téléchargement.
+
+## Journée du 2026-11-19 : PR n° 40, bugs des joueurs, cadence régulière (pas publié)
+
+Détails, mesures et limites en anglais à la fin de `DEV-NOTES.md`. En résumé, dans l'ordre :
+
+- **Précompilation et carte choisie.** `recomp_main --precompile` ne lisait pas `recomp.ini` : les shaders étaient
+  toujours compilés pour la carte du choix automatique. Corrigé (`host_main.cpp`).
+- **Installation incomplète (issues n° 37 et 43).** `update.zip` extrait seul : le launcher disait d'installer
+  Python. Il dit maintenant de télécharger le paquet complet (`textes.cpp`, `preparer.py`).
+- **PR n° 40 d'Elenedeath** intégrée dans `shaders/glsl.py` (boucles structurées, aiguillages bornés, mémoire
+  globale moins chère), avec un masque d'alignement en plus. 14 parties d'essai : image identique au bruit de fond
+  près ; NVIDIA 110 → 115 img/s, carte AMD intégrée 11 → 16 img/s en 1080p. La mise à jour refait « shaders ».
+- **Launcher sous Wine / Proton (issue n° 21).** Fenêtre blanche quand l'effet Direct2D de matrice de couleurs
+  manque : les deux effets sont facultatifs (`dessin.cpp`, `LANCEUR_SANS_EFFETS=1` pour l'essayer).
+- **Blocages (issues n° 38 et 33).** Quand le jeu ne livre plus d'image, le journal dit après 5, 20 et 50 s ce
+  qu'attend le fil du rendu et quels shaders la carte n'a pas finis (`vk_render.cpp`, `surveillance_blocages`).
+  La cause du blocage de l'issue n° 38 n'est pas connue ; ce journal la donnera.
+- **Cadence régulière (issue n° 41).** Chaque image est montrée à l'instant de son vblank virtuel au lieu de
+  l'être dès qu'elle est prête, tant que le PC tient la fréquence : à 60 Hz, les images décalées de plus de 1 ms
+  passent de 39 % à 2 %, à 120 Hz de 62 % à 23 % en vol, sans perte
+  de vitesse. Réglage `frame_pacing` de `recomp.ini`, `true` par défaut.
+- **Diagnostics ajoutés** : `RECOMP_SHADER_USED`, `RECOMP_SNAPSHOT_CAMPAIGN`, `RECOMP_FS_SLOW_MBPS`,
+  `RECOMP_HANG_TEST`, ligne `present calls` de `RECOMP_PERF`.
+- **Pas résolu** : carrés noirs des explosions (issues n° 31 et 44), pas reproduits ici en quatre variantes ;
+  saccade de 0,6 à 0,9 s au chargement d'une mission (écriture des textures rendues, sous verrou) ; campagne qui
+  ne démarre pas après le tutoriel (issue n° 9), jamais jouée ici.
+
+## Mode souris : la souris du PC en Joy-Con 2 posé comme une souris (2026-11-19 ; pas publié)
+
+Demande de l'utilisateur : jouer au clavier et à la souris, avec le mode souris du jeu (Switch 2).
+
+* **Ce que le jeu lit.** La souris et le clavier USB (`nn::hid::GetMouseState(s)`, `GetKeyboardStates`) ne servent
+  qu'à l'interface, et seulement quand la variable `input.keyboard_mouse_input_on_nintendo_enabled` est vraie : la visée
+  à la souris passe par le capteur optique des Joy-Con 2 (« Jcms » : `nn::hid::InitializeJcms`, `GetJcmsHandle`,
+  `StartJcms`, `GetJcmsStates`, `StopJcms`, `FinalizeJcms`). Couche vwm (main+0xba67000…) : deux poignées par manette
+  (Joy-Con gauche, type 0 ; droit, type 1), jusqu'à 16 états lus par image, déplacements additionnés.
+  `JcmsState` (0x20 octets) : n° d'échantillon +8, dx +0x10, dy +0x14, attributs +0x18 (bit 0 capteur présent, bit 1
+  posé). Une manette « a une souris » si le bit 0 de l'état le plus récent est mis (événement 0x18 de vwm, lu par
+  `input.get_gamepad_supports_mouse` : l'option « Mode souris » des options de jeu n'apparaît qu'alors).
+* **Type de manette.** Style de Npad bit 12 = « joycon-dual-ms » (paire de Joy-Con 2), 13 et 14 = un Joy-Con 2 seul ;
+  la manette Pro (« fullkey ») ne joue pas à la souris. Mais le jeu n'accepte le bit 12 qu'au démarrage
+  (`SetSupportedNpadStyleSet` 0x741f) : la campagne solo demande 0x407 (portable, paire de Joy-Con, Pro, bit 10) et
+  refuse sans rien dire une manette d'un autre style (« Einzelspieler » sans effet). `svc_hid.cpp` présente donc la
+  paire comme la console : bit 12 s'il est accepté, sinon paire ordinaire (bit 2) ; LIFO JoyDual (+0x6c8 dans le SDK
+  21) et attributs « Joy-Con gauche et droit connectés » (bits 2 et 4), que le jeu exige.
+* **Ce qui allume le mode souris** (`player_input.vscript`, décompilé avec Ghidra 12.2 ; main+0x881ccfa0 dans l'image
+  de référence) : un Joy-Con posé (contact Jcms), la souris qui bouge (plus de 0,01), et son capteur de mouvement qui
+  le dit couché sur la tranche : accélération x > seuil (gauche) ou < −seuil (droit) ; il en ressort quand x revient
+  au-dessus de −0,5 (droit). `eclipse_action_map_manager.vscript` prend alors les tables d'actions de la souris (3 ou
+  4 : droitier, gaucher) : `player_input` rend le type d'entrée 2.
+* **Le vrai blocage : `GetSupportedNpadStyleSet` (hid, commande 101) rendait 0.** À la création de sa fenêtre, le jeu
+  demande les capteurs de mouvement (`GetSixAxisSensorHandles`, `StartSixAxisSensor`) seulement pour les styles qu'il
+  relit par cette commande (main+0xba68b5c) : avec 0, aucun capteur, une accélération nulle, et jamais de mode souris.
+  `svc_hid.cpp` rend maintenant les styles acceptés (avec le réglage).
+* **`hle_kbm.cpp`** remplace les fonctions Jcms du SDK : le Joy-Con droit du joueur 1 reçoit les déplacements bruts de
+  la souris (Raw Input, sans l'accélération de Windows, multipliés par `mouse_speed`), un état au plus toutes les 4 ms ;
+  il est posé tant que la fenêtre a le focus. Et `nn::hid::GetSixAxisSensorState` : au repos, le Joy-Con droit couché
+  sur la tranche (accélération x = −1 G) tant qu'il est posé, sinon à plat. Les boutons de la souris appuient sur des
+  boutons de la Switch (`input.cpp` ; par défaut R et ZR, les deux boutons sous les doigts d'un Joy-Con 2 tenu en
+  souris) ; le clavier pilote la manette comme avant.
+* **Le curseur de Windows** est caché et retenu dans l'image du jeu : en plein écran, dès que la fenêtre est active ;
+  en fenêtré, après un clic dans l'image (la barre de titre reste à portée pour déplacer ou redimensionner la fenêtre ;
+  F11 ou Alt+Entrée vers le fenêtré le rend). `mouse_release` (F9 par défaut, une touche comme `key_…`), Alt+Tab ou la
+  perte du focus le rendent ; un clic dans l'image le reprend, et ce clic n'appuie sur rien dans le jeu (les boutons
+  tenus à la reprise sont ignorés jusqu'à leur relâchement). Toutes les fins du processus (fenêtre fermée,
+  `ExitProcess` de l'invité, plantage, mémoire épuisée) appellent `kbm_release` avant de terminer. Les molettes à haute
+  résolution envoient des fractions du cran de 120 : elles s'additionnent jusqu'au cran. La capture est écrite pour
+  Windows : ailleurs, `mouse_keyboard` reste coupé (`settings.cpp`), pour le portage Linux.
+* **Capteurs de mouvement** : tant que le mode est mis, `GetSixAxisSensorState` répond toujours au repos (Joy-Con droit
+  sur la tranche tant qu'il est posé). C'est ce que le mode demande ; le runtime n'a de toute façon pas d'entrée de
+  mouvement venue des manettes du PC.
+* **Réglages** : `mouse_keyboard` (faux par défaut : manette Pro, rien ne change), `mouse_speed` (10 à 1000 %),
+  `mouse_left`, `mouse_right`, `mouse_middle`, `mouse_back`, `mouse_forward`, `mouse_wheel_up`, `mouse_wheel_down` :
+  n'importe quelle action de la manette (`a` … `right`, `ls_up` … `rs_right`, `left_sl`, `left_sr`, `right_sl`,
+  `right_sr`, `none`) ; un cran de molette est un appui bref (80 ms). Launcher : page Contrôles, onglet SOURIS.
+* **Disposition du jeu en mode souris** (textes de l'interface, `ui_hud.locs_strings`, `HUD_TUTORIAL_PROMPT_R_MOUSE_…`) :
+  la souris dirige ; boost et frein sur le stick droit (haut, bas, tenus) ; inclinaison sur le stick gauche (gauche,
+  droite ; deux fois : tonneau ; les deux tenus : vol stationnaire) ; tir, tir secondaire, torpille et tonneau
+  selon la table d'actions du jeu (`fire_lasers`, `mouse_alt_fire`, `fire_bomb`, `mouse_barrel_roll_left` / `_right`).
+  Main gauche (`L_MOUSE`) : les sticks échangés. D'où la demande de l'utilisateur : toutes les entrées des deux
+  Joy-Con atteignables au clavier et à la souris.
+* **Clavier** : SL et SR de chaque Joy-Con ajoutés aux actions (`key_left_sl` … `key_right_sr`, bits 24 à 27 de
+  l'état Npad, aucune touche par défaut). Une touche peut demander Ctrl, Maj, Alt (`key_rs_up = shift+0x11`) :
+  `touches_actives` (`input.cpp`) garde la combinaison la plus précise de chaque touche (W : stick gauche, Maj+W :
+  stick droit), et une touche modificatrice liée seule ne compte pas pendant une combinaison qui se sert d'elle. Le
+  launcher saisit la combinaison (modificateurs tenus), ou la touche modificatrice relâchée seule. **AltGr** (AZERTY,
+  QWERTZ, US international…) : Windows le rapporte comme Ctrl gauche + Alt droit ; sur une disposition qui l'a (un de
+  ses caractères se tape avec Ctrl+Alt, `VkKeyScanExW`), Alt droit tenu ne compte ni comme Ctrl ni comme Alt, dans le
+  jeu (`host_modifiers_held`) comme dans la saisie du launcher. Les touches de confort des menus (Entrée, Retour
+  arrière, Échap, Tab) s'arrêtent dès que leur touche est liée, seule ou en combinaison. Un jeu construit avant les
+  combinaisons ignore ces touches : la page Contrôles le dit tant que le launcher propose une reconstruction.
+* **`recomp.ini`** : le bloc ajouté ne contient que `mouse_keyboard` (les autres réglages y sont expliqués) ; le
+  launcher n'écrit `mouse_speed` et les entrées `mouse_…` qu'une fois le mode mis (ou s'ils y sont déjà), et la ligne
+  SL · SR du clavier ne s'affiche qu'en mode souris. Launcher et jeu lisent ces réglages de la même façon (majuscules,
+  `yes` / `on` / `oui`, vitesse hors limites ramenée entre 10 et 1000).
+* **Pistes écartées** : la souris USB du jeu (variable ci-dessus) ne vise pas ; le style « joycon-dual-ms » imposé
+  ne suffit pas sans capteur de mouvement. Le léger lissage de la visée vient du jeu (réticule), pas de la souris.
+* **Références** : Recompia (Pokopia, github.com/Dittobyte/Recompia, `docs/hid_mouse_sw2.md`) pour Nmouse, Jcms et les
+  commandes 3110 et suivantes ; Pokopia passe par Nmouse, Star Fox lit Jcms lui-même. Les suffixes
+  `__alias_…__XXXXXXXX` des scripts sont le FNV-1a du chemin du script (`/data/eclipse/input/player_input.vscript` →
+  E6CAE361).
+
+
+## Menu en jeu (F1) : les réglages pendant la partie (2026-11-16 ; pas publié)
+
+Demande : le menu des autres recompilations Switch 2, qui donne les réglages sans quitter le jeu. Modèle : Longshot
+(MagicBeanDev, GPLv3, https://git.magicbean.dev/MagicBeanDev/Longshot : `gpu/vk/vk_menu.cpp`, `vk_imgui.cpp`,
+`vk_ui.h`). Même principe, réécrit pour ce jeu : Dear ImGui ne sert qu'à dessiner (ses listes de dessin, pas ses
+fenêtres ni ses entrées), le menu lit lui-même le clavier, la manette et la souris, et il est dessiné par-dessus l'image
+de la fenêtre à la dernière étape de la présentation. Fermé, il ne coûte rien : aucune image de Dear ImGui, aucune passe.
+
+**Fichiers.**
+- `runtime/os/menu.cpp` : les lignes, les entrées, le dessin. Ni Windows ni Vulkan (les services de l'hôte sont dans
+  l'espace `hote` de `menu.h`) : c'est ce qui permet de l'essayer hors du jeu.
+- `runtime/os/menu_ui.h` : l'allure, celle du launcher (ses couleurs, Bahnschrift), touches et boutons dessinés.
+- `runtime/os/menu_vk.cpp` : Dear ImGui et son backend Vulkan sur le périphérique du moteur ; polices ; textures.
+- `runtime/os/settings_ecrire.cpp` : écriture de `recomp.ini` (les lignes des clés changées sont remplacées en place,
+  le reste est gardé : commentaires, ordre, fins de ligne ; fichier écrit à côté puis mis en place d'un coup).
+- `runtime/third_party/imgui` : Dear ImGui 1.92.9b, sans modification (archive vérifiée par son SHA-256, `README.txt`).
+  Ses réglages sont dans `runtime/os/menu_imconfig.h`, donné à tout le runtime par `link.py`
+  (`-DIMGUI_USER_CONFIG=<os/menu_imconfig.h>`, entre chevrons : aucun guillemet à faire passer à g++ sous Windows). Une
+  vérification de Dear ImGui qui échoue est notée dans le journal (`menu`), elle n'arrête pas la partie.
+
+**Ouverture.** F1 toujours ; Inser aussi, sauf si le joueur l'a donnée à une action ; à la manette, le bouton central
+(Guide, PS, Home) ou Back et Start ensemble. Le premier bouton de l'accord part au jeu avant que le menu s'ouvre : le
+jeu se met donc souvent en pause, ce qui tombe bien. Les neuf premières secondes, un rappel « Réglages F1 » est montré
+en bas à gauche (pas pendant le relevé des shaders : `RECOMP_WINDOW_HIDDEN` ; `RECOMP_NO_MENU_HINT=1` le coupe).
+
+**Le jeu continue.** Comme dans Longshot, le menu n'arrête pas le jeu : il lui retire seulement ses entrées. Arrêter
+le fil qui présente et le compteur du jeu (`rt_stall_begin`) a été écarté : les autres fils du jeu continueraient, et
+rien ne permettait de l'essayer. À dire au joueur (aide de l'onglet Jeu, README) : mettre en pause d'abord.
+
+**Entrées.**
+- Clavier et souris : la procédure de fenêtre (`present.cpp`) donne les touches enfoncées (`menu::touche` : touche
+  virtuelle, scancode, répétition), la molette et les clics ; ils attendent dans une file que le fil qui présente
+  traite (`menu::a_dessiner`). La position du curseur est demandée au dessin (`hote::souris`).
+- Manette : `input.cpp` publie à chaque lecture les entrées brutes, par position (un bit par `Settings::P_*`), sans
+  les réglages du joueur, et le stick gauche (`menu::manette`). Le bouton donné à A valide, celui donné à B revient,
+  comme dans le jeu ; la croix et le stick se répètent quand on les tient.
+- Menu ouvert, `host_poll_input` rend une manette vide au jeu (`menu::masquer`), et les vibrations sont coupées. Menu
+  juste fermé, le jeu ne reçoit rien tant qu'un bouton reste appuyé : celui qui a fermé le menu (Échap vaut +, le
+  bouton donné à B) ne passe pas au jeu. Seuls les boutons comptent pour cette attente, pas les sticks : un joueur qui
+  tient son stick en fermant reprend la main tout de suite.
+
+**Ce qui vaut tout de suite, ce qui attend.** Le menu écrit dans les réglages en service (`settings_vivants`) ceux que
+le jeu relit à chaque usage : vibrations, touches, boutons, netteté du FSR (`fsr.cpp` la lisait une fois : relue à
+chaque image), compteur d'images, taille du menu ; la fenêtre passe par un message à son fil (`WM_PLEIN_ECRAN`) ; le
+volume par `audio_out::set_volume` (le gain était lu une fois au démarrage du fil audio). Les autres ne sont lus qu'au
+démarrage (résolution, cadence, échelle, DLSS, FSR, carte, langue) : le menu ne touche pas aux réglages en service
+(les chaînes `gpu` et `language` sont lues par d'autres fils), il les écrit dans `recomp.ini` et marque la ligne « au
+prochain lancement » tant que sa valeur n'est pas celle du départ. Seules les clés que le joueur a changées sont
+écrites : une valeur imposée par `RECOMP_*` ou la ligne de commande ne passe pas dans le fichier.
+
+**Volume.** C'est un réglage du launcher (`lanceur.ini`, `RECOMP_VOLUME`). Le launcher donne maintenant au jeu le
+chemin de son fichier (`RECOMP_LANCEUR_INI`) et le menu y écrit le volume ; sans launcher, il ne vaut que pour la partie
+(le menu le dit). À la fin de la partie (`WM_JEU_FINI`), le launcher relit `recomp.ini` et son volume : sans cela, le
+prochain changement fait dans le launcher effaçait ceux du menu (`reglages_ecrire` écrit toutes ses clés).
+
+**Vulkan** (`vk_render.cpp`, quatre points d'accroche). `menu::vk::init` après `vkCreateDevice` ;
+`menu::vk::images_fenetre` à chaque swapchain créée (vues de ses images) et avant la destruction de l'ancienne ;
+`menu::vk::presenter` dans `present`, après la copie de l'image du jeu, l'image d'écran en `TRANSFER_DST_OPTIMAL` avant
+et après. Tout s'enregistre dans le tampon de commandes de la présentation : pas de soumission ni d'attente de plus.
+- Textures (l'atlas des lettres) : créées et mises à jour dans ce tampon de commandes, avant la passe ; l'envoi du
+  backend (une soumission et `vkQueueWaitIdle`) ne sert jamais (`dd->Textures = nullptr`).
+- Ce qui est abandonné (tampons de transit, anciennes textures) est détruit `NSLOT + 2` présentations plus tard : un
+  emplacement n'est repris que quand le GPU a fini sa soumission, et chaque présentation en avance d'un au moins. Les
+  tampons de sommets du backend tournent sur autant d'images (`ImageCount`).
+- Images de fenêtre en sRGB (le format que `create_swapchain` préfère) : le shader de fragments du backend est remplacé
+  par le sien suivi du passage du sRGB à la lumière linéaire (`kFragSrgb`, source GLSL en commentaire, compilé par
+  glslang 16.6.0). Longshot convertit les couleurs des sommets sur 8 bits, ce qui écrase les couleurs sombres ; ici les
+  couleurs sombres du menu restent justes.
+- Dear ImGui n'a pas pu démarrer (fonction Vulkan absente, plus de mémoire vidéo) : le menu ne s'ouvre jamais, le jeu
+  garde ses entrées, et le journal dit pourquoi (`menu`).
+
+**Polices.** Bahnschrift comme le launcher (`%WINDIR%\Fonts\bahnschrift.ttf`, Windows 10 et 11), sinon Segoe UI, sinon
+la police vectorielle de Dear ImGui ; `RECOMP_MENU_FONT=<fichier .ttf>` en impose une. Aucune police n'est fournie.
+
+**Construction.** `link.py` compile Dear ImGui avec le runtime (cinq fichiers, une seule fois : cache par fichier), et
+compile maintenant le runtime côte à côte (huit à la fois) : l'étape ne rallonge presque pas. `preparer.py` : l'étape
+`lier` dépend aussi de `third_party/imgui`. `build.py` n'est pas touché (le changer referait la recompilation du jeu).
+Après une mise à jour, seule l'étape `lier` est refaite. `verif/trace_gcc.py` reprend les sources et les drapeaux de
+`link.py`.
+
+**Réglages nouveaux** (`recomp.ini`, section `[menu]`, ajoutée aux fichiers existants) : `show_fps` (true, false ;
+`RECOMP_SHOW_FPS`) et `menu_size` (small, medium, large). Le launcher ne les connaît pas et les garde tels quels.
+
+**Vérifié, et pas vérifié.** Ce travail a été fait sur un Mac, sans Windows :
+- tous les fichiers touchés et Dear ImGui compilent pour Windows (clang de zig 0.17.1, cible `x86_64-windows-gnu`, les
+  options de `link.py`) ; les symboles du menu, de Dear ImGui et des réglages sont tous définis entre les objets ;
+- un banc d'essai hors du jeu (MoltenVK 1.4.2 sur Apple M2 Pro, image hors écran `B8G8R8A8_SRGB` puis
+  `B8G8R8A8_UNORM`) fait tourner le vrai `menu.cpp`, le vrai `menu_vk.cpp` et le vrai `settings_ecrire.cpp` avec des
+  entrées scénarisées : 15 vérifications de comportement (ouverture, réglages immédiats, échange de boutons, touche
+  donnée, confirmation de Quitter, entrées du jeu masquées jusqu'au relâchement, accord Back + Start), en 720p, 1080p,
+  1440p (taille Grand, anglais), 960×540 (page qui défile) et 3440×1440 (600 images), et 26 vérifications de l'écriture
+  de `recomp.ini` (CRLF gardé, clé préfixe d'une autre, sections des touches, écriture d'un seul coup) ;
+- **pas vérifié** : la compilation par le GCC du paquet, l'édition de liens, et tout ce qui est propre à Windows et au
+  jeu : la procédure de fenêtre, le nom des touches, la lecture brute des manettes (SDL3 et XInput), le volume écrit
+  dans `lanceur.ini`, les quatre points d'accroche de `vk_render.cpp` sur une vraie swapchain (NVIDIA, AMD, Intel), le
+  menu pendant une vraie partie. À faire avant de publier : `verifier.py rapide`, puis une partie avec le menu ouvert
+  et fermé plusieurs fois, un changement de fenêtre depuis le menu, et `verif/trace_gcc.py` (liste des fichiers du GCC).
+
+**Première construction sous Windows (2026-11-16).** Compilé et lié par le GCC du paquet avec `preparer.py` (Windows 11,
+NVIDIA RTX 3070 Ti). Une correction a été nécessaire : `fsr.cpp` utilisait `std::clamp` sans `<algorithm>`. Le jeu
+démarre et le menu y fonctionne ; aucun relevé ligne par ligne n'a été gardé. `verifier.py rapide` sur ce PC : `python`,
+`runtime` (858 Mo, aucun avertissement), `sauvegardes`, `launcher`, `desinstaller`, `rapport`, `precompile` et `deplace`
+passent ; `versions`, `depot` et `paquet` échouent sur des fichiers absents du dépôt public (`recomp/depot/`,
+`launcher/extraits/`) ; `deplacement` échoue (comparaison des fichiers, même volume et autre volume), dans du code que
+ce travail ne touche pas. Reste de la liste ci-dessus : AMD et Intel, et `verif/trace_gcc.py`.
+
+## Version 1.2.0 : cinq contributions réunies et adaptées (2026-11-20 ; pas publié)
+
+Pas de 1.1.1 : la 1.2.0 réunit ce qui était prêt pour elle (journée du 2026-11-19, plus haut) et cinq contributions,
+fusionnées dans cet ordre puis adaptées les unes aux autres : PR n° 39 (Linux, Elenedeath), n° 54 (chargements plus
+fluides, Elenedeath), n° 51 (mode souris, sKuhLight), n° 57 (launcher à la manette, Elenedeath), n° 48 (menu en jeu,
+razzamatazm). La version Linux est décrite dans `docs/LINUX-fr.md`. La PR n° 52 (HDR, ultra-large) n'en fait pas
+partie.
+
+- **Méthode.** Fusion à trois voies fichier par fichier (`git merge-file`, base = les sources d'avant), dans une
+  copie ; 22 croisements réglés à la main, presque tous au même endroit : chaque PR ajoute son réglage à la suite de
+  `fast_rendering` (`settings.h`, `settings.cpp`) et sa ligne dans `reglages_lire` et `reglages_ecrire`
+  (`lanceur.cpp`). `git apply` écrit des CRLF sous Windows (`core.autocrlf`) : fins de ligne remises en LF avant
+  toute comparaison.
+- **Menu en jeu sous Linux.** `menu.cpp` ne dépend ni de Windows ni de Vulkan, mais ses services d'hôte
+  (`menu::hote`) n'existaient que dans la moitié Windows de `present.cpp`. Moitié SDL : touches (`touche_menu` : la
+  touche virtuelle de Windows de celles que le menu lit, le scancode PC par `scancodes.h`), molette, clic, souris en
+  pixels (`SDL_GetWindowPixelDensity`), plein écran et « Quitter » demandés au fil principal, noms des touches pris à
+  SDL par le fil principal (ses fonctions de clavier ne sont pas faites pour un autre fil). Police : Barlow du paquet
+  (`<installation>/polices`, trouvée par `/proc/self/exe`), sinon Noto Sans ou DejaVu Sans du système
+  (`menu_vk.cpp`). Volume : `lanceur.ini` est en UTF-8 sous Linux, la ligne `volume=` de `[lanceur]` y est remplacée
+  (`settings.cpp`). Dans `input.cpp`, `menu::manette` et `menu::masquer` sortent du bloc XInput. Une ligne Brouillard
+  en plus (`volumetric_fog`, comme la page Graphismes du launcher Linux) ; les lignes DLSS, d'abord absentes sous
+  Linux, y sont depuis le 2026-11-21 (plus bas).
+- **Menu en jeu et mode souris.** Une touche porte ses modificateurs dans les bits 16 à 18 (`Settings::MODIF_*`).
+  `settings_lignes` l'écrivait en `0x%X` de la valeur entière, que `parse_touche` refusait au lancement suivant
+  (touche remise par défaut) : elle est écrite comme par le launcher (`ctrl+shift+0x11`) et montrée « Maj + W »
+  (`nom_combinaison`). SL et SR ne sont listés qu'en mode souris (`nb_touches`). Menu ouvert, `kbm_wndproc` rend le
+  curseur et n'additionne plus les déplacements ; il est repris à la fermeture comme d'habitude (plein écran : au
+  premier mouvement ; fenêtré : au clic dans l'image). Ligne « Vitesse de la souris » (`mouse_speed`, lue à chaque
+  état de la souris).
+- **Menu en jeu, le reste.** Ligne « Cadence régulière » : `frame_pacing` est lu à chaque image (`nvn_gpu.cpp` ; il
+  l'était une seule fois), elle vaut donc tout de suite. La ligne Affichage suit F11 et Alt+Entrée pendant que le
+  menu est ouvert. La liste des cartes écarte, comme le jeu, les cartes sous Vulkan 1.3, la couche Direct3D 12 et le
+  rendu logiciel. `kNomsActions` (dans `settings.h` depuis le menu) a les quatre actions SL et SR du mode souris.
+- **Launcher sous Linux.** Combinaisons de touches de la page Contrôles : la couche Win32 (`win32_linux.cpp`) envoie
+  `WM_KEYUP`, nomme Maj, Ctrl et Alt (`VK_SHIFT`…) et répond à `GetKeyState` par l'état du clavier de SDL.
+  `disposition_altgr` rend faux (SDL donne AltGr comme Alt droit seul, sans le Ctrl gauche de Windows). Onglet Souris
+  caché : la capture (`hle_kbm.cpp`, Raw Input) est écrite pour Windows, `mouse_keyboard` reste coupé ailleurs. Les
+  deux questions de la désinstallation passent par `demander` (dessinées dans la fenêtre, donc menées à la manette).
+- **Construction.** `link.py` : Dear ImGui et le runtime compilés côte à côte, sous Linux aussi (`zig c++`, mêmes
+  `IMGUI_FLAGS`). `preparer.py` : l'étape « lier » dépend de `plateforme.py` et de Dear ImGui. Chez un joueur Windows
+  qui met à jour : « recompiler » repasse sans recompiler un lot (117 s ici), « lier » refait tout le runtime une
+  fois (24 s) ; 946 objets au lieu de 937.
+- **Dépôt et licences.** `depot.py` exporte aussi `plateforme.py`, `launcher/third_party` et les pages de
+  `recomp/depot/docs`. `THIRD_PARTY_NOTICES.txt` : pl_mpeg, stb_image, section 8 pour les paquets Linux.
+- **Essais (sans joueur).** Windows : campagne de 5 min à 1440p et 120 Hz, 101,5 img/s (103 avec la seule PR n° 54,
+  100 sans), 3 images de plus de 50 ms, pire 123 ms, 10,1 Go engagés, image correcte ; menu piloté par des touches
+  postées à la fenêtre du jeu d'essai : `frame_pacing = false` et `[keyboard]` écrits, « Quitter le jeu » rend 0.
+  Linux (Mint 22.3, RTX 3060 Laptop, X11) : AppImage 155 Mo, .deb 120 Mo, launcher sans écran, jeu 150 s : menu prêt
+  (Barlow), scène 3D présente, 60 img/s à l'écran titre. (Les 13 à 54 img/s notées ici pour le prologue étaient
+  faussées par `RECOMP_PERF` sur cette machine : 50 à 60 sans lui, voir « Cadence sous Linux » plus bas.)
+- **Versé dans l'arbre de développement le 2026-11-21.** Contrôle rapide (`verifier.py rapide`) : tout passait sauf
+  l'essai des questions de mise à jour (`verif/essai_choix_maj.py`), qui cherchait encore les boîtes de Windows
+  (`#32770`) alors que la PR n° 57 dessine les questions dans la fenêtre. Le launcher n'était pas en cause. `demander`
+  écrit maintenant deux lignes au journal (« question shown in the window », « question answered: ») ; l'essai les
+  suit et répond par des touches postées à la fenêtre : espace pour le bouton par défaut, Échap pour « non », jamais
+  Entrée (hors d'une question, c'est le bouton principal). Laquelle des deux questions était à l'écran se lit à ce
+  que le launcher écrit après la réponse. 31 contrôles sur 31.
+- **DLSS sous Linux (2026-11-21).** Il était coupé (`RECOMP_DLSS_LINUX`) : « NGX device extension query failed
+  (0xbad00012) ». `0xBAD00012` veut dire « non implémenté » : sous Linux, `libnvidia-ngx-dlss.so` (310.9.16)
+  n'exporte pas la question des extensions de périphérique, que le cœur NGX du pilote (595.99) ne fait que
+  transmettre. Le cœur exporte encore la question d'avant, `NVSDK_NGX_VULKAN_RequiredExtensions`, qui rend la liste
+  (`VK_NVX_binary_import`, `VK_NVX_image_view_handle`, `VK_KHR_buffer_device_address`, `VK_KHR_push_descriptor`) :
+  `extensions_peripherique` s'y replie quand la première répond « non implémenté » (jamais sous Windows, où elle
+  répond). Course au démarrage : `carte_prevue` (énumération à part, dès la lecture des variables du moteur quand le
+  DLSS est choisi) tombait pendant que SDL chargeait Vulkan sur le fil principal, et un pointeur nul était appelé,
+  une fois sur deux ; sous Linux elle attend la fin de l'initialisation vidéo (`gfx_screen_size`). Verrous retirés :
+  `carte_dlss` (dlss.cpp), `dlss_possible` (lanceur.cpp), page Graphismes (dessin.cpp), lignes DLSS du menu en jeu
+  (menu.cpp). Essais sans joueur (Mint 22.3, RTX 3060 Laptop, pilote 595.99, X11, écran piloté par la carte AMD) :
+  DLSS 4 créé en Qualité (1280×720 → 1920×1080) et en DLAA, aucune évaluation en échec en 8 min jusqu'au jeu
+  interactif (Corneria), images correctes, viseur et interface compris ; 6 démarrages sur 6 sans plantage ;
+  précompilation sans fenêtre en 3 s. Windows revérifié (RTX 5070 Ti, Qualité, 60 img/s : la première question y
+  répond toujours). Le gain en images par seconde n'est pas mesuré : ces essais tournaient avec `RECOMP_PERF`, qui
+  fausse la cadence sur cette machine (point suivant). Modèle M (DLSS 4.5) essayé ensuite sans `RECOMP_PERF`, 1 min
+  dans l'ouverture : créé, aucune évaluation en échec, Qualité à 60 img/s, DLAA vers 42 img/s sur cette carte. Pas
+  essayé : les modes Équilibré à Ultra performance, Wayland, un pilote NVIDIA plus ancien.
+- **Cadence sous Linux : mes mesures étaient en cause (2026-11-21).** Les cadences basses relevées sur le portable
+  d'essai (prologue à 13–54 img/s, première mission vers 10 img/s) venaient de `RECOMP_PERF`, activé dans tous mes
+  essais Linux : il chronomètre chaque opération et chaque dessin, soit des dizaines de milliers de lectures de
+  l'heure par image en mission. Sur cette machine une lecture coûte 1,4 µs au lieu d'une vingtaine de ns : au
+  démarrage le noyau écarte le compteur du processeur (« tsc: Marking TSC unstable due to check_tsc_sync_source
+  failed » ; le cœur 0 est décalé de 155,5 ms des onze autres, mesuré) et prend l'horloge `hpet`, que
+  `clock_gettime` ne lit que par un appel système. Sans `RECOMP_PERF`, comme chez un joueur, même machine, 1080p
+  fenêtré : première mission à 57 img/s en moyenne sur 5 min (45 à 60, jusqu'à 3 564 dessins par image), prologue
+  entre 50 et 60. Le jeu lui-même lit son compteur ≈ 38 000 fois par seconde en mission (compté) : ≈ 5 % d'un cœur
+  sur cette machine, sans effet visible. Le journal du jeu donne maintenant, sous Linux, le coût d'une lecture et
+  l'horloge du noyau, et prévient quand `RECOMP_PERF` est actif sur une horloge lente (`host_main.cpp`). À retenir :
+  ne pas croire une cadence mesurée avec `RECOMP_PERF` quand cette ligne dit « slow time reads » ; mesurer sans lui
+  (les lignes « fps » du journal suffisent).
+- **Pas essayé** : le menu vu à l'écran avec ces adaptations, la manette (menu, launcher, questions), le mode souris
+  avec le menu ouvert, le menu sous Linux au clavier ou à la manette, le .deb installé, une carte AMD, Wayland.

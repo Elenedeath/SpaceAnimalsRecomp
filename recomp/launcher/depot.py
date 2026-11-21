@@ -53,8 +53,14 @@ def main():
     # notes de développement en anglais (recomp/DEV-NOTES.md) : traduction des précédentes, à mettre à jour avec elles
     if os.path.exists(os.path.join(RECOMP, "DEV-NOTES.md")):
         copier(os.path.join(RECOMP, "DEV-NOTES.md"), os.path.join(out, "docs", "DEV-NOTES.md"))
+    # autres pages de docs/ (LINUX.md, LINUX-fr.md de la version Linux…) : gardées dans recomp/depot/docs, comme les
+    # fichiers de la racine ; sans cela l'export les effaçait du dépôt. Les notes de développement viennent de plus haut.
+    pages = os.path.join(DEPOT, "docs")
+    for f in sorted(os.listdir(pages)) if os.path.isdir(pages) else ():
+        if f.endswith(".md") and not f.startswith("DEV-NOTES"):
+            copier(os.path.join(pages, f), os.path.join(out, "docs", f))
     r = os.path.join(out, "recomp")
-    for f in ("recomp.py", "build.py", "fullbuild.py", "link.py", "hooks.txt", "lots.txt", "VERSION"):
+    for f in ("recomp.py", "build.py", "plateforme.py", "fullbuild.py", "link.py", "hooks.txt", "lots.txt", "VERSION"):
         copier(os.path.join(RECOMP, f), os.path.join(r, f))
     for d, ext in SOURCES.items():
         for racine, dossiers, fichiers in os.walk(os.path.join(RECOMP, d)):
@@ -66,6 +72,11 @@ def main():
     for f in os.listdir(LANCEUR):
         if f.endswith(LANCEUR_FICHIERS):
             copier(os.path.join(LANCEUR, f), os.path.join(r, "launcher", f))
+    # code tiers du launcher (pl_mpeg.h : extraits du fond sous Linux), licences/THIRD_PARTY_NOTICES.txt section 7
+    tiers = os.path.join(LANCEUR, "third_party")
+    for f in sorted(os.listdir(tiers)) if os.path.isdir(tiers) else ():
+        if f.endswith((".h", ".txt")):
+            copier(os.path.join(tiers, f), os.path.join(r, "launcher", "third_party", f))
     copier(os.path.join(LANCEUR, "icone.ico"), os.path.join(r, "launcher", "icone.ico"))   # icône du launcher (icone.py)
     for f in ("nup.py", "nso.py"):
         copier(os.path.join(PROJET, "tools", f), os.path.join(out, "tools", f))

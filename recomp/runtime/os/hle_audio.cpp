@@ -269,7 +269,20 @@ void a_gain(CPUState* ctx) {   // SetOutputStreamGain(type*, float gain, TimeSpa
     ctx->x[0] = 0;
 }
 void a_zero(CPUState* ctx) { ctx->x[0] = 0; }
-void a_channels(CPUState* ctx) { ctx->x[0] = 2; }
+// Nombre de canaux de la sortie active, demandé par le jeu. 2 : le jeu ouvre un flux stéréo. RECOMP_AUDIO_CHANNELS=6
+// (essai, issue n° 28 : son 5.1) : annonce six canaux pour voir quel flux le jeu ouvre ; un flux à six canaux est
+// alors replié en stéréo (read_frame), la sortie de Windows restant stéréo.
+void a_channels(CPUState* ctx) {
+    static const int n = [] {
+        const char* e = getenv("RECOMP_AUDIO_CHANNELS");
+        const int v = e ? atoi(e) : 2;
+        if (e) HLOG("audio", "active output device announced to the game with %d channels (RECOMP_AUDIO_CHANNELS)", v);
+        return v == 6 || v == 1 ? v : 2;
+    }();
+    static int dits = 0;
+    if (dits++ < 3) HLOG("audio", "the game asks for the channel count of the output device: %d", n);
+    ctx->x[0] = (uint64_t)n;
+}
 void a_device_name(CPUState* ctx) {   // (AudioDeviceName*)
     if (ctx->x[0]) memcpy((void*)ctx->x[0], "MainAudioOut", 13);
     ctx->x[0] = 0;

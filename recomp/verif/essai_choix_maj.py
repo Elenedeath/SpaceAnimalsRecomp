@@ -5,7 +5,14 @@
 
 Le dossier jetable est un faux paquet : faux maj.py (annonce la version 9.9.9, n'installe rien), faux preparer.py (ne
 construit rien), faux jeu « construit par la version 1.0.2 » alors que le paquet est en 1.0.3. Le launcher, lui, est le
-vrai, sans crochet d'essai : ses boîtes de dialogue s'ouvrent pour de bon et le script y répond.
+vrai, sans crochet d'essai : ses questions s'ouvrent pour de bon et le script y répond.
+
+Depuis la 1.2.0 (PR n° 57), les questions sont dessinées dans la fenêtre du launcher : plus de boîte de Windows à
+chercher. Le script les voit par deux lignes du journal (« question shown in the window », « question answered: »,
+lanceur.cpp, demander) et répond par des touches postées à la fenêtre : espace pour le bouton par défaut (« oui » pour
+ces deux questions), Échap pour « non ». Jamais Entrée : hors d'une question, c'est le bouton principal. Laquelle des
+deux questions était à l'écran se lit à ce que le launcher écrit après la réponse. Une boîte de Windows qui s'ouvrirait
+quand même (seconde question par-dessus la première) est comptée comme un échec.
 
   A  nouvelle version du launcher, jeu à refaire, réponse « non » : rien ne démarre, la question n'est pas reposée,
      la reconstruction reste proposée (elle n'est jamais imposée : le jeu actuel reste jouable)
@@ -53,15 +60,13 @@ else:
 u = ctypes.WinDLL("user32", use_last_error=True)
 ENUM = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 u.EnumWindows.argtypes = [ENUM, wintypes.LPARAM]
-u.EnumChildWindows.argtypes = [wintypes.HWND, ENUM, wintypes.LPARAM]
 u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 u.IsWindowVisible.argtypes = [wintypes.HWND]
-u.GetDlgItem.argtypes = [wintypes.HWND, ctypes.c_int]
-u.GetDlgItem.restype = wintypes.HWND
 u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-WM_CLOSE, WM_COMMAND, IDYES, IDNO = 0x0010, 0x0111, 6, 7
+WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_MOUSELEAVE = 0x0010, 0x0100, 0x0101, 0x02A3
+VK_ECHAP, VK_ESPACE = 0x1B, 0x20
+POSEE, REPONDUE = "question shown in the window", "question answered: "   # lignes du journal (lanceur.cpp, demander)
 
 
 def classe(h):
@@ -86,41 +91,12 @@ def fenetres(pid):
 
 
 def dialogues(pid):
+    """Boîtes de Windows du processus : il ne doit plus y en avoir (questions dessinées dans la fenêtre)."""
     return [h for h, c in fenetres(pid) if c == "#32770"]
 
 
-def texte(dialogue):
-    morceaux = []
-
-    def un(h, _):
-        if classe(h) == "Static":
-            b = ctypes.create_unicode_buffer(2048)
-            u.GetWindowTextW(h, b, 2048)
-            if b.value.strip():
-                morceaux.append(b.value)
-        return True
-
-    u.EnumChildWindows(dialogue, ENUM(un), 0)
-    return "\n".join(morceaux)
-
-
-def attendre_dialogue(pid, delai):
-    fin = time.time() + delai
-    while time.time() < fin:
-        d = dialogues(pid)
-        if d:
-            time.sleep(0.3)   # le texte est posé juste après la création
-            return d[0]
-        time.sleep(0.2)
-    return None
-
-
-def repondre(dialogue, oui):
-    ident = IDYES if oui else IDNO
-    u.PostMessageW(dialogue, WM_COMMAND, ident, u.GetDlgItem(dialogue, ident) or 0)
-    fin = time.time() + 5
-    while time.time() < fin and u.IsWindowVisible(dialogue):
-        time.sleep(0.1)
+def fenetre_principale(pid):
+    return next((h for h, c in fenetres(pid) if c != "#32770"), None)
 
 
 def main():
@@ -184,31 +160,60 @@ def main():
             p.kill()   # le launcher de cet essai, jamais un autre
             note("fermeture du launcher", False, "il a fallu l'arrêter")
 
-    def question(p, delai, avec):
-        """Attend une question ; `avec` : texte attendu dedans (None : la question sur le jeu, sans numéro de version)."""
-        d = attendre_dialogue(p.pid, delai)
-        t = texte(d) if d else ""
-        if d:
-            print("      « " + t.replace("\n", " ⏎ ")[:230] + " »")
-        bonne = bool(d) and (("9.9.9" in t) if avec else ("9.9.9" not in t))
-        return d, bonne
+    def questions():
+        """(posées, répondues) : questions dessinées dans la fenêtre depuis l'ouverture, d'après le journal."""
+        t = lire(journal)
+        return t.count(POSEE), t.count(REPONDUE)
+
+    def attendre_question(delai, deja=0):
+        """Attend une question à l'écran (posée, pas encore répondue), la `deja` + 1ᵉ depuis l'ouverture."""
+        fin = time.time() + delai
+        while time.time() < fin:
+            posees, repondues = questions()
+            if posees > deja and posees == repondues + 1:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def repondre(p, oui):
+        """Répond à la question à l'écran, au clavier ; rend la réponse que le launcher a notée (« yes », « no », « »)."""
+        h = fenetre_principale(p.pid)
+        avant = questions()[1]
+        if not h:
+            return ""
+        if oui:   # la souris du joueur, restée au-dessus de « non », le sélectionnerait : survol oublié d'abord
+            u.PostMessageW(h, WM_MOUSELEAVE, 0, 0)
+        touche = VK_ESPACE if oui else VK_ECHAP
+        u.PostMessageW(h, WM_KEYDOWN, touche, 1)
+        u.PostMessageW(h, WM_KEYUP, touche, 0xC0000001)
+        fin = time.time() + 5
+        while time.time() < fin and questions()[1] == avant:
+            time.sleep(0.1)
+        recues = [l.split(REPONDUE, 1)[1].strip() for l in lire(journal).splitlines() if REPONDUE in l]
+        return recues[-1] if len(recues) > avant else ""
+
+    def poser_et_repondre(p, delai, oui, deja=0):
+        """Une question doit s'afficher, et recevoir la réponse voulue. Rend vrai si les deux."""
+        vue = attendre_question(delai, deja)
+        note("une question s'affiche dans la fenêtre", vue)
+        recue = repondre(p, oui) if vue else ""
+        voulue = "yes" if oui else "no"
+        note(f"elle reçoit « {'oui' if oui else 'non'} »", recue == voulue, "" if recue == voulue else f"réponse notée : {recue or 'aucune'}")
+        return vue and recue == voulue
 
     try:
         # A : nouvelle version du launcher, jeu à refaire, « non »
         ecrire_ini(maj_auto=0)
         p = ouvrir("A  jeu à refaire après une nouvelle version, réponse « non »")
-        d, bonne = question(p, 25, False)
-        note("la question sur la mise à jour du jeu s'affiche", bonne)
-        if d:
-            repondre(d, False)
+        poser_et_repondre(p, 25, False)
         time.sleep(3)
+        note("c'était la question sur le jeu : refus dans le journal", "game update postponed by the player" in lire(journal))
         note("rien ne démarre", not os.path.exists(m_cons) and "build:" not in lire(journal))
-        note("refus dans le journal", "game update postponed by the player" in lire(journal))
         note("version notée comme vue", "version_vue=1.0.3" in lire(ini, "utf-16"))
-        note("pas d'autre question", not dialogues(p.pid))
+        note("pas d'autre question", questions() == (1, 1) and not dialogues(p.pid))
         fermer(p)
         p = ouvrir("A' réouverture")
-        note("la question n'est pas reposée", attendre_dialogue(p.pid, 7) is None)
+        note("la question n'est pas reposée", not attendre_question(7) and not dialogues(p.pid))
         note("la reconstruction reste proposée", "rebuild offered" in lire(journal))
         note("rien ne démarre", not os.path.exists(m_cons))
         fermer(p)
@@ -216,32 +221,26 @@ def main():
         # B : même situation, « oui »
         ecrire_ini(maj_auto=0)
         p = ouvrir("B  jeu à refaire après une nouvelle version, réponse « oui »")
-        d, bonne = question(p, 25, False)
-        note("la question sur la mise à jour du jeu s'affiche", bonne)
-        if d:
-            repondre(d, True)
+        poser_et_repondre(p, 25, True)
         fin = time.time() + 20
         while time.time() < fin and not os.path.exists(m_cons):
             time.sleep(0.3)
+        note("c'était la question sur le jeu : accord dans le journal", "game update accepted by the player" in lire(journal))
         note("la mise à jour du jeu démarre", os.path.exists(m_cons))
-        note("accord dans le journal", "game update accepted by the player" in lire(journal))
         time.sleep(2)
         fermer(p)
 
         # C : mise à jour disponible, « non »
         ecrire_ini(maj_auto=1, version_vue="1.0.3")
         p = ouvrir("C  mise à jour 9.9.9 disponible, réponse « non »")
-        d, bonne = question(p, 30, True)
-        note("la question sur la nouvelle version s'affiche", bonne)
-        if d:
-            repondre(d, False)
+        poser_et_repondre(p, 30, False)
         time.sleep(3)
+        note("c'était la question sur la nouvelle version : refus dans le journal", "update 9.9.9 declined" in lire(journal))
         note("rien n'est installé", not os.path.exists(m_inst) and "update: installing" not in lire(journal))
         note("refus retenu pour cette version", "maj_refusee=9.9.9" in lire(ini, "utf-16"))
-        note("refus dans le journal", "update 9.9.9 declined" in lire(journal))
         fermer(p)
         p = ouvrir("C' réouverture")
-        note("la question n'est pas reposée", attendre_dialogue(p.pid, 9) is None)
+        note("la question n'est pas reposée", not attendre_question(9) and not dialogues(p.pid))
         note("la version reste proposée (bandeau)", "update available: 9.9.9" in lire(journal))
         note("rien n'est installé", not os.path.exists(m_inst))
         fermer(p)
@@ -249,34 +248,34 @@ def main():
         # D : mise à jour disponible, « oui »
         ecrire_ini(maj_auto=1, version_vue="1.0.3")
         p = ouvrir("D  mise à jour 9.9.9 disponible, réponse « oui »")
-        d, bonne = question(p, 30, True)
-        note("la question sur la nouvelle version s'affiche", bonne)
-        if d:
-            repondre(d, True)
+        poser_et_repondre(p, 30, True)
         fin = time.time() + 20
         while time.time() < fin and not os.path.exists(m_inst):
             time.sleep(0.3)
-        note("l'installation démarre", os.path.exists(m_inst) and "update: installing 9.9.9" in lire(journal))
+        note("c'était la question sur la nouvelle version : l'installation démarre",
+             os.path.exists(m_inst) and "update: installing 9.9.9" in lire(journal))
         time.sleep(2)
         fermer(p)
 
         # E : les deux à la fois
         ecrire_ini(maj_auto=1)
         p = ouvrir("E  jeu à refaire et mise à jour disponible en même temps")
-        d, bonne = question(p, 25, False)
-        note("d'abord la question sur le jeu", bonne)
+        vue = attendre_question(25)
+        note("une première question s'affiche dans la fenêtre", vue)
         fin = time.time() + 20
         while time.time() < fin and "update available" not in lire(journal):
             time.sleep(0.3)
         time.sleep(4)   # la seconde question aurait eu le temps de s'ouvrir par-dessus
-        note("une seule question à l'écran", len(dialogues(p.pid)) == 1, f"{len(dialogues(p.pid))} à l'écran")
-        if d:
-            repondre(d, False)
-        d2, bonne = question(p, 10, True)
-        note("puis la question sur la nouvelle version", bonne)
-        if d2:
-            repondre(d2, False)
+        posees, repondues = questions()
+        note("une seule question à l'écran", posees - repondues == 1 and not dialogues(p.pid),
+             f"{posees - repondues} dans la fenêtre, {len(dialogues(p.pid))} boîte(s) de Windows")
+        recue = repondre(p, False) if vue else ""
+        time.sleep(1)
+        note("d'abord la question sur le jeu", recue == "no" and "game update postponed by the player" in lire(journal)
+             and "declined" not in lire(journal))
+        poser_et_repondre(p, 10, False, deja=1)
         time.sleep(2)
+        note("puis la question sur la nouvelle version", "update 9.9.9 declined" in lire(journal))
         note("rien ne démarre, rien n'est installé", not os.path.exists(m_cons) and not os.path.exists(m_inst))
         fermer(p)
     finally:

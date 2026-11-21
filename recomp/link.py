@@ -4,11 +4,14 @@
   python link.py [--modules main,sdk,...] [-O 2] [--out build/full/recomp_main.exe]
 
 Objets des modules : build/full/<module>/objs.txt (produits par fullbuild.py) ; runtime et couche
-hôte (runtime/*.cpp, runtime/os/*.cpp) compilés ici. Un module absent de la liste reste chargé
+hôte (runtime/*.cpp, runtime/os/*.cpp) compilés ici, avec Dear ImGui (runtime/third_party/imgui : le
+menu en jeu, runtime/os/menu.cpp). Un module absent de la liste reste chargé
 en mémoire (manifest) mais ses fonctions ne sont pas appelables : utile pour tester le
 démarrage avant la fin du build de main.
 """
 import argparse
+import concurrent.futures as cf
+import hashlib
 import os
 import subprocess
 import sys
@@ -17,9 +20,26 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import build  # noqa: E402
+import plateforme  # noqa: E402
 
 FULL = os.path.join(HERE, "build", "full")
 ALL = ["main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "sdk"]
+
+# Dear ImGui (third_party/imgui, licence MIT) : le dessin du menu en jeu (runtime/os/menu.cpp, menu_vk.cpp). Ses sources
+# sont compilées avec le runtime, une fois (cache par fichier de build.py). Ses réglages sont dans os/menu_imconfig.h,
+# donné à tout le runtime pour que Dear ImGui et le menu voient les mêmes. Repris par verif/trace_gcc.py.
+IMGUI = os.path.join(build.RUNTIME, "third_party", "imgui")
+IMGUI_SOURCES = [os.path.join(IMGUI, f) for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp",
+                                                  os.path.join("backends", "imgui_impl_vulkan.cpp"))]
+# (entre chevrons, cherché par -I runtime : aucun guillemet à faire passer dans la ligne de commande de Windows)
+IMGUI_FLAGS = ["-I" + IMGUI, "-DIMGUI_USER_CONFIG=<os/menu_imconfig.h>"]
+
+
+def imgui_empreinte():
+    """Drapeau propre aux sources de Dear ImGui : l'empreinte de ses réglages, qui ne sont pas dans leur dossier (un
+    changement de os/menu_imconfig.h les recompile : les drapeaux entrent dans la clé du cache de build.py)."""
+    with open(os.path.join(build.RUNTIME, "os", "menu_imconfig.h"), "rb") as f:
+        return "-DMENU_IMCONFIG=" + hashlib.sha256(f.read()).hexdigest()[:12]
 
 
 def main():
@@ -28,7 +48,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--modules", default=",".join(ALL))
     p.add_argument("-O", default="2")
-    p.add_argument("--out", default=os.path.join(FULL, "recomp_main.exe"))
+    p.add_argument("--out", default=os.path.join(FULL, "recomp_main" + plateforme.EXE))
     a = p.parse_args()
     t0 = time.time()
     objs = []
@@ -51,6 +71,7 @@ def main():
     rt = [os.path.join(build.RUNTIME, "runtime.cpp"), os.path.join(build.RUNTIME, "fp.cpp")]
     osdir = os.path.join(build.RUNTIME, "os")
     rt += sorted(os.path.join(osdir, f) for f in os.listdir(osdir) if f.endswith(".cpp"))
+    rt += IMGUI_SOURCES
     rtobj = os.path.join(FULL, "rt")
     os.makedirs(rtobj, exist_ok=True)
     flags = build.BASE_FLAGS + ["-O" + a.O, "-g1", "-Wall", "-Wno-unused-function",
@@ -59,16 +80,29 @@ def main():
                                 "-D_WIN32_WINNT=0x0A00", "-DWINVER=0x0A00",
                                 # GCC suppose la pile alignée sur 32 octets pour l'AVX, Windows ne l'aligne que sur 16 :
                                 # les écritures vectorielles alignées (vmovdqa) deviennent non alignées (même vitesse)
-                                "-Wa,-muse-unaligned-vector-move"]
+                                "-Wa,-muse-unaligned-vector-move"] + IMGUI_FLAGS
+    cxx = "g++"
+    if plateforme.LINUX:
+        # Linux : zig (clang) pour le runtime comme pour le code généré ; en-têtes de SDL3 fournis (fenêtre, son, clavier)
+        cxx = build.compilateur_genere()[0]
+        inc, _ = plateforme.sdl3()
+        flags = build.BASE_FLAGS + ["-O" + a.O, "-g1", "-Wall", "-Wno-unused-function",
+                                    "-I" + os.path.join(build.RUNTIME, "third_party"), *plateforme.cible_linux(cxx)] + IMGUI_FLAGS
+        if inc:
+            flags.append("-I" + inc)
+    flags_imgui = flags + [imgui_empreinte()]
     errs = []
-    for s in rt:
-        o = os.path.join(rtobj, os.path.splitext(os.path.basename(s))[0] + ".o")
-        _, err = build.compile_one("g++", s, o, flags)
-        if err:
-            errs.append((s, err))
-        elif _ and os.path.exists(o):
-            pass
-        objs.append(o)
+    # compilés côte à côte (comme les lots du jeu) : la première fois, Dear ImGui ne rallonge presque pas l'étape
+    with cf.ThreadPoolExecutor(max(1, min(os.cpu_count() or 1, 8))) as ex:
+        futs = []
+        for s in rt:
+            o = os.path.join(rtobj, os.path.splitext(os.path.basename(s))[0] + ".o")
+            futs.append((s, o, ex.submit(build.compile_one, cxx, s, o, flags_imgui if s in IMGUI_SOURCES else flags)))
+        for s, o, f in futs:
+            _, err = f.result()
+            if err:
+                errs.append((s, err))
+            objs.append(o)
     if errs:
         for s, e in errs:
             print(f"--- {s}\n{e[:6000]}")
@@ -85,9 +119,12 @@ def main():
         version = "0.0.0"
     chiffres = ([int(x) for x in version.split(".") if x.isdigit()] + [0, 0, 0, 0])[:4]
     rc = ""
-    if os.path.exists(os.path.join(FULL, "icone.ico")):
+    if plateforme.LINUX:   # pas de ressources sous Linux (icône et description : fichier .desktop du paquet)
+        version = None
+    elif os.path.exists(os.path.join(FULL, "icone.ico")):
         rc += '1 ICON "../icone.ico"\n'
-    rc += ("1 VERSIONINFO\nFILEVERSION {v}\nPRODUCTVERSION {v}\nFILEOS 0x40004\nFILETYPE 0x1\nBEGIN\n"
+    if version is not None:
+        rc += ("1 VERSIONINFO\nFILEVERSION {v}\nPRODUCTVERSION {v}\nFILEOS 0x40004\nFILETYPE 0x1\nBEGIN\n"
            '    BLOCK "StringFileInfo"\n    BEGIN\n        BLOCK "040904B0"\n        BEGIN\n'
            '            VALUE "FileDescription", "StarFox Remake"\n'
            '            VALUE "ProductName", "StarFox Remake [recompiled]"\n'
@@ -96,7 +133,7 @@ def main():
            '        END\n    END\n'
            '    BLOCK "VarFileInfo"\n    BEGIN\n        VALUE "Translation", 0x0409, 1200\n    END\nEND\n'
            ).format(v=",".join(str(c) for c in chiffres), t=version)
-    if rc:
+    if rc and not plateforme.LINUX:
         with open(os.path.join(rtobj, "icone.rc"), "w", encoding="utf-8") as fp:
             fp.write(rc)
         try:
@@ -126,7 +163,23 @@ def main():
            "-latomic", "-lwinmm", "-lgdi32", "-luser32", "-lole32",
            "-lmfplat", "-lmfreadwrite", "-lmfuuid",   # extraits vidéo (record.cpp)
            "-Wl,--disable-high-entropy-va"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    if plateforme.LINUX:
+        # SDL3 : libSDL3.so.0 fournie dans outils/sdl3/lib, trouvée par le chemin relatif à l'exécutable
+        # (<racine>/recomp/build/full/recomp_main : outils/ du paquet ou recomp/outils des sources), sinon celle du système
+        _, lib = plateforme.sdl3()
+        cmd = [cxx, *plateforme.cible_linux(cxx), "-o", part, "@" + rsp, "-lpthread", "-ldl",
+               "-Wl,-rpath,$ORIGIN/../../../outils/sdl3/lib:$ORIGIN/../../outils/sdl3/lib"]
+        cmd += (["-L" + lib] if lib else []) + ["-lSDL3"]
+    env = None
+    if plateforme.LINUX:
+        # cache de zig de l'édition de liens (libc++ compilée une fois) : le nôtre, pas ~/.cache/zig de l'utilisateur.
+        # Ici et pas dans l'enveloppe de plateforme.py : plateforme.py fait partie de la signature de l'étape
+        # « recompiler » (preparer.py), et le modifier refait 1 h 30 de recompilation chez le joueur (2026-11-15).
+        c = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+                         "spaceanimalsrecomp-zig", "commun")
+        os.makedirs(c, exist_ok=True)
+        env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=c)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode:
         print(r.stderr[:8000])
         if os.path.exists(part):

@@ -3,12 +3,19 @@
 //    sont lues en place dans le conteneur .nup d'origine (ouvert en lecture seule, jamais copié) ;
 //  * sauvegardes et carte SD : dossiers de l'hôte (à côté de l'exécutable).
 #include <atomic>
+#include <cmath>
+#include <chrono>
 #include "svc_util.h"
 #include "settings.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#include <fcntl.h>
+#endif
 
 #include <filesystem>
 #include <fstream>
@@ -16,6 +23,9 @@
 namespace fs = std::filesystem;
 
 namespace hos {
+// Instant (horloge monotone, ns) de la 2e ouverture en écriture de la sauvegarde : le début de campagne dans les
+// parties d'essai qui partent d'une sauvegarde terminée. Lu par RECOMP_SNAPSHOT_CAMPAIGN (vk_render.cpp).
+std::atomic<uint64_t> g_campagne_ns{0};
 namespace dlss {
 double echelle_dlss();   // dlss.cpp (dlss.h demande les en-têtes Vulkan)
 }
@@ -41,13 +51,20 @@ std::vector<std::pair<std::string, std::string>> recomp_cvars() {
     std::vector<std::pair<std::string, std::string>> v;
     double echelle = dlss::echelle_dlss();
     if (echelle <= 0) echelle = std::clamp(settings().render_scale, 67, 100) / 100.0;
-    char e[16];
-    snprintf(e, sizeof e, "%.4f", echelle);
+    // écrit en entiers : "%.4f" suit la locale du processus, et donnait « 1,0000 » (illisible pour le moteur, scène 3D
+    // noire) quand SDL l'avait passée à celle d'un système non anglais (X11). Même texte qu'avant avec un point.
+    char e[24];
+    const long dix_milliemes = std::lround(echelle * 10000.0);
+    snprintf(e, sizeof e, "%ld.%04ld", dix_milliemes / 10000, dix_milliemes % 10000);
     v.push_back({"render.resolution_scale_console", e});
     v.push_back({"render.resolution_scale", e});
     v.push_back({"render.dynres_enabled", "false"});
     v.push_back({"render.dlss_allowed", "false"});   // pas le réseau DLSS de la console
     v.push_back({"render.ndsr_allowed", "false"});   // ni son agrandissement NDSR
+    if (!settings().volumetric_fog) {   // brouillard volumétrique coupé (settings.h, volumetric_fog)
+        v.push_back({"render.volumetric_fog_enabled", "false"});
+        v.push_back({"render.volumetric_fog_handheld_enabled", "false"});
+    }
     return v;
 }
 
@@ -60,7 +77,18 @@ struct Romfs {
         std::shared_ptr<std::vector<uint8_t>> host;   // contenu de remplacement (romfs_override/)
     };
     std::vector<F> files;
+#ifdef _WIN32
     HANDLE nup = INVALID_HANDLE_VALUE;
+#else
+    int nup = -1;   // descripteur du .nup (lectures pread)
+#endif
+    bool nup_ouvert() const {
+#ifdef _WIN32
+        return nup != INVALID_HANDLE_VALUE;
+#else
+        return nup >= 0;
+#endif
+    }
 
     static uint32_t hash(uint32_t parent, const std::string& name) {
         uint32_t h = parent ^ 123456789u;
@@ -72,9 +100,14 @@ struct Romfs {
     }
 
     void build() {
+#ifdef _WIN32
         nup = CreateFileA(g_nup_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
-        if (nup == INVALID_HANDLE_VALUE) HLOG("fs", "container not found: %s", g_nup_path.c_str());
+#else
+        nup = open(g_nup_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (nup >= 0) posix_fadvise(nup, 0, 0, POSIX_FADV_RANDOM);
+#endif
+        if (!nup_ouvert()) HLOG("fs", "container not found: %s", g_nup_path.c_str());
         const uint32_t NONE = 0xFFFFFFFFu, NB = 3;
         std::vector<uint8_t> dirmeta, filemeta;
         auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
@@ -98,7 +131,7 @@ struct Romfs {
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
         std::string odir = exe;
-        odir = odir.substr(0, odir.find_last_of("\/") + 1) + "romfs_override\\";
+        odir = odir.substr(0, odir.find_last_of("\/") + 1) + "romfs_override" PSEP;
         for (size_t i = 0; i < g_romfs.size(); i++) {
             RomfsFile rf = g_romfs[i];
             std::shared_ptr<std::vector<uint8_t>> host;
@@ -109,16 +142,20 @@ struct Romfs {
                 fclose(of);
                 rf.size = host->size();
                 HLOG("fs", "romfs: /%s replaced by %s (%zu bytes)", rf.path.c_str(), (odir + rf.path).c_str(), host->size());
-            } else if (rf.path == "veclipse_build.cvar" && nup != INVALID_HANDLE_VALUE && rf.size < 65536 &&
+            } else if (rf.path == "veclipse_build.cvar" && nup_ouvert() && rf.size < 65536 &&
                        !getenv("RECOMP_NO_CVAR_PATCH")) {
                 // Cadence : sans « out.desired_frame_time », le régulateur du moteur vise ≈ 18 ms (55 img/s).
                 // Une cible courte laisse l'écran virtuel (contre-pression à l'acquisition, nvn_gpu.cpp)
                 // fixer le rythme au vblank, comme le vsync de la console.
                 std::string txt(rf.size, ' ');
+#ifdef _WIN32
                 OVERLAPPED ov{};
                 ov.Offset = (DWORD)rf.nup_offset, ov.OffsetHigh = (DWORD)(rf.nup_offset >> 32);
                 DWORD got = 0;
                 if (ReadFile(nup, txt.data(), (DWORD)rf.size, &got, &ov) && got == rf.size) {
+#else
+                if (pread(nup, txt.data(), rf.size, (off_t)rf.nup_offset) == (ssize_t)rf.size) {
+#endif
                     // entrées ajoutées : cadence, réglages PC (recomp_cvars), puis RECOMP_CVARS="nom=valeur;..."
                     std::vector<std::pair<std::string, std::string>> add;
                     if (txt.find("out.desired_frame_time") == std::string::npos) add.push_back({"out.desired_frame_time", "0.004"});
@@ -225,6 +262,7 @@ struct Romfs {
                     MemNoyau garde;
                     mem_ensure((uint64_t)dst, n);
                     for (uint64_t done = 0; done < n;) {
+#ifdef _WIN32
                         DWORD chunk = (DWORD)std::min<uint64_t>(n - done, 1u << 30), got = 0;
                         OVERLAPPED ov{};
                         ov.Offset = (DWORD)(src + done);
@@ -232,6 +270,13 @@ struct Romfs {
                         if (!ReadFile(nup, dst + done, chunk, &got, &ov) || !got) {
                             // Échec autrefois silencieux : le jeu recevait des zéros sans qu'aucune ligne le dise.
                             const DWORD err = GetLastError();
+#else
+                        unsigned long chunk = (unsigned long)std::min<uint64_t>(n - done, 1u << 30), got = 0;
+                        const ssize_t lu = pread(nup, dst + done, chunk, (off_t)(src + done));
+                        if (lu > 0) got = (unsigned long)lu;
+                        if (lu <= 0) {
+                            const unsigned long err = lu < 0 ? (unsigned long)errno : 0;
+#endif
                             static std::atomic<int> nech{0};
                             const int k = nech.fetch_add(1);
                             if (k < 40 || k % 1000 == 0)
@@ -244,6 +289,29 @@ struct Romfs {
                             break;
                         }
                         done += got;
+                        // RECOMP_FS_SLOW_MBPS=n (essai) : lecture bridée à n Mo/s, comme un disque lent ou le cache de
+                        // fichiers de Windows froid au premier passage d'un niveau (carrés noirs, issues n° 31 et 44)
+                        // RECOMP_FS_SLOW_MS=n (essai) : n ms par lecture qui ne suit pas la précédente dans le fichier,
+                        // comme le déplacement de tête d'un disque dur dont le cache de Windows est froid (le joueur de
+                        // l'issue n° 44 : disque à 7200 tr/min, carrés noirs à la première partie après l'installation)
+                        static const int saut_ms = getenv("RECOMP_FS_SLOW_MS") ? atoi(getenv("RECOMP_FS_SLOW_MS")) : 0;
+                        if (saut_ms > 0) {
+                            static std::atomic<uint64_t> fin_prec{0}, sauts{0};
+                            if (fin_prec.exchange(src + done) != src + done - got) {
+                                Sleep((DWORD)saut_ms);
+                                const uint64_t k = ++sauts;
+                                if (k % 2000 == 0) HLOG("fs", "RECOMP_FS_SLOW_MS: %llu simulated seeks so far", (unsigned long long)k);
+                            }
+                        }
+                        static const double lent = getenv("RECOMP_FS_SLOW_MBPS") ? atof(getenv("RECOMP_FS_SLOW_MBPS")) : 0;
+                        if (lent > 0) {
+                            static thread_local double dette = 0;   // ms dues, les petites lectures s'additionnent
+                            dette += got / (lent * 1048576.0) * 1000.0;
+                            if (dette >= 1.0) {
+                                Sleep((DWORD)dette);
+                                dette -= (DWORD)dette;
+                            }
+                        }
                     }
                 }
             }
@@ -315,7 +383,15 @@ const fs::path& save_root() {
             HLOG("fs", "saves: %s (RECOMP_SAVE_DIR, %zu file(s))", p.u8string().c_str(), compter_fichiers(p));
             return p;
         }
+#ifdef _WIN32
         const wchar_t* appdata = _wgetenv(L"APPDATA");
+#else
+        // Linux : $XDG_DATA_HOME, sinon ~/.local/share (équivalent de %APPDATA%)
+        std::string donnees;
+        if (const char* x = getenv("XDG_DATA_HOME"); x && *x) donnees = x;
+        else if (const char* h = getenv("HOME"); h && *h) donnees = std::string(h) + "/.local/share";
+        const char* appdata = donnees.empty() ? nullptr : donnees.c_str();
+#endif
         if (!appdata || !*appdata) {   // pas de profil : ancien emplacement
             fs::create_directories(ancien, ec);
             HLOG("fs", "saves: %s (APPDATA missing: next to the game, %zu file(s))", ancien.u8string().c_str(),
@@ -342,7 +418,11 @@ const fs::path& save_root() {
             }
             HLOG("fs", "saves: %zu file(s) copied from %s (old location, left in place)", n_ancien,
                  ancien.u8string().c_str());
+#ifdef _WIN32
             if (FILE* f = _wfopen((ancien / L"SAVE MOVED - SAUVEGARDE DEPLACEE.txt").c_str(), L"wb")) {
+#else
+            if (FILE* f = fopen((ancien / "SAVE MOVED - SAUVEGARDE DEPLACEE.txt").c_str(), "wb")) {
+#endif
                 const std::string t = "Since version 1.0.3, saves are kept in:\r\n  " + nouveau.u8string() +
                                       "\r\nThis folder is the copy from before the move; the game no longer uses it.\r\n\r\n"
                                       "Depuis la version 1.0.3, les sauvegardes sont dans :\r\n  " + nouveau.u8string() +
@@ -371,7 +451,7 @@ bool resolve(const fs::path& root, const std::string& gp, fs::path& out) {
     std::string s = gp;
     while (!s.empty() && s[0] == '/') s.erase(0, 1);
     fs::path rel = fs::u8path(s).lexically_normal();
-    for (auto& part : rel)
+    for (const auto& part : rel)   // (libc++ : l'itérateur de path rend une copie)
         if (part == "..") return false;
     out = root / rel;
     return true;
@@ -482,6 +562,12 @@ std::shared_ptr<Service> make_host_fs(const char* n, fs::path root) {
         }
         case 8: {   // OpenFile(mode, path)
             if (!fs::is_regular_file(p, ec)) { r.result = FS_PATH_NOT_FOUND; return true; }
+            if (sauvegarde && (r.arg<uint32_t>(0) & 2)) {
+                static std::atomic<int> ecritures{0};
+                if (++ecritures == 2)
+                    g_campagne_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
             if (sauvegarde) {   // journal : le jeu a bien retrouvé (ou réécrit) sa sauvegarde
                 static std::atomic<int> nlog{0};
                 if (nlog++ < 12)

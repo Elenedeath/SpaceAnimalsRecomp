@@ -1,0 +1,87 @@
+# Portage Linux
+
+> Intégré dans la 1.2.0 (PR 39, Elenedeath). Depuis, il existe aussi un paquet `.deb` (`recomp/launcher/paquet_deb.py`)
+> et le menu en jeu (F1) est disponible sous Linux (porté dans la 1.2.0, encore peu essayé) ; le mode souris reste propre à Windows.
+
+> Traduction anglaise : [LINUX.md](LINUX.md). Les deux fichiers sont tenus à jour ensemble ; ce texte-ci fait foi.
+
+Même jeu, même launcher que sous Windows, compilés pour Linux et livrés en **AppImage** (Steam Deck, PC Linux). Comme
+sous Windows, rien du jeu n'est distribué : l'AppImage contient le launcher, les sources du recompilateur et les outils
+de construction ; le jeu est recompilé sur la machine du joueur depuis sa propre copie (`.nup`).
+
+Windows ne change pas : tout le code propre à Linux est derrière `#ifdef _WIN32 … #else … #endif`. Vérifié en compilant
+les deux branches avec le GCC fourni : objets du launcher et du runtime identiques octet par octet, sauf `vk_render.o`
+dont seuls les numéros de ligne cités par les messages d'erreur Vulkan (`VKCHK`, `__LINE__`) diffèrent.
+
+## Ce qui change sous Linux
+
+| Windows | Linux |
+|---|---|
+| `VirtualAlloc` (engagement à la demande) | `mmap(PROT_NONE)` + `mprotect` (le noyau fournit la RAM au premier accès) — `memory.cpp` |
+| gestionnaire vectoriel d'exceptions | `sigaction(SIGSEGV…)` — `host_main.cpp` |
+| fils, événements, fibres | pthreads, futex, `ucontext` — `kernel.cpp`, `plat_linux.h` |
+| fenêtre Win32, `vkCreateWin32SurfaceKHR` | fenêtre SDL3, surface Vulkan de SDL (fil principal : `gfx_boucle_principale`) — `present.cpp` |
+| clavier Win32, XInput | clavier et manettes SDL3 (scancodes de `recomp.ini` inchangés : `scancodes.h`) — `input.cpp` |
+| WASAPI | flux audio SDL3 — `audio_out.cpp` |
+| DLSS : `_nvngx.dll` du pilote, `nvngx_dlss.dll` | `libnvidia-ngx.so.1` du pilote NVIDIA, `libnvidia-ngx-dlss.so` du même SDK (outils/dlss) |
+| Enregistrement Media Foundation | absent |
+| GCC + Clang de WinLibs | zig 0.17 (clang, libc++, en-têtes de la glibc 2.31) — `plateforme.py` |
+| launcher : Win32, Direct2D, DirectWrite, Media Foundation | **même code** : Win32 réalisé sur POSIX/SDL3 (`win32_linux.cpp`), Direct2D/DirectWrite sur cairo/pango (`d2d_cairo.h`), vidéos de fond en MPEG-1 lues par pl_mpeg |
+| sauvegardes `%APPDATA%\SpaceAnimalsRecomp` | `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp` |
+
+La mémoire que le jeu rend (`UnmapPhysicalMemory`) redevient inaccessible, sauf les pages qu'un import Vulkan couvre
+encore : le pilote Linux relit les pages d'un import de mémoire hôte à chaque soumission tant que l'import existe, et une
+plage inaccessible fait échouer la soumission (DEVICE LOST au retour au menu). Ces pages sont seulement vidées
+(`MADV_DONTNEED`, elles se relisent à zéro). `RECOMP_UNMAP_PINNED_OLD=1` : ancien comportement (toute la plage inaccessible).
+
+Les nombres s'écrivent toujours avec un point. Sur un système qui n'est pas en anglais (`fr_FR`…), SDL passe un moment
+la locale du processus à celle du système sous X11, et l'échelle du rendu s'écrivait alors `1,0000` dans les réglages du
+moteur, qu'il ne sait pas lire : scène 3D noire, interface seule. Le jeu pose `LC_NUMERIC=C` au démarrage (avant SDL), et
+l'échelle du rendu est écrite en entiers. `RECOMP_NUMERIC_LOCALE=1` : ancien comportement (locale du système).
+
+## Construire l'AppImage
+
+Sous Linux (ou WSL), avec clang/ld.lld, cmake, ninja, readelf et ffmpeg (extraits du fond), après avoir préparé la
+racine système (`sysroot_linux.py` : Steam Runtime « sniper », glibc 2.31, SDL3, cairo, pango) :
+
+```sh
+python3 recomp/launcher/sysroot_linux.py build/sysroot     # une fois : ~1,2 Go téléchargés
+python3 recomp/launcher/paquet_linux.py build/release --sysroot build/sysroot \
+    --extraits SpaceAnimalsRecomp-1.1.0-update.zip     # ou un dossier d'extrait_*.mp4
+```
+
+Produit `SpaceAnimalsRecomp-<version>-x86_64.AppImage`. Au lancement, `AppRun` garde une copie de `app/` (launcher et
+sources) dans `${XDG_DATA_HOME:-~/.local/share}/SpaceAnimalsRecomp/app` : le jeu construit, `recomp.ini` et les caches
+y restent ; les outils (Python, zig, glslang, SDL3) restent dans l'image montée.
+
+Bureau : `AppRun` pose l'entrée de menu et l'icône du launcher (`spaceanimalsrecomp`). Le jeu pose sa propre entrée,
+cachée du menu (`spaceanimalsrecomp-game`, `NoDisplay`), avec l'icône du jeu tirée de votre copie
+(`build/full/icone_jeu.jpg`, décodée par stb_image) : la fenêtre du jeu a l'icône du jeu et le launcher garde la sienne,
+comme sous Windows, et le dock montre celle de l'application active. DÉSINSTALLER retire les deux.
+
+Pour le launcher seul : `python3 recomp/launcher/construire.py --sysroot <sysroot>` (écrit `lanceur` à la racine).
+
+## Limites connues
+
+- Mise à jour et déplacement depuis le launcher : désactivés (l'AppImage se remplace d'un bloc). La désinstallation passe
+  par `desinstaller_linux.py` (bouton DÉSINSTALLER).
+- Steam Deck (RADV VANGOGH) : le jeu tourne, 60 img/s à l'écran titre. Dans la cinématique du prologue, le brouillard
+  volumétrique (`volumetric_fog_light.comp`) prend 25 ms par image, 82 % du GPU : le couper (page Graphismes,
+  `volumetric_fog = false`) fait passer de 13-22 à 45-60 img/s. Le reste dépend de la surface couverte par les
+  personnages (shaders de pixels) : rendu 3D à 75 % conseillé.
+- Polices : Barlow (OFL) remplace Bahnschrift, absente de Linux.
+- DLSS : marche depuis la 1.2.0 sur les cartes NVIDIA RTX avec le pilote NVIDIA (`libnvidia-ngx.so.1`), au choix dans
+  la page Graphismes ou le menu en jeu. Sous Linux, la bibliothèque DLSS répond « non implémenté » quand on lui demande
+  les extensions Vulkan dont elle a besoin ; le jeu les demande maintenant à l'ancienne fonction du pilote, et un
+  plantage au démarrage avec le DLSS choisi (un démarrage sur deux) est corrigé. `RECOMP_DLSS_LINUX` n'existe plus.
+  Essayé en DLAA et Qualité, modèles DLSS 4 et DLSS 4.5, sur une RTX 3060 Laptop (pilote 595.99, X11). Sur les RTX
+  20 et 30, le modèle DLSS 4.5 coûte plus cher (pas de FP8 natif : environ 42 img/s en DLAA, 60 en Qualité), donc le
+  DLSS 4, choix par défaut, y reste le meilleur réglage. Équilibré à Ultra performance, Wayland et les pilotes plus
+  anciens ne sont pas essayés.
+- Choix automatique de la carte : le rendu logiciel de Mesa (llvmpipe) est écarté par le jeu et absent de la liste du
+  launcher. Il annonce la RAM comme mémoire vidéo et était préféré à une carte intégrée sur un PC sans carte dédiée
+  (pas d'image). Le réglage `gpu` peut encore le nommer.
+- Swapchain : `B8G8R8A8_SRGB` dans l'espace de couleur sRGB d'abord, puis `R8G8B8A8_SRGB`, puis n'importe quel format en
+  sRGB. La liste des formats et le choix sont écrits au journal (`swapchain formats`). `RECOMP_SWAPCHAIN_ANY_COLORSPACE=1` :
+  ancien choix (dernier `B8G8R8A8_SRGB` quel que soit son espace de couleur, sinon le premier format). Une image trop
+  claire (noirs gris) a été signalée une fois ; ce n'est pas confirmé comme sa cause.

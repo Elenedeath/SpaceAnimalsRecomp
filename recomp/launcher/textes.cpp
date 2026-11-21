@@ -34,6 +34,9 @@ const Texte TEXTES[] = {
     {"jeu_obsolete_aide", L"RECONSTRUIRE MAINTENANT  ›", L"REBUILD NOW  ›"},
     {"jeu_obsolete_detail", L"seules les parties qui ont changé sont refaites", L"only the parts that changed are rebuilt"},
     {"en_jeu", L"EN JEU", L"IN GAME"},
+    {"q_oui", L"OUI", L"YES"},
+    {"q_non", L"NON", L"NO"},
+    {"q_ok", L"OK", L"OK"},
     {"graphismes", L"GRAPHISMES", L"GRAPHICS"},
     {"reglages", L"RÉGLAGES", L"SETTINGS"},
     {"controles", L"CONTRÔLES", L"CONTROLS"},
@@ -74,6 +77,11 @@ const Texte TEXTES[] = {
     {"reg_hz", L"Images par s.", L"Frames per s."},
     {"reg_hz_aide", L"90 et 120 : pas encore stables", L"90 and 120: not yet stable"},
     {"reg_natif", L"Rendu 3D", L"3D rendering"},
+    // brouillard volumétrique (page Graphismes, Linux)
+    {"reg_brouillard", L"Brouillard", L"Fog"},
+    {"reg_brouillard_aide", L"désactivé : bien plus rapide (Steam Deck)", L"off: much faster (Steam Deck)"},
+    {"brouillard_oui", L"Activé", L"On"},
+    {"brouillard_non", L"Désactivé", L"Off"},
     {"natif", L"100 % (natif)", L"100% (native)"},
     // rendu 3D (page Graphismes) : toutes les mises à l'échelle sont dites expérimentales (demande de l'utilisateur)
     {"reg_natif_aide", L"sous 100 % : expérimental, plus rapide", L"below 100%: experimental, faster"},
@@ -92,7 +100,11 @@ const Texte TEXTES[] = {
     {"reg_dlss_exp", L"mise à l'échelle expérimentale", L"experimental upscaling"},
     {"reg_dlss_rtx", L"cartes NVIDIA RTX seulement", L"NVIDIA RTX cards only"},
     {"dlss_indispo", L"Indisponible", L"Unavailable"},
+#ifdef _WIN32
     {"reg_dlss_manque", L"nvngx_dlss.dll manque à côté du jeu", L"nvngx_dlss.dll missing next to the game"},
+#else
+    {"reg_dlss_manque", L"libnvidia-ngx-dlss.so manque (outils/dlss)", L"libnvidia-ngx-dlss.so missing (outils/dlss)"},
+#endif
     {"dlss_non", L"Désactivé", L"Off"},
     {"dlss_dlaa", L"DLAA (natif)", L"DLAA (native)"},
     {"dlss_qualite", L"Qualité (67 %)", L"Quality (67%)"},
@@ -108,13 +120,18 @@ const Texte TEXTES[] = {
     {"reg_fsr", L"FSR (AMD)", L"FSR (AMD)"},
     {"reg_fsr_aide", L"toute carte, remplace l'anticrénelage", L"any card, replaces anti-aliasing"},
     {"reg_fsr_dlss", L"sans effet : le DLSS passe devant", L"no effect: DLSS takes priority"},
+#ifdef _WIN32
     {"reg_fsr_manque", L"fichiers d'AMD absents (outils\\fsr)", L"AMD's files missing (outils\\fsr)"},
+#else
+    {"reg_fsr_manque", L"indisponible sous Linux (AMD : Windows seulement)", L"unavailable on Linux (AMD: Windows only)"},
+#endif
     {"fsr_natif", L"Natif (100 %)", L"Native (100%)"},
     {"fsr_equilibre", L"Équilibré (59 %)", L"Balanced (59%)"},
     {"reg_fsr_version", L"Version FSR", L"FSR version"},
     {"reg_fsr_version_aide", L"auto : FSR 4 si la carte le propose", L"auto: FSR 4 if the card offers it"},
     {"rendu_fsr", L"%d %% (mode FSR)", L"%d%% (FSR mode)"},
     {"reg_natif_fsr", L"expérimental : agrandi par le FSR", L"experimental: enlarged by FSR"},
+#ifdef _WIN32
     {"gra_note", L"Le DLSS et le FSR remplacent l'anticrénelage du jeu. Le DLSS n'est proposé qu'avec une carte NVIDIA RTX "
                  L"(et nvngx_dlss.dll à côté du jeu) ; le FSR d'AMD marche sur toute carte : FSR 4 sur les cartes AMD qui "
                  L"le proposent, FSR 3.1 sur les autres. Les mises à l'échelle sont expérimentales (Qualité à Ultra perf., "
@@ -124,13 +141,29 @@ const Texte TEXTES[] = {
      L"next to the game); AMD FSR works on any card: FSR 4 on the AMD cards that offer it, FSR 3.1 on the others. "
      L"Upscaling options are experimental (Quality to Ultra Perf., 3D rendering below 100%): 3D is rendered smaller "
      L"then enlarged. Changing the graphics card redoes the shader preparation. Applies at the next game launch."},
+#else
+    {"gra_note", L"Le DLSS remplace l'anticrénelage du jeu. Il n'est proposé qu'avec une carte NVIDIA RTX "
+                 L"(et libnvidia-ngx-dlss.so dans outils/dlss) ; le FSR d'AMD n'existe que sous Windows. Les mises à "
+                 L"l'échelle sont expérimentales (Qualité à Ultra perf., Rendu 3D sous 100 %) : la 3D est rendue plus "
+                 L"petite puis agrandie. Changer de carte graphique refait la préparation des shaders. Valable au "
+                 L"prochain lancement du jeu.",
+     L"DLSS replaces the game's anti-aliasing. It is only offered with an NVIDIA RTX card (and libnvidia-ngx-dlss.so "
+     L"in outils/dlss); AMD FSR exists on Windows only. Upscaling options are experimental (Quality to Ultra Perf., "
+     L"3D rendering below 100%): 3D is rendered smaller then enlarged. Changing the graphics card redoes the shader "
+     L"preparation. Applies at the next game launch."},
+#endif
     {"reg_aff", L"Affichage", L"Display"},
     {"sans_bordure", L"Plein écran", L"Full screen"},
     {"fenetre", L"Fenêtré", L"Windowed"},
     {"reg_aff_aide", L"Alt+Entrée bascule en jeu", L"Alt+Enter toggles in game"},
     {"reg_langue", L"Langue du jeu", L"Game language"},
+#ifdef _WIN32
     {"reg_langue_aide", L"Auto : celle de Windows", L"Auto: Windows language"},
     {"auto_langue", L"Auto (Windows)", L"Auto (Windows)"},
+#else
+    {"reg_langue_aide", L"Auto : celle du système", L"Auto: system language"},
+    {"auto_langue", L"Auto (système)", L"Auto (system)"},
+#endif
     {"reg_vol", L"Volume", L"Volume"},
     {"reg_vib", L"Vibrations", L"Rumble"},
     {"reg_vib_aide", L"manettes Xbox, PS4, PS5, Pro", L"Xbox, PS4, PS5, Pro controllers"},
@@ -166,23 +199,65 @@ const Texte TEXTES[] = {
     {"stick_g", L"Stick gauche", L"Left stick"},
     {"stick_d", L"Stick droit", L"Right stick"},
     {"croix", L"Croix", L"D-pad"},
-    {"ctl_note", L"Cliquez sur une touche pour la changer ; une touche déjà prise est échangée. Les changements valent au "
-                 L"prochain lancement du jeu. Boutons de la manette : onglet MANETTE.",
-     L"Click a key to change it; a key already in use is swapped. Changes apply the next time the game starts. "
-     L"Controller buttons: CONTROLLER tab."},
+    {"slsr", L"SL · SR", L"SL · SR"},
+    {"sl_g", L"SL (Joy-Con G)", L"SL (left Joy-Con)"},
+    {"sr_g", L"SR (Joy-Con G)", L"SR (left Joy-Con)"},
+    {"sl_d", L"SL (Joy-Con D)", L"SL (right Joy-Con)"},
+    {"sr_d", L"SR (Joy-Con D)", L"SR (right Joy-Con)"},
+    {"mod_ctrl", L"Ctrl", L"Ctrl"},
+    {"mod_maj", L"Maj", L"Shift"},
+    {"mod_alt", L"Alt", L"Alt"},
+    {"ctl_note", L"Cliquez sur une touche pour la changer ; une touche déjà prise est échangée. Ctrl, Maj ou Alt tenus en "
+                 L"même temps : une combinaison (Maj + W et W font deux actions). Valable au prochain lancement du jeu.",
+     L"Click a key to change it; a key already in use is swapped. Hold Ctrl, Shift or Alt with it for a combination "
+     L"(Shift + W and W do two actions). Applies the next time the game starts."},
+    {"ctl_note_reconstruire", L"Cliquez sur une touche pour la changer. Les combinaisons (Ctrl, Maj, Alt) ne marchent "
+                              L"qu'avec le jeu reconstruit : d'ici là, le jeu ignore ces touches.",
+     L"Click a key to change it. Key combinations (Ctrl, Shift, Alt) only work once the game is rebuilt: until then, "
+     L"the game ignores those keys."},
     // onglet Manette (2026-11-12) : manettes Xbox, PlayStation, Switch Pro et Joy-Con (SDL3)
     {"ong_clavier", L"CLAVIER", L"KEYBOARD"},
     {"ong_manette", L"MANETTE", L"CONTROLLER"},
+    // onglet Souris : mode souris du jeu (Joy-Con 2 droit tenu comme une souris)
+    {"ong_souris", L"SOURIS", L"MOUSE"},
+    {"sou_mode", L"Mode souris", L"Mouse mode"},
+    {"sou_mode_aide", L"visée à la souris, comme un Joy-Con 2", L"mouse aiming, like a Joy-Con 2"},
+    {"sou_oui", L"Activé", L"On"},
+    {"sou_non", L"Désactivé", L"Off"},
+    {"sou_vitesse", L"Vitesse", L"Speed"},
+    {"sou_vitesse_aide", L"s'ajoute à la sensibilité du jeu", L"on top of the game's sensitivity"},
+    {"sou_gauche", L"Clic gauche", L"Left click"},
+    {"sou_droit", L"Clic droit", L"Right click"},
+    {"sou_milieu", L"Clic milieu", L"Middle click"},
+    {"sou_arriere", L"Bouton arrière", L"Back button"},
+    {"sou_avant", L"Bouton avant", L"Forward button"},
+    {"sou_molette_haut", L"Molette vers le haut", L"Wheel up"},
+    {"sou_molette_bas", L"Molette vers le bas", L"Wheel down"},
+    {"sou_aucun", L"Aucun", L"None"},
+    {"sou_note", L"La souris devient le Joy-Con 2 droit posé sur la table : le jeu passe de lui-même en visée à la souris. "
+                 L"Dans ce mode, le jeu met le boost et le frein sur le stick droit (haut, bas), l'inclinaison sur le "
+                 L"stick gauche (gauche, droite). F9 rend le curseur, un clic dans le jeu le reprend. Valable au prochain "
+                 L"lancement du jeu.",
+     L"The mouse becomes the right Joy-Con 2 lying on the desk: the game switches to mouse aiming by itself. In this "
+     L"mode the game puts boost and brake on the right stick (up, down), tilt on the left stick (left, right). F9 "
+     L"releases the cursor, a click in the game takes it back. Applies the next time the game starts."},
     {"pad_branchee", L"Manette : %ls", L"Controller: %ls"},
     {"pad_autres", L"  (+ %d autre(s))", L"  (+ %d more)"},
     {"pad_aucune", L"Aucune manette branchée : cliquez sur un bouton (dessin ou liste), puis sur celui du dessin qui doit "
                    L"le faire ; s'il était pris, ils échangent. ‹ › : autres entrées. Valable au prochain lancement.",
      L"No controller connected: click a button (drawing or list), then the one on the drawing that should do it; if it "
      L"was in use, they swap. ‹ ›: other inputs. Applies at the next game launch."},
+#ifdef _WIN32
     {"pad_sans_sdl", L"SDL3 manque (outils\\sdl3) : manettes Xbox seulement. Cliquez sur un bouton (dessin ou liste), "
                      L"puis sur celui du dessin qui doit le faire. ‹ › : autres entrées.",
      L"SDL3 missing (outils\\sdl3): Xbox controllers only. Click a button (drawing or list), then the one on the "
      L"drawing that should do it. ‹ ›: other inputs."},
+#else
+    {"pad_sans_sdl", L"SDL3 indisponible : manettes Xbox seulement. Cliquez sur un bouton (dessin ou liste), "
+                     L"puis sur celui du dessin qui doit le faire. ‹ › : autres entrées.",
+     L"SDL3 unavailable: Xbox controllers only. Click a button (drawing or list), then the one on the "
+     L"drawing that should do it. ‹ ›: other inputs."},
+#endif
     {"pad_note", L"Cliquez sur un bouton (dessin ou liste), puis appuyez sur celui de la manette qui doit le faire, ou "
                  L"cliquez-le sur le dessin ; s'il était pris, ils échangent. ‹ › : autres entrées. Valable au prochain "
                  L"lancement.",
@@ -228,12 +303,21 @@ const Texte TEXTES[] = {
      L"The game stopped (code %d). “BUG REPORT” creates the file to attach to an issue."},
     // (pas de chiffre d'exigence : il sera donné à la sortie d'après les mesures ; le conseil du fichier d'échange vient
     // des arrêts du 2026-11-11 sur un PC de 32 Go au fichier d'échange fixe de 8 Go)
+#ifdef _WIN32
     {"memoire_faible", L"Mémoire libre : %.1f Go, c'est peu pour le jeu. Fermez les programmes lourds et laissez Windows gérer le fichier d'échange, ou recliquez pour lancer quand même.",
      L"Free memory: %.1f GB, that is low for the game. Close heavy programs and let Windows manage the page file, or click again to start anyway."},
     {"jeu_memoire", L"Mémoire insuffisante : fermez les programmes lourds (jeux, navigateur…), laissez Windows gérer le fichier d'échange, puis relancez.",
      L"Not enough memory: close heavy programs (games, browser…), let Windows manage the page file, then try again."},
     {"affichage_indisponible", L"Affichage impossible : Direct3D 11 ou Direct2D indisponible (détail dans lanceur.log). Mettez à jour le pilote de la carte graphique.",
      L"Cannot display: Direct3D 11 or Direct2D unavailable (details in lanceur.log). Update the graphics driver."},
+#else
+    {"memoire_faible", L"Mémoire libre : %.1f Go (RAM et espace d'échange), c'est peu pour le jeu. Fermez les programmes lourds ou agrandissez l'espace d'échange (swap), ou recliquez pour lancer quand même.",
+     L"Free memory: %.1f GB (RAM and swap), that is low for the game. Close heavy programs or enlarge the swap space, or click again to start anyway."},
+    {"jeu_memoire", L"Mémoire insuffisante : fermez les programmes lourds (jeux, navigateur…) ou agrandissez l'espace d'échange (swap), puis relancez.",
+     L"Not enough memory: close heavy programs (games, browser…) or enlarge the swap space, then try again."},
+    {"affichage_indisponible", L"Affichage impossible : fenêtre SDL indisponible (détail dans lanceur.log). Lancez le launcher depuis une session graphique.",
+     L"Cannot display: SDL window unavailable (details in lanceur.log). Start the launcher from a graphical session."},
+#endif
     {"desinstaller", L"DÉSINSTALLER", L"UNINSTALL"},
     // emplacement du jeu (issue GitHub n° 14). Pas de « % » dans dep_fini, dep_fini_copie ni dep_echec : affichés par
     // LANCEUR_STATUT, qui les passe à swprintf.
@@ -256,12 +340,25 @@ const Texte TEXTES[] = {
     {"dep_echec", L"Déplacement impossible : un fichier du dossier est sans doute ouvert dans un autre programme. Rien n'a changé.",
      L"The game was not moved: a file of the folder is probably open in another program. Nothing changed."},
     {"e_maj", L"Téléchargement et vérification", L"Download and check"},
+#ifdef _WIN32
     {"desinst_question", L"Désinstaller SpaceAnimalsRecomp ?\n\nSeront supprimés : le jeu construit, le launcher et ses outils (tout ce dossier) et la copie du compilateur.\n\nVotre copie du jeu n'est jamais supprimée.",
      L"Uninstall SpaceAnimalsRecomp?\n\nThis deletes the built game, the launcher and its tools (this whole folder) and the compiler copy.\n\nYour game copy is never deleted."},
     {"desinst_sauvegardes", L"Supprimer aussi vos sauvegardes ?\n\nNon : elles restent dans %APPDATA%\\SpaceAnimalsRecomp et seront reprises si vous réinstallez.",
      L"Delete your saves too?\n\nNo: they stay in %APPDATA%\\SpaceAnimalsRecomp and will be picked up if you reinstall."},
-    {"pas_de_python", L"Python 3 introuvable : installez-le, ou placez-le dans outils\\python.",
-     L"Python 3 not found: install it, or put it in outils\\python."},
+    // dossier outils absent (update.zip ou code source extraits seuls, issues n° 37 et 43) : ne pas dire d'installer
+    // Python, la construction échouerait plus loin (modules, compilateur)
+    {"pas_de_python", L"Installation incomplète : le dossier outils est absent. Téléchargez le paquet complet (SpaceAnimalsRecomp-x.y.z-windows.zip) dans les Releases et lancez lanceur.exe depuis ce dossier. Inutile d'installer Python.",
+     L"Incomplete installation: the outils folder is missing. Download the full package (SpaceAnimalsRecomp-x.y.z-windows.zip) from Releases and run lanceur.exe from that folder. No need to install Python."},
+#else
+    {"desinst_question", L"Désinstaller SpaceAnimalsRecomp ?\n\nSeront supprimés : le jeu construit, le launcher (~/.local/share/SpaceAnimalsRecomp/app), l'AppImage, les caches du compilateur et le raccourci du bureau.\n\nVotre copie du jeu n'est jamais supprimée.",
+     L"Uninstall SpaceAnimalsRecomp?\n\nThis deletes the built game, the launcher (~/.local/share/SpaceAnimalsRecomp/app), the AppImage, the compiler caches and the desktop shortcut.\n\nYour game copy is never deleted."},
+    {"desinst_sauvegardes", L"Supprimer aussi vos sauvegardes ?\n\nNon : elles restent dans ~/.local/share/SpaceAnimalsRecomp et seront reprises si vous réinstallez.",
+     L"Delete your saves too?\n\nNo: they stay in ~/.local/share/SpaceAnimalsRecomp and will be picked up if you reinstall."},
+    {"pas_de_python", L"Python 3 introuvable : installez-le (python3), ou placez-le dans outils/python.",
+     L"Python 3 not found: install it (python3), or put it in outils/python."},
+    {"desinst_echec", L"Désinstallation incomplète : ", L"Uninstall incomplete: "},
+    {"desinst_en_cours", L"Désinstallation en cours…", L"Uninstalling…"},
+#endif
     {"pas_de_copie", L"Choisissez d'abord votre copie du jeu.", L"Choose your game copy first."},
     {"filtre_nup", L"Copie de Star Fox (*.nup)", L"Star Fox copy (*.nup)"},
     {"dialogue_titre", L"Choisir votre copie de Star Fox", L"Choose your Star Fox copy"},

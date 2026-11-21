@@ -5,11 +5,18 @@
 // Sémantique calquée sur le noyau (documentation switchbrew / comportement de mesosphère) ;
 // un seul verrou global protège tout l'état du noyau.
 #include "hos.h"
+#include "gfx.h"
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <process.h>
 #include <windows.h>
+#else
+#include "plat_linux.h"
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +33,8 @@
 #include <unordered_map>
 
 namespace hos {
+extern std::atomic<const char*> g_gpu_phase;   // vk_render.cpp : surveillance des blocages
+extern std::atomic<uint64_t> g_gpu_images;
 
 // ------------------------------------------------------------------------------ objets
 struct KThread : KObject {
@@ -38,12 +47,20 @@ struct KThread : KObject {
     uint64_t affinity = 1;
     uint64_t tlr = 0;
     CPUState* ctx = nullptr;
+#ifdef _WIN32
     HANDLE host = nullptr;
+#else
+    pthread_t host{};
+    bool host_ok = false;
+    std::atomic<uint32_t> wake_seq{0};   // mot du futex de réveil (incrémenté par wake)
+#endif
     bool started = false, exited = false;
     // attente : événement Win32 (réveil) + minuteur haute résolution (délais précis à ~0,5 ms,
     // indépendamment de la résolution du minuteur système ; std::condition_variable arrondissait
     // les délais à 10-15 ms, ce qui faisait tomber le jeu à ~42 images/s)
+#ifdef _WIN32
     HANDLE wake_ev = nullptr, hr_timer = nullptr;
+#endif
     std::atomic<bool> woken{false};   // atomique : lu sans le verrou pendant l'attente active (block)
     uint32_t wait_result = 0;
     int32_t wait_index = -1;
@@ -93,9 +110,23 @@ std::atomic<bool> g_manque_memoire{false};
 
 // mémoire validable libre du PC (RAM + fichier d'échange), en Go
 double memoire_validable_libre_go() {
+#ifdef _WIN32
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof m;
     return GlobalMemoryStatusEx(&m) ? m.ullAvailPageFile / 1073741824.0 : 0.0;   // Go binaires, comme la RAM
+#else
+    // Linux : mémoire disponible + fichier d'échange libre (/proc/meminfo, en Ko)
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0.0;
+    char ligne[256];
+    unsigned long long dispo = 0, swap = 0, v = 0;
+    while (fgets(ligne, sizeof ligne, f)) {
+        if (sscanf(ligne, "MemAvailable: %llu", &v) == 1) dispo = v;
+        else if (sscanf(ligne, "SwapFree: %llu", &v) == 1) swap = v;
+    }
+    fclose(f);
+    return (dispo + swap) / 1048576.0;
+#endif
 }
 
 // ------------------------------------------------------------------------------ état
@@ -179,6 +210,7 @@ bool cas32(uint64_t a, uint32_t& expect, uint32_t v) {
 
 // Attente du thread courant (verrou g_k tenu). timeout en ns (< 0 : infini).
 // Renvoie true si réveillé, false si délai écoulé.
+#ifdef _WIN32
 HANDLE hr_timer(KThread* t) {
     if (!t->hr_timer)
         t->hr_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -193,6 +225,9 @@ void precise_sleep(KThread* t, int64_t ns) {
     if (tm && SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(tm, INFINITE);
     else std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
 }
+#else
+void precise_sleep(KThread*, int64_t ns) { plat_sleep_ns(ns); }   // clock_nanosleep : précis sans minuteur dédié
+#endif
 
 // Attente active avant de dormir (soir du 2026-11-12). Profil d'une mission (scènes à 2 500 dessins) : aucun fil du
 // jeu n'est saturé, ses fils de travail passent plus de la moitié du temps endormis entre deux tâches, et chaque
@@ -220,7 +255,9 @@ int64_t attente_active_qpc() {
 
 bool block(std::unique_lock<std::mutex>& lk, KThread* t, int64_t timeout_ns) {
     if (t->woken) return true;
+#ifdef _WIN32
     if (!t->wake_ev) t->wake_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#endif
     auto dl = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns < 0 ? 0 : timeout_ns);
     if (const int64_t actif = attente_active_qpc(); actif > 0 && (timeout_ns < 0 || timeout_ns > 500000)) {
         lk.unlock();
@@ -235,6 +272,24 @@ bool block(std::unique_lock<std::mutex>& lk, KThread* t, int64_t timeout_ns) {
         lk.lock();
         if (t->woken) return true;
     }
+#ifndef _WIN32
+    // Linux : futex sur t->wake_seq. Le mot est lu sous le verrou, avant de le rendre : un réveil arrivé entre-temps
+    // l'a changé et futex_wait revient aussitôt (EAGAIN). Délai relatif recalculé à chaque tour.
+    while (!t->woken) {
+        const uint32_t seq = t->wake_seq.load(std::memory_order_acquire);
+        timespec ts{}, *pts = nullptr;
+        if (timeout_ns >= 0) {
+            int64_t rem = std::chrono::duration_cast<std::chrono::nanoseconds>(dl - std::chrono::steady_clock::now()).count();
+            if (rem <= 0) return false;
+            ts.tv_sec = (time_t)(rem / 1000000000), ts.tv_nsec = (long)(rem % 1000000000);
+            pts = &ts;
+        }
+        lk.unlock();
+        syscall(SYS_futex, (uint32_t*)&t->wake_seq, FUTEX_WAIT_PRIVATE, seq, pts, nullptr, 0);
+        lk.lock();
+    }
+    return true;
+#else
     while (!t->woken) {
         DWORD r;
         if (timeout_ns < 0) {
@@ -258,6 +313,7 @@ bool block(std::unique_lock<std::mutex>& lk, KThread* t, int64_t timeout_ns) {
         (void)r;   // réveil, délai ou réveil parasite : on reteste l'état sous le verrou
     }
     return true;
+#endif
 }
 
 void wake(KThread* t, uint32_t result, int32_t index = -1) {
@@ -265,7 +321,12 @@ void wake(KThread* t, uint32_t result, int32_t index = -1) {
     t->wait_result = result;
     t->wait_index = index;
     t->where = 0;
+#ifdef _WIN32
     if (t->wake_ev) SetEvent(t->wake_ev);
+#else
+    t->wake_seq.fetch_add(1, std::memory_order_release);
+    syscall(SYS_futex, (uint32_t*)&t->wake_seq, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+#endif
 }
 
 void prepare_wait(KThread* t) {
@@ -325,6 +386,9 @@ void cv_reacquire(KThread* w) {
 }
 
 // --- threads
+#ifndef _WIN32
+#define __stdcall
+#endif
 unsigned __stdcall thread_proc(void* p) {
     KThread* t = (KThread*)p;
     t_cur = t;
@@ -371,9 +435,30 @@ std::shared_ptr<KThread> make_thread(uint64_t entry, uint64_t arg, uint64_t sp, 
 
 void start_host_thread(KThread* t) {
     t->started = true;
+#ifdef _WIN32
     t->host = (HANDLE)_beginthreadex(nullptr, (unsigned)HOST_STACK, thread_proc, t,
                                      STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!t->host) panic("cannot create the host thread");
+#else
+    // pile hôte réservée sans être engagée (MAP_NORESERVE), comme STACK_SIZE_PARAM_IS_A_RESERVATION ; page de garde en bas
+    void* pile = mmap(nullptr, HOST_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK,
+                      -1, 0);
+    if (pile == MAP_FAILED) panic("cannot reserve the host thread stack (%llu MB)", (unsigned long long)(HOST_STACK >> 20));
+    mprotect(pile, 0x10000, PROT_NONE);
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setstack(&at, pile, HOST_STACK);
+    const int e = pthread_create(&t->host, &at, [](void* p) -> void* {
+        jmp_buf sortie;   // svc ExitThread revient ici (plat_fin_fil), sans dérouler la pile
+        t_plat_sortie = &sortie;
+        if (!setjmp(sortie)) thread_proc(p);
+        t_plat_sortie = nullptr;
+        return nullptr;
+    }, t);
+    pthread_attr_destroy(&at);
+    if (e) panic("cannot create the host thread (error %d)", e);
+    t->host_ok = true;
+#endif
 }
 
 int64_t timeout_of(uint64_t v) { return (int64_t)v; }   // < 0 : infini
@@ -459,7 +544,12 @@ int run_main_thread(uint64_t entry, uint64_t a0, uint64_t a1, uint64_t a2, uint6
              (unsigned long long)bottom, (unsigned long long)top);
         start_host_thread(t);
     }
+#ifdef _WIN32
     WaitForSingleObject(t->host, INFINITE);
+#else
+    // fil principal : fenêtre et événements de SDL (present.cpp) jusqu'à la fin du thread principal du jeu
+    gfx_boucle_principale([](void* p) { return pthread_tryjoin_np(*(pthread_t*)p, nullptr) == 0; }, &t->host);
+#endif
     HLOG("kernel", "the main thread has finished");
     return 0;
 }
@@ -636,7 +726,12 @@ static void svc_dispatch_impl(CPUState* ctx, uint32_t imm, uint64_t pc) {
     case 0x07:  // ExitProcess
         HLOG("kernel", "ExitProcess requested by the guest (%s)", symbolize(pc).c_str());
         fflush(nullptr);
+        kbm_release();
+#ifdef _WIN32
         ExitProcess(0);
+#else
+        _exit(0);
+#endif
     case 0x08: {  // CreateThread(entry x1, arg x2, sp x3, prio w4, core w5) → w1 handle
         std::lock_guard<std::mutex> lk(g_k);
         int core = (int32_t)W(5);
@@ -669,7 +764,11 @@ static void svc_dispatch_impl(CPUState* ctx, uint32_t imm, uint64_t pc) {
                 notify_sync(t);
             }
         }
+#ifdef _WIN32
         _endthreadex(0);
+#else
+        plat_fin_fil();
+#endif
         return;
     }
     case 0x0B: {  // SleepThread(ns)
@@ -941,6 +1040,8 @@ static void svc_dispatch_impl(CPUState* ctx, uint32_t imm, uint64_t pc) {
         HLOG("kernel", "svcBreak(reason 0x%x, arg 0x%llx, size 0x%llx) from %s", reason,
              (unsigned long long)X(1), (unsigned long long)X(2), symbolize(pc).c_str());
         if (reason & 0x80000000u) { RET(0); return; }   // notification seulement
+        HLOG("kernel", "at that moment, graphics thread: %s; frames delivered by the game so far: %llu",
+             g_gpu_phase.load(), (unsigned long long)g_gpu_images.load());
         panic("svcBreak: the guest stopped (reason 0x%x)", reason);
     }
     case 0x27: {  // OutputDebugString(str, size)
@@ -1133,12 +1234,16 @@ std::vector<std::pair<uint64_t, void*>> kernel_thread_list() {
     std::vector<std::pair<uint64_t, void*>> v;
     std::lock_guard<std::mutex> lk(g_k);
     for (auto& t : g_threads)
+#ifdef _WIN32
         if (t->started && !t->exited && t->host) v.emplace_back(t->id, (void*)t->host);
+#else
+        if (t->started && !t->exited && t->host_ok) v.emplace_back(t->id, (void*)(uintptr_t)t->host);
+#endif
     return v;
 }
 
 void kernel_dump_threads() {
-    std::vector<std::pair<HANDLE, uint64_t>> running;
+    std::vector<std::pair<void*, uint64_t>> running;
     {
     std::lock_guard<std::mutex> lk(g_k);
     HLOG("dump", "%zu guest threads:", g_threads.size());
@@ -1182,7 +1287,11 @@ void kernel_dump_threads() {
             HLOG("dump", "      object -0x18: %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x", w[0], w[1],
                  w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
         }
+#ifdef _WIN32
         if (t->started && !t->exited && !t->in_sync && !t->where) running.emplace_back(t->host, t->id);
+#else
+        if (t->started && !t->exited && !t->in_sync && !t->where) running.emplace_back((void*)(uintptr_t)t->host, t->id);
+#endif
         if (t->last_svc == 0x18 && t->last_args[1]) {   // WaitSynchronization : objets attendus
             for (int i = 0; i < (int)(uint32_t)t->last_args[2] && i < 8; i++) {
                 uint32_t h;

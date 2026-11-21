@@ -9,8 +9,12 @@
 // QueueSubmitCommands exécute les listes via nvn_execute (nvn_exec.h).
 #include "nvn_exec.h"
 
+#ifdef _WIN32
 #include <direct.h>
 #include <io.h>
+#else
+#include "plat_linux.h"
+#endif
 
 #include <cmath>
 #include <deque>

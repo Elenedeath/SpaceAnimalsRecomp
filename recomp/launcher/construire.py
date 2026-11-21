@@ -31,9 +31,47 @@ def outil(nom):
     return shutil.which(nom) or nom
 
 
+def linux():
+    """Linux (AppImage du Steam Deck) : le même launcher, compilé par clang contre une racine système (Steam Runtime
+    « sniper », glibc 2.31 : sysroot_linux.py), avec SDL3, cairo, pango et fontconfig. L'API Win32
+    dont il se sert est réalisée par win32_linux.cpp, Direct2D par d2d_cairo.h.
+
+      python3 construire.py --sysroot <racine système> [--out ../../lanceur]   (clang++ et ld.lld du PATH, ou CXX=…)
+    """
+    if "--sysroot" not in sys.argv:
+        print("--sysroot <racine système> : obligatoire sous Linux (glibc 2.31, SDL3, cairo, pango)")
+        return 1
+    sr = os.path.abspath(sys.argv[sys.argv.index("--sysroot") + 1])
+    sortie = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else os.path.join(ICI, "..", "..", "lanceur")
+    cxx = os.environ.get("CXX") or shutil.which("clang++") or "clang++"
+    t = "x86_64-linux-gnu"
+    inc = [os.path.join(sr, "usr", "local", "include")] + [os.path.join(sr, "usr", "include", d) for d in
+           ("pango-1.0", "cairo", "glib-2.0", "harfbuzz", "freetype2", "fribidi", "pixman-1", "libpng16")]
+    inc.append(os.path.join(sr, "usr", "lib", t, "glib-2.0", "include"))
+    libs = [os.path.join(sr, "usr", "local", "lib"), os.path.join(sr, "usr", "lib", t), os.path.join(sr, "lib", t)]
+    cmd = [cxx, "--target=" + t, "--sysroot=" + sr, "-fuse-ld=lld", "-std=c++20", "-O2", "-march=x86-64-v2", "-Wall",
+           "-Wno-unknown-pragmas", "-Wno-missing-braces", *("-isystem" + i for i in inc),
+           "-I" + os.path.join(ICI, "..", "runtime", "third_party"),
+           *(os.path.join(ICI, s) for s in SOURCES + ["win32_linux.cpp"]), "-o", sortie,
+           *("-L" + l for l in libs), "-Wl,-rpath-link," + ":".join(libs), "-Wl,-rpath,$ORIGIN/lib",
+           "-lSDL3", "-lpangocairo-1.0", "-lpango-1.0", "-lgobject-2.0", "-lglib-2.0", "-lcairo", "-lfontconfig",
+           "-ldl", "-lpthread"]
+    r = subprocess.run(cmd, cwd=ICI, capture_output=True, text=True)
+    messages = (r.stdout + r.stderr).strip()
+    if messages:
+        print(messages[:12000])
+    if r.returncode:
+        return 1
+    fini = os.path.abspath(sortie)
+    print(f"OK {fini} ({os.path.getsize(fini) / 1e6:.1f} Mo)")
+    return 0
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    if sys.platform.startswith("linux"):
+        return linux()
     # à la racine du projet, comme dans le paquet (recomp/ à côté) ; autre nom avec --out si lanceur.exe tourne.
     # Chemin relatif au dossier du launcher : sans espaces, quel que soit le dossier du projet.
     sortie = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else os.path.join("..", "..", "lanceur.exe")

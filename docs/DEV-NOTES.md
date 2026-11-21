@@ -381,7 +381,7 @@ python link.py                                   # after modifying the runtime
 | `RECOMP_FRAMES_IN_FLIGHT` | frames waiting to be displayed before acquisition blocks (2 by default) |
 | `RECOMP_NO_VSYNC_EMU=1` | no back-pressure at the virtual vblank (free-running frame rate) |
 | `RECOMP_FH_MODE=9` | empty `ListFrameHistory` (the engine's regulator runs open-loop) |
-| `RECOMP_PERF=1` | per-frame timings: presentation, GPU thread, operations, `draw` steps, sync waits |
+| `RECOMP_PERF=1` | per-frame timings: presentation, GPU thread, operations, `draw` steps, sync waits; real GPU time per frame (avg, max, frames over one display period) |
 | `RECOMP_FRAME_TRACE=N`, `RECOMP_FRAME_TRACE_MS=x` | system calls longer than x ms (1 by default) in frames N to N+2 |
 | `RECOMP_TS_LOG=N` | GPU timestamps written and read back by the game (frames N to N+3) |
 | `RECOMP_AUTOPRESS=1` | presses A for 100 ms every 2 s (title screen) |
@@ -419,7 +419,19 @@ python link.py                                   # after modifying the runtime
 | `RECOMP_FINISH_NO_FLUSH=1` | `nvnQueueFinish` without submitting the recorded Vulkan work (former cause of the blocky text) |
 | `RECOMP_COPY_IN_PLACE=1` | `CopyBufferToTexture` reads the source at GPU execution time instead of a snapshot taken at recording time |
 | `RECOMP_CPU_BUFFER_COPY=1` | `CopyBufferToBuffer` done by the CPU at recording time (old behavior) instead of an ordered GPU copy |
-| `RECOMP_GPU_PROFILE=N` | at frame N, GPU duration of each draw and compute dispatch (timestamps), summed per program: the 30 most expensive go to the log |
+| `RECOMP_GPU_PROFILE=N` | at frame N, GPU duration of each draw and compute dispatch (timestamps), summed per program: the 30 most expensive go to the log, with the span from first to last draw |
+| `RECOMP_GPU_PROFILE=auto` | same profile, taken on the frame after a slow one (GPU time over one display period, or display image acquisition over half of it); 100 profiles at most, 5 s apart, each line gives the reason; draws without a fragment shader name their vertex shader, each draw line gives its vertex count, and `target` lines sum the time per render target (size, `depth only` for depth/shadow passes) |
+| `RECOMP_VB_VRAM=1` | also `recomp.ini` `vertex_buffers_vram` / `vertex_buffers_vram_mb` (the variables win); test, off by default, Windows only (ignored on Linux): vertices and indices read from a video memory copy instead of the imported game memory (PCIe). Game memory is followed in 64 KB pieces: copied at the head of the next command buffer and write-protected; a write by the game faults and sends draws back to the import until the next copy; pieces rewritten right after each copy stay on the import. `RECOMP_VB_VRAM_MO`: video memory cap (2048 MB). `RECOMP_VB_VRAM_CALC=0`: never copy the windows used by computes. One `VB_VRAM:` log line every 600 frames |
+| `RECOMP_NO_HOST_LIBC=1` | keep the game SDK's recompiled `memmove` / `memcpy` / `strcmp` (by default the calls that go through the dispatch use the host C library, same results) |
+| `RECOMP_MEMVALID_VQ=1` | `mem_valid` checks every range with `VirtualQuery`, as before (by default the on-demand ranges are recognised from the runtime's own table, without a call to Windows) |
+| `RECOMP_TEX_RELEASE_WHOLE=1` | the source of a big texture is given back in a single block, as before (by default, beyond 4 MB, in 4 MB pieces spread over frame ends, each piece re-hashed just before it is given back) |
+| `RECOMP_DESWIZZLE_THREADS=n` | also `recomp.ini` `deswizzle_threads` (the variable wins); threads used for texture deswizzling and hashing (default: half of the logical processors, 8 at most) |
+| `RECOMP_DESWIZZLE_OLD=1` | old deswizzle path (row bands, then a second read of the source for its hash); by default each 1 MB piece of the source is read once, deswizzled with non-temporal stores and hashed while it is in the cache |
+| `RECOMP_STAGING_POOL_MB=n` | also `recomp.ini` `staging_pool_mb` (the variable wins); size of the texture staging pool with more than 5 GB of commit free (default 512 MB; 128 = size before 1.1.0.2) |
+| `RECOMP_NO_STAGING_ARENA=1` | also `recomp.ini` `staging_arena_mb = off` (size: `staging_arena_mb`, `RECOMP_STAGING_ARENA_MB`; the variables win); no warm staging arena (default: with more than 5 GB of commit free, one 512 MB staging buffer whose pages are touched once by a low-priority background thread, so texture uploads no longer pay a page fault per 4 KB; released under 5 GB free or when Windows refuses memory). `RECOMP_STAGING_ARENA_MB=n`: its size |
+| `RECOMP_MEM_NO_HYSTERESIS=1` | memory levels (staging pool size, staging arena, deferred texture releases) follow the free commit without margin, as before. By default a level drops as soon as the free commit goes below 5 GB (or 3 GB), but comes back up only above 3.5 GB, or above 5 GB + the staging arena size + 0.25 GB: near 5 GB the arena no longer gets created and released every ~10 s |
+| `RECOMP_NO_IMAGE_BLOCKS=1` | one video memory allocation per texture, as before (by default textures of 16 MB or less are cut from shared 64 MB blocks) |
+| `RECOMP_IMAGE_BLOCKS_KEEP=1` | the empty 64 MB image blocks (one kept per memory type) stay kept whatever the memory, as before. By default they are released below 3 GB of commit free, above 85 % of the video memory budget, or when memory is refused to the game (one log line each time, 20 at most) |
 | `RECOMP_SYNC_SUBMIT=1` | synchronous submissions: the GPU thread waits for each submission to finish (before the 8th pass) |
 | `RECOMP_SNAPSHOT_EVERY=n`, `RECOMP_SNAPSHOT_DIR=d` | one snapshot every n frames; (existing) folder for the snapshots |
 | `RECOMP_VOLUME=0..100` | output volume (100 by default; 0: muted, the sound card still paces the game's audio) |
@@ -438,6 +450,8 @@ python link.py                                   # after modifying the runtime
 | `RECOMP_KEY_SCRIPT="38:A,43:-A"` | scripted presses: button (A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LSTICK RSTICK) pressed, or released with `-`, at the given time in seconds. Holding A for 5 s skips a cutscene; "38:A,43:-A,52:A,57:-A" usually leads to the training in 70 s (depending on loading times) |
 | `RECOMP_BACKGROUND_INPUT=1` | reads the XInput controller even when the window does not have focus (old behavior) |
 | `RECOMP_INPUT_LOG=1` | log of every button change and of every change in the presence of the XInput controller |
+| `RECOMP_MOUSE_KEYBOARD=0\|1` | overrides `mouse_keyboard` in `recomp.ini` (the game's mouse mode, `hle_kbm.cpp`) |
+| `RECOMP_JCMS_CONTACT=0\|1` | mouse mode: right Joy-Con 2 lifted or laid down, whatever the window focus (tests without a player) |
 | `RECOMP_CNTFRQ=hz` | frequency of the guest counter (31,250,000 by default, that of the Switch 2) |
 | `RECOMP_ALIAS_PACKAGED=1` | old reuse, by address, of a packaged image without comparing its contents (stale textures) |
 | `SHADERC_NO_CLIP=1` | (`shaderc.py`) translates without `gl_ClipDistance` |
@@ -3697,3 +3711,541 @@ array texture. `RECOMP_GPU_SYNC=1`: the game waits for the GPU thread at every s
 silently. `nvn_exec.cpp`: `CopyTextureToBuffer`, never executed, is logged if the game emits it.
 `RECOMP_SHADER_WATCH=hash,hash`: the draws that use those shaders (frame, material, first target), the first time and
 then every 600 frames.
+
+**Issue #26 (Radeon RX 580, 1.0.3): three defects of an old AMD driver (2026-11-14).** The driver of that card
+(Polaris "legacy" branch) offers neither `VK_EXT_graphics_pipeline_library` nor `VK_KHR_shader_quad_control`.
+- *Wireframe lines on models*: this is the defect of point 3 of the "AMD cards" section (votes of helper pixels),
+  which only `VK_KHR_shader_quad_control` fixes today. Confirmed by the player's log: no "fragment shaders: full pixel
+  quads" line. Not fixed; those votes would have to be written without subgroups in the translator. Reproducible with
+  `RECOMP_GPU=AMD RECOMP_QUAD_CONTROL=0`.
+- *Freeze at the first appearance of a character*: without libraries, each pipeline is compiled in full at its first
+  draw, and the launcher's precompilation cannot prepare it. Not fixed (lead: a list of pipeline states recorded
+  beforehand).
+- *The game stops at the end of Corneria* ("System vgame_sim appears dead: last reported in 71899 ms ago", then
+  Abort): the engine's watchdog. The clock pause of issue #13 gave 5 s of grace to EACH stall: dozens of pipelines
+  compiled one after another, 1 to 4 s each, when the debrief cinematic starts, never triggered it. Fixed in
+  `runtime.cpp`: the 5 s credit is cumulative and refills by 1 s per 12 s spent outside a stall (`STALL_RECHARGE`).
+  `RECOMP_STALL_PER_CALL=1` restores the old computation; `RECOMP_STALL_SERIES=frame,count,ms` simulates a series of
+  stalls in game.
+  Verified outside the game only (`scratchpad/essai_stall.py`: the text of those functions, extracted from
+  `runtime.cpp`, compiled with a fake clock): 30 stalls of 3 s give 5.32 s on the game clock instead of 90.3 s; one
+  stall of 100 s, 5 s as before; hitches of 0.3 s every 20 s, nothing hidden; the clock always increases. Then in
+  game (`RECOMP_STALL_SERIES=6000,30,3000`, 30 stalls of 3 s during the opening cinematic): with the old computation
+  (`RECOMP_STALL_PER_CALL=1`), the game stops 68 s after the series starts, with the player's message ("System
+  vgame_sim appears dead: last reported in 65436 ms ago", same `svcBreak`, same argument 0x711309f474); with the new
+  one, 85,011 ms are hidden from the game and the run goes on until it is closed normally. The mechanism is therefore
+  reproduced; that it really was pipeline compilations on the player's side remains a reading of their log. The
+  published 1.1.0 still has the old computation.
+- Also to do: the "build:" line of `lanceur.log` contains the file name of the game copy (the profile folder is
+  masked, not that name); the player made it public by attaching their log.
+
+**Missing tools repaired by the build (issue #3, 2026-11-14).** A player had the 1.1.0 launcher with "SDL3 missing
+(outils\sdl3)" and a Pro Controller that did nothing in game. By reading the code, the launcher's own update does
+install the tools a version adds (`maj.py` runs the new version's `outils.py` before writing `pret.txt`, and stops if
+a download fails; the script is identical from 1.0.0 to 1.1.0). But nothing repaired an installation where some are
+missing: `update.zip` extracted by hand over the previous version (the most likely case here, not confirmed), a file
+deleted or quarantined. The real download by an update has never been tried (the `maj` check puts the archives in
+place beforehand).
+- `preparer.py`, `outils_manquants`: tools whose mark `outils/.installe/<name>` is missing or comes from another
+  archive, or whose witness file is gone (`"temoin"` in `outils.py`: `SDL3.dll`; the file itself for FSR and DLSS).
+  Python and its modules are excluded (it is the running Python).
+- `installer_outils_manquants`, at the start of every build: runs `outils.py --dest` again, which downloads what is
+  missing. A failure does not stop the build (those tools are optional); it is remembered in
+  `outils/.installe/_echec.txt` so that the launcher does not ask for a rebuild at every start for a player without
+  network access.
+- `--a-refaire` puts "outils" at the head of its list as long as some are missing: the launcher then shows "to be
+  rebuilt", and the rebuild installs them (steps already done are skipped).
+- Verified without network and without the game (`scratchpad/essai_outils_manquants.py`, a fake package
+  installation): healthy installation, `sdl3` folder missing, `SDL3.dll` deleted with its mark left behind, DLSS DLL
+  missing without network. Not verified: in the launcher itself, and with a real download.
+
+**Shader precompilation ignored the chosen graphics card (found 2026-11-19, fixed, not published).** In
+`host_main.cpp`, the `--precompile` branch returned before `settings_init`: `recomp.ini` and the `RECOMP_*`
+variables were never read there, so `gpu = …` (launcher, GRAPHISMES page) and `RECOMP_GPU` had no effect and the
+shaders were compiled for the card of the automatic choice. The game then started on the chosen card with a
+`pipelines.ok` mark made for another one (vendor and device are in the signature), so nothing was precompiled for it:
+shaders compiled at first use, with the freezes that go with it. Only players who pick a card other than the
+automatic one were concerned. Fix: `settings_init(argc, argv)` in that branch, in the supervisor and in its child.
+Verified without a window on this PC: `RECOMP_GPU=AMD recomp_main.exe --precompile` now compiles the 2,388 shaders
+on the integrated AMD card ("chosen in the settings" in `precompile.log`), 0 failures; before, the same command ran
+on the NVIDIA card. A runtime `.cpp` only: players relink, nothing is recompiled.
+
+**Incomplete installation: a clear message instead of "install Python" (issues #37 and #43, 2026-11-19, not
+published).** Two players extracted `update.zip` (or the source code) alone: no `outils` folder. The launcher said
+"Python 3 not found: install it, or put it in outils\python", they installed a Python, and the build failed further
+on (missing modules, then no compiler: "36 batch(es) failed").
+- `textes.cpp`, `pas_de_python`: the text now says the installation is incomplete and to download the full package.
+- `preparer.py`, `verifier_installation`, first thing of the "verifier" step: without `python\python.exe` in a tools
+  folder (`outils` next to `recomp`, or `recomp\outils` in the development tree), the build stops at once with the
+  same instructions, whatever Python runs it. `RECOMP_OUTILS_DU_PC=1`: build anyway with the PC's own Python and
+  compiler (development).
+- Verified without the game (`scratchpad/essai_paquet_incomplet.py`, a folder made of the launcher scripts only):
+  message with the package name of the current version; check passed with `outils\python` present or with the
+  variable. The launcher compiles (`construire.py --out`); the new text has not been looked at in its window.
+
+**Frame pacing is not tied to the real screen (issue #41, analysis of 2026-11-19, nothing changed).** The game is
+paced by a virtual display at exactly `refresh_rate` Hz counted on the PC clock (`nvn_gpu.cpp`, `Item::Present`:
+next virtual vblank; `hle_gfx.cpp`, frame history), and each image is presented at once in MAILBOX
+(`vk_render.cpp`, swapchain creation). Nothing ties that clock to the vertical blank of the real screen. On a
+screen without variable refresh, the phase between the two slides (a 60 Hz screen is rarely at 60.000 Hz); each
+time the presentation instant crosses a real vblank, images are shown twice then skipped for a few seconds, while
+the frame-time graph stays flat: what the player describes. Same on a screen whose rate is not a multiple of the
+game's (60 images on 144 or 165 Hz). `RECOMP_HOST_FIFO=1` already forces FIFO (not tried since the asynchronous
+submissions). To do: measure it (real vblank times against present times, repeated and skipped refreshes per
+minute), then lock the virtual vblank on the real one when the screen rate is a multiple of the game rate, and
+keep the free clock otherwise. Needs game runs on a screen without variable refresh.
+
+**Black squares on explosions (issues #31, #44…, analysis of 2026-11-19, nothing changed).** Seen in a player's
+video (1.1.0, RTX 3080, start of Corneria): for about a quarter of a second after a kill, the quad of one explosion
+sprite is opaque black, with a faint round pattern inside, sparks drawn over it; it shrinks with the sprite and
+goes away with it. So one particle is drawn without its transparency for its whole life; it is not a hole in the
+image nor a NaN spreading. Read in the code, and ruled out: staging buffers reused too early (they go back to the
+pool only when the GPU has finished their submission), draws skipped while a pipeline compiles (no such path),
+texture views and LOD clamps ignored (they are honoured). Left, to be tried in game with kills and DLSS on:
+(1) the sprite samples a copy of the scene (distortion) that the DLSS/FSR path does not fill, which would explain
+"much more with DLSS"; (2) its texture is read from game memory before the game has finished writing it, or an
+image is taken over by address with its previous content, until the periodic check sends it again
+(`flush_recheck`, at most 30 frames later). The players' logs would tell (2): `of which N re-uploads` in the
+periodic line, zero in all my runs. My unattended runs kill almost nothing, which is why they never showed it.
+
+## Shader translation: structured loops, bounded jump tables, cheaper global memory (PR #40, 2026-11-19)
+
+Contribution of Elenedeath (GitHub PR #40), `shaders/glsl.py` only, integrated by hand on 2026-11-19 (not published).
+- **Loops** (`boucles_structurees`): a shader with constant backward jumps used to put its whole chain of blocks in
+  one `while (true)`, walked again at each turn of any of its loops. Each loop region (jump target .. block of the
+  backward jump) is now its own `while (true)`; overlapping regions are merged, the others nest. Shaders with a
+  computed jump that is not a bounded table keep the old form. `RECOMP_SHADER_UNE_BOUCLE=1`: old form everywhere.
+- **Bounded jump tables** (`cibles_brx`): `IMNMX` unsigned with a constant, shift left by 2, `LDC` in bank 1, `BRX`.
+  Only entries 0..K can be read, so they are the only targets; 195 of the 262 `BRX` are recognized.
+- **Global memory** (`gxln`): the last window found is kept in registers, and a 64 or 128-bit vector access is
+  translated once instead of word by word. One addition to the PR: the address of a vector access is masked to a
+  multiple of 4, as `gld()` does for each word (the buffer reference is 4-aligned). Only remaining difference with
+  the old code: a vector straddling two imported windows reads as zero as a whole (it would have to be unaligned on
+  its own size and sit on a 32 MB cell limit or at the end of a pool).
+
+**What changes in the output** (glslang 16.6.0, the players' one): 2,468 stages, 2,388 translated, 80 unsupported,
+as before; 479 shaders change (97 compute, 380 fragment, 2 vertex), the other 1,909 SPIR-V are byte-identical, all
+`.meta` identical. In 363 of the 380 fragment shaders, operations that depend on neighbouring pixels (implicit-LOD
+sampling, derivatives: 1,730 lines) leave the single loop they were in.
+
+**Verification without the game.** Diff read entirely. An independent simulator (`scratchpad/pr40/simuler_flot.py`)
+runs the blocks in the same order before and after on every restructured shader. Both drivers of this PC compile
+the 2,388 shaders without a failure (`--precompile`); cold driver compile time unchanged (AMD 46 s, NVIDIA 22 s).
+
+**Verification in game** (14 unattended runs, windowed, muted; Corneria campaign from a finished save, and the
+prologue of a new game). The runs use 117 of the 479 changed shaders (112 fragment, 5 compute).
+- Image: no visible difference in any scene (menus, cinematics, cockpits, sea, canyon, city), on NVIDIA and on the
+  integrated AMD card. With snapshots taken at fixed instants after the campaign start
+  (`RECOMP_SNAPSHOT_CAMPAIGN`), over the first 100 s (cinematic on rails), the mean difference between the
+  reference and the PR is 0.4 to 2.0 levels out of 255 per 20 s slice; between two identical reference runs it is
+  0.4 to 2.3. Later, the runs diverge by themselves (loading time, random events).
+- No skipped draw, no missing shader, no error in any log.
+- Speed, same mission, before → after:
+
+| Configuration | Frames in the run | Median fps | Lowest fps sample | 120-frame windows with a frame > 40 ms |
+|---|---|---|---|---|
+| NVIDIA RTX 5070 Ti, 1440p, 120 Hz | 33,600 → 35,400 | 110 → 115 | 60 → 78 | 27 of 229 → 17 of 245 |
+| Same, prologue | 26,400 → 27,600 | 88 → 95 | 42 → 47 | — |
+| Integrated AMD, 1080p, native scale | 3,600 → 5,400 | 11 → 16 | 1.9 → 3.9 | (every window) |
+| Integrated AMD, 720p at 67 % | 10,800 → 12,600 | 31 → 35 | 6.3 → 13.7 | (most windows) |
+| 4 cores (affinity 55), 1080p, 60 Hz | 60 fps held | 60 → 60 | 59 → 58 | 14 of 140 → 16 of 140 |
+
+  Three reference runs and three PR runs on NVIDIA agree with one another. The longest single frames are at scene
+  changes in every run; the two longest (0.6 and 0.9 s, in PR runs) are the temporary-file write of released
+  texture data at the mission load (`deferred releases: 8.78 ms/frame` in that window), a known stall that does not
+  depend on the shaders.
+- Not covered: the other missions (the unattended ship never leaves Corneria), the 362 changed shaders these runs do
+  not use, RADV and Intel (the author's measurements), and old AMD drivers without `VK_KHR_shader_quad_control`.
+
+**For players:** the update redoes the "shaders" step (translation and driver compilation, about two minutes);
+nothing is recompiled.
+
+**Two diagnostics added for this** (`vk_render.cpp`, `svc_fs.cpp`; no effect without the variables):
+`RECOMP_SHADER_USED=1` logs the first use of each shader by a draw or a compute (which shaders a run really
+exercises); `RECOMP_SNAPSHOT_CAMPAIGN=step[,start[,end]]` takes snapshots at fixed instants after the second write
+of the save (the campaign start in runs that begin from a finished save), so that two runs can be compared at the
+same place within one frame. Tools: `scratchpad/pr40/` (`jouer.sh`, `couverture.py`, `comparer_instants.py`,
+`apparier_instants.py`, `pires_images.py`).
+
+**Stall of 0.6 to 0.9 s at a mission load: released texture data written under a lock (seen 2026-11-19, not
+fixed).** In 2 of the 14 runs above, one frame at the mission load lasted 0.6 and 0.9 s, with
+`deferred releases: 8.78 ms/frame` in that window: the temporary-file write of released texture sources
+(`tex_release_pending` → `tex_release` → `mem_release`, `memory.cpp`). It is the stall already noted on 2026-11-12
+("a single write cannot be cut"): Windows slows a buffered write down when many pages are dirty. Two things make it
+felt: the write runs on the GPU thread at the end of a frame, and `mem_release` holds `g_rel_lock` exclusively
+during `rel_io`, so a game thread that faults on a released page waits too. Moving the call to another thread is
+not enough; the write has to leave the lock (copy under the read-only protection, write afterwards, or an
+unbuffered write by pieces). To redo with long validation runs: this is the code of the crash of issue #17.
+Consistent with the hitches "always at the same places" (#42) and with the player helped by
+`texture_release = false` (#10, #25).
+
+**Black squares on explosions: not reproduced on this PC (2026-11-19).** Corneria campaign, unattended, the ship
+firing in bursts through `RECOMP_KEY_SCRIPT` (9 to 11 enemies shot down per run), ten snapshots per second during
+the flight (`RECOMP_SNAPSHOT_CAMPAIGN=0.1,158,266`), searched for dark clusters present at one instant and absent
+0.3 s before and after (`scratchpad/pr40/carres_detecte.py`). Nothing but camera motion and the portraits of the
+radio panel (black for 0.1 to 0.3 s when the panel opens, in every run; maybe as on the console) in these runs:
+- DLAA, published shaders, warm caches;
+- DLAA, shaders never drawn before and no pipeline cache (every linked pipeline created for the first time);
+- DLAA, game data read at 40 MB/s (`RECOMP_FS_SLOW_MBPS=40`, added for this: `svc_fs.cpp`, a slow disk or a cold
+  Windows file cache).
+- DLSS Performance, model M (the settings of a player who has them);
+- no DLSS, no FSR, 1080p, 60 Hz, native scale, pacing off: the exact settings of the player of issue #44, who has
+  a black square at every enemy shot down (RTX 3080). Nothing either on this RTX 5070 Ti: the settings are not
+  what makes the difference.
+What the slow-disk run did show: images without a live object sent again while the game was still rewriting their
+memory, then again 12 frames later by the periodic check (`RECOMP_FLUSH_LOG=1`): the mechanism "an upload catches
+half-written data, the periodic check repairs it up to 30 frames later" exists; nothing says yet that it is what the
+players see. Needed to go further: the log of a player who has the squares (the periodic line
+`… textures uploaded (… of which N re-uploads)` and the settings in its header), ideally a run of theirs with
+`RECOMP_FLUSH_LOG=1`.
+
+**Launcher: white window under Wine / Proton (issue #21, 2026-11-19, not published).** The player's `lanceur.log`
+ends at `display: CreateEffect (color matrix) failed (0x88990028)`: Wine's Direct2D has no colour-matrix effect, and
+`dessin_init` gave up there, leaving the window white. The two effects are now optional (`dessin.cpp`): without the
+colour matrix the background video is drawn as it is, darkened like the grading does; without the blur the title
+has no glow; one log line says which is missing. `LANCEUR_SANS_EFFETS=1` simulates their absence. Verified on
+Windows with that variable (test build, capture: everything is drawn and readable). Not verified under Proton
+itself, where something else may be missing further on. Linux is still not a supported platform.
+
+**The game stops delivering frames: where it is stuck is now logged (issues #38 and #33, 2026-11-19, not
+published).** Player's log of #38 (RX 9070 XT, FSR 4, 1080p on a 144 Hz screen, FIFO: that driver offers no
+MAILBOX): 60 fps until 1030 s, a last sample at 44.7 fps at 1034.8 s, then no frame at all, no error line, the
+memory sweeps going on, and at 1098.2 s the engine's watchdog (`System vgame_sim appears dead: last reported in
+60044 ms ago`) and `svcBreak`. So the game threads were alive, the simulation waited 60 s for something, and no
+pipeline was being compiled (the game clock was not paused). The player calls it "PC entirely frozen", which fits
+a graphics card busy for a minute. FSR 4 had been working for 17 minutes; the chosen card is also the one of the
+automatic choice, so the precompilation fix above does not concern this player. The cause is not known: nothing in
+the log said what the graphics thread was doing. It does now:
+- `g_gpu_phase` (`vk_render.cpp`, struct `Phase`): a static text set around each wait of the graphics thread
+  (driver compiling, waiting for a submission, `vkAcquireNextImageKHR`, `vkQueuePresentKHR`, a sync of the game,
+  idle because the game sends no commands);
+- `surveillance_blocages`, a thread started at the first frame: after 5, 20 and 50 s without a frame delivered by
+  the game, one line `NO FRAME DELIVERED BY THE GAME FOR n s. Graphics thread: … Submissions: n sent, n finished by
+  the graphics card. Last program: … Shaders of the unfinished submissions (* = never completed before): …`, and
+  `frames are delivered again after n s` when it resumes;
+- `svcBreak` logs the same state (`kernel.cpp`).
+Verified with `RECOMP_HANG_TEST=frame,seconds` (the graphics thread sleeps at that frame): the line comes out at
+5 s. The asynchronous completion thread had no such report (only the synchronous `wait_serial` did, "GPU not
+responding for 1 s"), which is why these logs were silent. The translated shaders bound their loops at 1,000,000
+turns (`guard`): a runaway loop on every pixel is still a freeze of a minute or more; lowering the bound needs the
+real maximum of the game's loops first.
+
+**Campaign not starting after the tutorial without restarting the game (issue #9): read, not understood.** The
+player's log shows the tutorial ending, `tutorial_to_corneria.level.package_list` loaded with an async hint at
+983.9 s, the outro cinematic unloaded at 1042 s, then 350 s of a still scene (358 draws, 382 pipelines, no new
+texture, 60 fps) until the player closes the window. No stub or error line in between. Either that screen waits
+for an input that does not arrive, or a load never completes. The unattended test ship cannot finish the tutorial,
+so this path has never been run here; it needs a played session (or a script of the tutorial).
+
+## Regular frame pacing: each frame shown at its virtual vblank (issue #41, 2026-11-19, not published)
+
+**The defect.** A player with a flat frame-time graph at 60 fps finds the game "out of sync", clearly less smooth
+than in an emulator (RTX 5070 Ti, 1440p, 240 Hz screen, DLSS Quality). The game is paced by a virtual display
+(`hle_gfx.cpp`: a vblank every 1/refresh_rate, counted on the PC clock; `gpu_acquire_wait` holds the game back on
+it), but each frame was handed to the real screen as soon as the graphics thread had finished it, a few
+milliseconds earlier or later than its neighbours depending on the work of that frame. The game's frame times were
+regular; the instants of `vkQueuePresentKHR` were not. On a fixed-rate screen a frame then lasts one refresh more
+or less than the next one (240 Hz: 4.2 ms per refresh), and a variable-rate screen shows the frames at those
+uneven instants. On the console, the display queue shows each frame at a vblank.
+
+**The change** (`nvn_gpu.cpp`, `Item::Present`): before `vkr::present`, the graphics thread waits until the
+virtual vblank of that frame minus 0.3 ms (`wait_until_tick`), the instant it already reported to the game through
+the frame history. Only while the PC holds the rate: after half a second of frames each one vblank after the
+previous one. A frame that missed its vblank is shown at once, and so are the next ones until the rhythm is back.
+Setting `frame_pacing` in `recomp.ini` (`settings.cpp`, `kCleCadence`; `true` by default, added at the end of
+existing files; `RECOMP_FRAME_PACING` for tests); `false` gives the behaviour of 1.1.0.
+
+**Why the condition.** Waiting takes away the one-frame lead that keeps a slow PC from missing the next vblank.
+Tried on the integrated AMD card (720p at 67 %, about 35 fps for 60 asked), frames per second over the same 220 s
+of mission: no pacing 35.7, 34.4, 34.3 (three runs); pacing without condition 32.3; frame by frame (only frames
+that are on time) 33.8; after 8 frames on time 32.8; same plus "ready a quarter of a period early" 33.3 (and that
+rule cancelled the gain at 120 Hz); after half a second on time 34.8 and 34.7: no loss left.
+
+**Measurement** (`RECOMP_PERF=1`, new line `present calls: interval error sd … ms, worst … ms; off by more than
+1 ms: n, 2 ms: n, half a period: n`, per 120 frames; `scratchpad/pr40/regularite.py`). Corneria campaign,
+unattended, RTX 5070 Ti. Share of the frames presented more than 1 ms / 2 ms away from the period:
+
+| Run | Before | With pacing (final rule) |
+|---|---|---|
+| 60 Hz, 1440p, DLSS Quality, cinematic | 38.8 % / 8.9 % | 2.3 % / 1.7 % |
+| 60 Hz, same, flight | 29.6 % / 17.1 % | 3.3 % / 2.3 % |
+| 120 Hz, 1440p native, cinematic | 51.2 % / 32.7 % | 34.9 % / 22.7 % |
+| 120 Hz, same, flight | 62.4 % / 42.3 % | 23.3 % / 11.4 % |
+| 60 Hz, 1080p, 4 cores, cinematic (rule "8 frames") | 40.8 % / 12.9 % | 1.6 % / 1.3 % |
+| 60 Hz, same, flight (rule "8 frames") | 44.3 % / 20.1 % | 4.1 % / 3.2 % |
+
+  At 120 Hz this PC does not hold 120 fps in those scenes (100 to 115 fps): pacing only applies in the stretches
+  where it does. No loss of speed: 60 Hz, median interval 16.67 ms both ways; 120 Hz, 99.4 and 106.8 fps before
+  (two runs), 108.6 after, and the 120-frame windows containing a frame over 25 ms go from 49 of 200 to 21 of 220;
+  4 cores, 59.6 fps both ways. The 4-core pair was not replayed with the final rule.
+
+**Cost and limits.** A frame is shown later than before by the time it was ready ahead of its vblank (a few
+milliseconds; the console does the same). The virtual clock is still not tied to the real screen: 60.000 Hz
+against a screen at 59.94 Hz slips by one frame every 17 s (one repeated or dropped frame); locking the virtual
+vblank on the real one when the rates match is the next step, to do with a screen at a multiple of 60 Hz (this
+PC's is at 164.8 Hz). Not judged by eye on a 60, 120 or 240 Hz screen: the regularity is measured, the feeling is
+the players' to confirm.
+
+## Mouse mode: the PC mouse as a Joy-Con 2 laid down as a mouse (2026-11-19; not published)
+
+User request: play with keyboard and mouse, using the game's mouse mode (Switch 2).
+
+* **What the game reads.** The USB mouse and keyboard (`nn::hid::GetMouseState(s)`, `GetKeyboardStates`) only serve
+  the interface, and only when the variable `input.keyboard_mouse_input_on_nintendo_enabled` is true: mouse aiming goes
+  through the Joy-Con 2 optical sensor ("Jcms": `nn::hid::InitializeJcms`, `GetJcmsHandle`, `StartJcms`,
+  `GetJcmsStates`, `StopJcms`, `FinalizeJcms`). vwm layer (main+0xba67000…): two handles per controller (left Joy-Con,
+  type 0; right, type 1), up to 16 states read per frame, movements added up. `JcmsState` (0x20 bytes): sampling number
+  +8, dx +0x10, dy +0x14, attributes +0x18 (bit 0 sensor present, bit 1 laid down). A controller "has a mouse" when bit
+  0 of the newest state is set (vwm event 0x18, read by `input.get_gamepad_supports_mouse`: the "Mouse mode" game option
+  only appears then).
+* **Controller type.** Npad style bit 12 = "joycon-dual-ms" (Joy-Con 2 pair), 13 and 14 = a single Joy-Con 2; the Pro
+  controller ("fullkey") never plays with the mouse. But the game only accepts bit 12 at startup
+  (`SetSupportedNpadStyleSet` 0x741f): the single-player campaign asks for 0x407 (handheld, Joy-Con pair, Pro, bit 10)
+  and silently refuses a controller of another style ("Einzelspieler" does nothing). `svc_hid.cpp` therefore presents
+  the pair like the console does: bit 12 when accepted, otherwise a plain pair (bit 2); JoyDual LIFO (+0x6c8 in SDK 21)
+  and the "left and right Joy-Con connected" attributes (bits 2 and 4) the game requires.
+* **What turns mouse mode on** (`player_input.vscript`, decompiled with Ghidra 12.2; main+0x881ccfa0 in the reference
+  image): a Joy-Con laid down (Jcms contact), the mouse moving (more than 0.01), and its motion sensor saying it lies on
+  its side: acceleration x > threshold (left) or < −threshold (right); it leaves when x goes back above −0.5 (right).
+  `eclipse_action_map_manager.vscript` then picks the mouse action maps (3 or 4: right- or left-handed): `player_input`
+  returns input type 2.
+* **The real blocker: `GetSupportedNpadStyleSet` (hid, command 101) returned 0.** When it creates its window, the game
+  requests the motion sensors (`GetSixAxisSensorHandles`, `StartSixAxisSensor`) only for the styles it reads back with
+  this command (main+0xba68b5c): with 0, no sensor, a zero acceleration, and never any mouse mode. `svc_hid.cpp` now
+  returns the accepted styles (with the setting).
+* **`hle_kbm.cpp`** replaces the SDK's Jcms functions: player 1's right Joy-Con receives the raw mouse movements (Raw
+  Input, without Windows acceleration, multiplied by `mouse_speed`), at most one state every 4 ms; it is laid down while
+  the window has focus. And `nn::hid::GetSixAxisSensorState`: at rest, the right Joy-Con lying on its side (acceleration
+  x = −1 G) while laid down, flat otherwise. The mouse buttons press Switch buttons (`input.cpp`; R and ZR by default,
+  the two buttons under the fingers of a Joy-Con 2 held as a mouse); the keyboard drives the controller as before.
+* **The Windows cursor** is hidden and held in the game's picture: borderless, as soon as the window is active;
+  windowed, after a click in the picture (the title bar stays reachable to move or resize the window; F11 or
+  Alt+Enter to windowed releases it). `mouse_release` (F9 by default, a key like `key_…`), Alt+Tab or losing focus
+  release it; a click in the picture takes it back, and that click presses nothing in the game (buttons held at
+  capture are ignored until released). Every exit path (window closed, guest `ExitProcess`, crash, out of memory)
+  calls `kbm_release` before ending the process. High-resolution wheels send fractions of a 120 notch: they add up to
+  a notch. The capture is written for Windows: elsewhere `mouse_keyboard` stays off (`settings.cpp`), for the Linux
+  port.
+* **Motion sensors**: while the mode is on, `GetSixAxisSensorState` always answers at rest (right Joy-Con on its side
+  while laid down). That is what the mode needs; the runtime has no motion input from PC controllers either way.
+* **Settings**: `mouse_keyboard` (false by default: Pro controller, nothing changes), `mouse_speed` (10 to 1000%),
+  `mouse_left`, `mouse_right`, `mouse_middle`, `mouse_back`, `mouse_forward`, `mouse_wheel_up`, `mouse_wheel_down`:
+  any controller action (`a` … `right`, `ls_up` … `rs_right`, `left_sl`, `left_sr`, `right_sl`, `right_sr`, `none`);
+  a wheel notch is a short press (80 ms). Launcher: Controls page, MOUSE tab.
+* **The game's mouse-mode layout** (interface texts, `ui_hud.locs_strings`, `HUD_TUTORIAL_PROMPT_R_MOUSE_…`): the
+  mouse steers; boost and brake on the right stick (up, down, held); tilt on the left stick (left, right; twice: barrel
+  roll; both held: hover); fire, alternate fire, torpedo and barrel roll from the game's action table
+  (`fire_lasers`, `mouse_alt_fire`, `fire_bomb`, `mouse_barrel_roll_left` / `_right`). Left-handed (`L_MOUSE`): the
+  sticks swapped. Hence the user's request: every input of both Joy-Con reachable from the keyboard and the mouse.
+* **Keyboard**: SL and SR of each Joy-Con added to the actions (`key_left_sl` … `key_right_sr`, bits 24 to 27 of the
+  Npad state, no key by default). A key can require Ctrl, Shift, Alt (`key_rs_up = shift+0x11`): `touches_actives`
+  (`input.cpp`) keeps the most specific combination of each key (W: left stick, Shift+W: right stick), and a modifier
+  key bound on its own does not count during a combination that uses it. The launcher captures the combination
+  (modifiers held), or the modifier key released on its own. **AltGr** (AZERTY, QWERTZ, US international…): Windows
+  reports it as left Ctrl + right Alt; on a layout that has it (one of its characters typed with Ctrl+Alt,
+  `VkKeyScanExW`), right Alt held counts neither as Ctrl nor as Alt, in the game (`host_modifiers_held`) and in the
+  launcher's capture. The menu convenience keys (Enter, Backspace, Esc, Tab) stop as soon as their key is bound,
+  alone or in a combination. A game built before combinations ignores those keys: the Controls page says so while
+  the launcher offers a rebuild.
+* **`recomp.ini`**: the appended block only holds `mouse_keyboard` (the other settings are explained in it); the
+  launcher writes `mouse_speed` and the `mouse_…` inputs only once the mode is on (or when they are already there),
+  and the SL · SR keyboard row only shows in mouse mode. Launcher and game read these settings the same way (case,
+  `yes` / `on` / `oui`, out-of-range speed brought back within 10 to 1000).
+* **Dead ends**: the game's USB mouse (variable above) does not aim; forcing the "joycon-dual-ms" style is not enough
+  without a motion sensor. The slight smoothing of the aim comes from the game (reticle), not from the mouse.
+* **References**: Recompia (Pokopia, github.com/Dittobyte/Recompia, `docs/hid_mouse_sw2.md`) for Nmouse, Jcms and
+  commands 3110 onward; Pokopia goes through Nmouse, Star Fox reads Jcms itself. The scripts' `__alias_…__XXXXXXXX`
+  suffixes are the FNV-1a of the script path (`/data/eclipse/input/player_input.vscript` → E6CAE361).
+
+
+## In-game menu (F1): settings while playing (2026-11-16; not published)
+
+Request: the menu of the other Switch 2 recompilations, which gives the settings without leaving the game. Model:
+Longshot (MagicBeanDev, GPLv3, https://git.magicbean.dev/MagicBeanDev/Longshot: `gpu/vk/vk_menu.cpp`, `vk_imgui.cpp`,
+`vk_ui.h`). Same principle, rewritten for this game: Dear ImGui is used for drawing only (its draw lists, not its
+windows or input), the menu reads the keyboard, the controller and the mouse itself, and it is drawn over the window's
+image at the last step of the presentation. Closed, it costs nothing: no Dear ImGui frame, no render pass.
+
+**Files.**
+- `runtime/os/menu.cpp`: the lines, the input, the drawing. Neither Windows nor Vulkan (the host's services are in the
+  `hote` namespace of `menu.h`): that is what lets it be tried outside the game.
+- `runtime/os/menu_ui.h`: the look, the launcher's (its colours, Bahnschrift), with drawn keys and buttons.
+- `runtime/os/menu_vk.cpp`: Dear ImGui and its Vulkan backend on the engine's device; fonts; textures.
+- `runtime/os/settings_ecrire.cpp`: writing `recomp.ini` (the lines of the changed keys are replaced in place, the rest
+  is kept: comments, order, line endings; the file is written beside it, then put in place in one step).
+- `runtime/third_party/imgui`: Dear ImGui 1.92.9b, unmodified (archive checked by its SHA-256, `README.txt`). Its
+  settings are in `runtime/os/menu_imconfig.h`, given to the whole runtime by `link.py`
+  (`-DIMGUI_USER_CONFIG=<os/menu_imconfig.h>`, in angle brackets: no quote to pass to g++ on Windows). A Dear ImGui
+  check that fails is written to the log (`menu`); it does not stop the game.
+
+**Opening.** F1 always; Insert too, unless the player gave it to an action; on a controller, the centre button (Guide,
+PS, Home) or Back and Start together. The first button of the chord reaches the game before the menu opens, so the
+game often pauses, which is welcome. For the first nine seconds a "Settings F1" reminder is shown at the bottom left
+(not during the shader collection: `RECOMP_WINDOW_HIDDEN`; `RECOMP_NO_MENU_HINT=1` turns it off).
+
+**The game keeps running.** As in Longshot, the menu does not stop the game: it only takes its input away. Stopping
+the presenting thread and the game's counter (`rt_stall_begin`) was set aside: the game's other threads would go on,
+and nothing here could test it. To tell the player (help of the Game tab, README): pause first.
+
+**Input.**
+- Keyboard and mouse: the window procedure (`present.cpp`) gives the keys pressed (`menu::touche`: virtual key,
+  scancode, repeat), the wheel and the clicks; they wait in a queue that the presenting thread handles
+  (`menu::a_dessiner`). The cursor's position is asked for when drawing (`hote::souris`).
+- Controller: at every read `input.cpp` publishes the raw inputs, by position (one bit per `Settings::P_*`), without
+  the player's settings, and the left stick (`menu::manette`). The button given to A confirms and the one given to B
+  goes back, as in the game; the D-pad and the stick repeat while held.
+- Menu open, `host_poll_input` gives the game an empty controller (`menu::masquer`), and rumble is off. Menu just
+  closed, the game gets nothing while a button is still down: the one that closed the menu (Esc is +, the button given
+  to B) does not reach the game. Only buttons count for that wait, not sticks: a player holding the stick while
+  closing is back in control at once.
+
+**What applies at once, what waits.** The menu writes into the settings in use (`settings_vivants`) those the game
+reads again at every use: rumble, keys, buttons, FSR sharpening (`fsr.cpp` read it once: now read every frame), FPS
+counter, menu size; the window goes through a message to its thread (`WM_PLEIN_ECRAN`); the volume through
+`audio_out::set_volume` (the gain was read once when the audio thread started). The others are only read at start-up
+(resolution, frame rate, scale, DLSS, FSR, card, language): the menu leaves the settings in use alone (the `gpu` and
+`language` strings are read by other threads), writes them to `recomp.ini` and marks the line "at the next launch"
+while its value is not the one the run started with. Only the keys the player changed are written: a value forced by
+`RECOMP_*` or the command line does not leak into the file.
+
+**Volume.** It is a launcher setting (`lanceur.ini`, `RECOMP_VOLUME`). The launcher now gives the game the path of its
+file (`RECOMP_LANCEUR_INI`) and the menu writes the volume there; without the launcher it lasts for the session only
+(the menu says so). When the game exits (`WM_JEU_FINI`), the launcher reads `recomp.ini` and its volume again: without
+that, the next change made in the launcher erased the menu's (`reglages_ecrire` writes all of its keys).
+
+**Vulkan** (`vk_render.cpp`, four hooks). `menu::vk::init` after `vkCreateDevice`; `menu::vk::images_fenetre` at every
+swapchain created (views of its images) and before the old one is destroyed; `menu::vk::presenter` in `present`, after
+the copy of the game's picture, the display image in `TRANSFER_DST_OPTIMAL` before and after. Everything is recorded in
+the presentation's command buffer: no extra submission, no extra wait.
+- Textures (the glyph atlas): created and updated in that command buffer, before the pass; the backend's own upload (a
+  submission and `vkQueueWaitIdle`) is never used (`dd->Textures = nullptr`).
+- What is let go (staging buffers, old textures) is destroyed `NSLOT + 2` presentations later: a slot is only taken
+  again once the GPU has finished its submission, and each presentation moves on by one at least. The backend's vertex
+  buffers rotate over as many frames (`ImageCount`).
+- sRGB window images (the format `create_swapchain` prefers): the backend's fragment shader is replaced by its own
+  followed by the sRGB to linear conversion (`kFragSrgb`, GLSL source in a comment, compiled with glslang 16.6.0).
+  Longshot converts the vertex colours on 8 bits, which crushes dark colours; here the menu's dark colours stay right.
+- Dear ImGui could not start (a Vulkan function missing, no video memory left): the menu never opens, the game keeps
+  its input, and the log says why (`menu`).
+
+**Fonts.** Bahnschrift like the launcher (`%WINDIR%\Fonts\bahnschrift.ttf`, Windows 10 and 11), else Segoe UI, else
+Dear ImGui's vector font; `RECOMP_MENU_FONT=<.ttf file>` forces one. No font is shipped.
+
+**Build.** `link.py` compiles Dear ImGui with the runtime (five files, once: per-file cache), and now compiles the
+runtime side by side (eight at a time): the step barely gets longer. `preparer.py`: the `lier` step also depends on
+`third_party/imgui`. `build.py` is not touched (changing it would redo the game's recompilation). After an update only
+the `lier` step runs again. `verif/trace_gcc.py` takes the sources and flags from `link.py`.
+
+**New settings** (`recomp.ini`, `[menu]` section, appended to existing files): `show_fps` (true, false;
+`RECOMP_SHOW_FPS`) and `menu_size` (small, medium, large). The launcher does not know them and keeps them as they are.
+
+**Checked, and not checked.** This work was done on a Mac, without Windows:
+- every file touched and Dear ImGui compile for Windows (zig 0.17.1's clang, target `x86_64-windows-gnu`, `link.py`'s
+  options); the symbols of the menu, Dear ImGui and the settings are all defined across the objects;
+- a test bench outside the game (MoltenVK 1.4.2 on an Apple M2 Pro, offscreen image in `B8G8R8A8_SRGB` then
+  `B8G8R8A8_UNORM`) runs the real `menu.cpp`, the real `menu_vk.cpp` and the real `settings_ecrire.cpp` with scripted
+  input: 15 behaviour checks (opening, immediate settings, button swap, key assignment, Quit confirmation, game input
+  masked until release, Back + Start chord), at 720p, 1080p, 1440p (Large size, English), 960×540 (scrolling page) and
+  3440×1440 (600 frames), and 26 checks of the `recomp.ini` writing (CRLF kept, a key that prefixes another, key
+  sections, one-step write);
+- **not checked**: the build with the package's GCC, the link, and everything specific to Windows and to the game: the
+  window procedure, key names, the raw controller read (SDL3 and XInput), the volume written to `lanceur.ini`, the four
+  hooks of `vk_render.cpp` on a real swapchain (NVIDIA, AMD, Intel), the menu during a real session. To do before
+  publishing: `verifier.py rapide`, then a session with the menu opened and closed several times, a window change from
+  the menu, and `verif/trace_gcc.py` (list of the GCC files).
+
+**First build on Windows (2026-11-16).** Built and linked with the package's GCC through `preparer.py` (Windows 11,
+NVIDIA RTX 3070 Ti). One fix was needed: `fsr.cpp` used `std::clamp` without `<algorithm>`. The game starts and the
+menu works there; no row-by-row record was kept. `verifier.py rapide` on that PC: `python`, `runtime` (858 MB, no
+warning), `sauvegardes`, `launcher`, `desinstaller`, `rapport`, `precompile` and `deplace` pass; `versions`, `depot` and
+`paquet` fail on files that are not in the public repository (`recomp/depot/`, `launcher/extraits/`); `deplacement`
+fails (same-volume and other-volume file comparison), in code this work does not touch. Left from the list above: AMD
+and Intel, and `verif/trace_gcc.py`.
+
+## Version 1.2.0: five contributions brought together and adapted (2026-11-20; not published)
+
+There is no 1.1.1: 1.2.0 gathers what was ready for it (the 2026-11-19 sections above) and five contributions, merged
+in this order and then adapted to one another: PR #39 (Linux, Elenedeath), #54 (smoother loading, Elenedeath), #51
+(mouse mode, sKuhLight), #57 (launcher with a controller, Elenedeath), #48 (in-game menu, razzamatazm). The Linux
+version is described in `docs/LINUX.md`. PR #52 (HDR, ultrawide) is not part of it.
+
+- **Method.** Three-way merge file by file (`git merge-file`, base = the sources before), in a copy; 22 crossings
+  settled by hand, nearly all at the same places: every PR adds its setting right after `fast_rendering`
+  (`settings.h`, `settings.cpp`) and its line in `reglages_lire` and `reglages_ecrire` (`lanceur.cpp`). `git apply`
+  writes CRLF on Windows (`core.autocrlf`): line endings are brought back to LF before any comparison.
+- **In-game menu on Linux.** `menu.cpp` depends on neither Windows nor Vulkan, but its host services (`menu::hote`)
+  only existed in the Windows half of `present.cpp`. SDL half: keys (`touche_menu`: the Windows virtual key of those
+  the menu reads, the PC scancode through `scancodes.h`), wheel, click, mouse in pixels
+  (`SDL_GetWindowPixelDensity`), full screen and "Quit" requested from the main thread, key names taken from SDL by
+  the main thread (its keyboard functions are not meant for another thread). Font: the package's Barlow
+  (`<installation>/polices`, found through `/proc/self/exe`), otherwise the system's Noto Sans or DejaVu Sans
+  (`menu_vk.cpp`). Volume: `lanceur.ini` is UTF-8 on Linux, the `volume=` line of `[lanceur]` is replaced
+  (`settings.cpp`). In `input.cpp`, `menu::manette` and `menu::masquer` leave the XInput block. A Fog row as well
+  (`volumetric_fog`, as on the Graphics page of the Linux launcher); the DLSS rows, absent on Linux at first, are
+  there since 2026-11-21 (below).
+- **In-game menu and mouse mode.** A key carries its modifiers in bits 16 to 18 (`Settings::MODIF_*`).
+  `settings_lignes` wrote it as `0x%X` of the whole value, which `parse_touche` refused at the next start (key back
+  to its default): it is now written like the launcher does (`ctrl+shift+0x11`) and shown as "Shift + W"
+  (`nom_combinaison`). SL and SR are only listed in mouse mode (`nb_touches`). While the menu is open, `kbm_wndproc`
+  releases the cursor and stops adding up movements; it is taken back at closing as usual (borderless: at the first
+  movement; windowed: at a click in the picture). "Mouse speed" row (`mouse_speed`, read at every mouse state).
+- **In-game menu, the rest.** "Frame pacing" row: `frame_pacing` is read every frame (`nvn_gpu.cpp`; it was read
+  once), so the row applies at once. The Display row follows F11 and Alt+Enter while the menu is open. The card list
+  leaves out, like the game, cards below Vulkan 1.3, the Direct3D 12 layer and software rendering. `kNomsActions` (in
+  `settings.h` since the menu) has the four SL and SR actions of mouse mode.
+- **Launcher on Linux.** Key combinations of the Controls page: the Win32 layer (`win32_linux.cpp`) sends `WM_KEYUP`,
+  names Shift, Ctrl and Alt (`VK_SHIFT`…) and answers `GetKeyState` from SDL's keyboard state. `disposition_altgr`
+  returns false (SDL reports AltGr as right Alt alone, without Windows' left Ctrl). Mouse tab hidden: the capture
+  (`hle_kbm.cpp`, Raw Input) is written for Windows, `mouse_keyboard` stays off elsewhere. The two uninstall
+  questions go through `demander` (drawn in the window, so usable with a controller).
+- **Build.** `link.py`: Dear ImGui and the runtime compiled side by side, on Linux too (`zig c++`, same
+  `IMGUI_FLAGS`). `preparer.py`: the "lier" step depends on `plateforme.py` and on Dear ImGui. For a Windows player
+  who updates: "recompiler" runs again without recompiling a batch (117 s here), "lier" rebuilds the whole runtime
+  once (24 s); 946 objects instead of 937.
+- **Repository and licenses.** `depot.py` also exports `plateforme.py`, `launcher/third_party` and the pages of
+  `recomp/depot/docs`. `THIRD_PARTY_NOTICES.txt`: pl_mpeg, stb_image, section 8 for the Linux packages.
+- **Tests (no player).** Windows: a 5-minute campaign at 1440p and 120 Hz, 101.5 fps (103 with PR #54 alone, 100
+  without), 3 frames over 50 ms, worst 123 ms, 10.1 GB committed, correct picture; menu driven by keys posted to the
+  test game's window: `frame_pacing = false` and `[keyboard]` written, "Quit the game" returns 0. Linux (Mint 22.3,
+  RTX 3060 Laptop, X11): 155 MB AppImage, 120 MB .deb, launcher without a screen, game for 150 s: menu ready
+  (Barlow), 3D scene present, 60 fps on the title screen. (The 13 to 54 fps noted here for the prologue were skewed
+  by `RECOMP_PERF` on this machine: 50 to 60 without it, see "Frame rate on Linux" below.)
+- **Poured into the development tree on 2026-11-21.** Quick check (`verifier.py rapide`): everything passed except
+  the test of the update questions (`verif/essai_choix_maj.py`), which still looked for Windows message boxes
+  (`#32770`) while PR #57 draws the questions in the window. The launcher was not at fault. `demander` now writes two
+  lines to the log ("question shown in the window", "question answered: "); the test follows them and answers with
+  keys posted to the window: Space for the default button, Escape for "no", never Enter (outside a question it is the
+  main button). Which of the two questions was on screen is read from what the launcher writes after the answer. 31
+  checks out of 31.
+- **DLSS on Linux (2026-11-21).** It was switched off (`RECOMP_DLSS_LINUX`): "NGX device extension query failed
+  (0xbad00012)". `0xBAD00012` means "not implemented": on Linux, `libnvidia-ngx-dlss.so` (310.9.16) does not export
+  the device extension query, which the driver's NGX core (595.99) only forwards. The core still exports the older
+  query, `NVSDK_NGX_VULKAN_RequiredExtensions`, which returns the list (`VK_NVX_binary_import`,
+  `VK_NVX_image_view_handle`, `VK_KHR_buffer_device_address`, `VK_KHR_push_descriptor`): `extensions_peripherique`
+  falls back to it when the first one answers "not implemented" (never on Windows, where it answers). Startup race:
+  `carte_prevue` (a separate enumeration, run as soon as the engine variables are read when DLSS is chosen) ran while
+  SDL was loading Vulkan on the main thread, and a null pointer was called, one start out of two; on Linux it now
+  waits for the end of the video initialization (`gfx_screen_size`). Locks removed: `carte_dlss` (dlss.cpp),
+  `dlss_possible` (lanceur.cpp), Graphics page (dessin.cpp), DLSS rows of the in-game menu (menu.cpp). Tests without
+  a player (Mint 22.3, RTX 3060 Laptop, driver 595.99, X11, screen driven by the AMD card): DLSS 4 created in Quality
+  (1280×720 → 1920×1080) and in DLAA, no failed evaluation in 8 minutes up to interactive play (Corneria), correct
+  pictures including the crosshair and the HUD; 6 starts out of 6 without a crash; windowless precompilation in 3 s.
+  Windows checked again (RTX 5070 Ti, Quality, 60 fps: the first query still answers there). The gain in frames per
+  second is not measured: these tests ran with `RECOMP_PERF`, which skews the frame rate on this machine (next
+  point). Model M (DLSS 4.5) tested afterwards without `RECOMP_PERF`, 1 minute in the opening: created, no failed
+  evaluation, Quality at 60 fps, DLAA around 42 fps on this card. Not tested: the Balanced to Ultra Performance
+  modes, Wayland, an older NVIDIA driver.
+- **Frame rate on Linux: my measurements were the cause (2026-11-21).** The low frame rates noted on the test laptop
+  (prologue at 13–54 fps, first mission around 10 fps) came from `RECOMP_PERF`, set in all my Linux tests: it times
+  every operation and every draw, tens of thousands of time reads per frame in a mission. On this machine one read
+  costs 1.4 µs instead of about twenty ns: at boot the kernel sets the processor counter aside ("tsc: Marking TSC
+  unstable due to check_tsc_sync_source failed"; core 0 is 155.5 ms away from the eleven others, measured) and takes
+  the `hpet` clock, which `clock_gettime` only reads through a system call. Without `RECOMP_PERF`, as for a player,
+  same machine, windowed 1080p: first mission at 57 fps on average over 5 minutes (45 to 60, up to 3,564 draws per
+  frame), prologue between 50 and 60. The game itself reads its counter about 38,000 times per second in a mission
+  (counted): about 5% of one core on this machine, with no visible effect. On Linux the game log now gives the cost
+  of one read and the kernel clock, and warns when `RECOMP_PERF` is on with a slow clock (`host_main.cpp`). To
+  remember: do not trust a frame rate measured with `RECOMP_PERF` when that line says "slow time reads"; measure
+  without it (the "fps" lines of the log are enough).
+- **Not tested**: the menu seen on screen with these adaptations, a controller (menu, launcher, questions), mouse
+  mode with the menu open, the menu on Linux with a keyboard or a controller, the installed .deb, an AMD card, Wayland.

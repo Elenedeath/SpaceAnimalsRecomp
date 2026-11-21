@@ -6,7 +6,11 @@
 
 #include <algorithm>
 #include <chrono>
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include "plat_linux.h"
+#endif
 
 namespace hos {
 namespace nvn {

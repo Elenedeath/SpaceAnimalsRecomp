@@ -7,10 +7,15 @@
 //   3. variables d'environnement RECOMP_REFRESH, RECOMP_RESOLUTION, RECOMP_NATIVE_RES, RECOMP_WINDOW,
 //      RECOMP_LANGUAGE (développement) ;
 //   4. options --refresh <Hz>, --resolution <auto|720|1080|1440|2160>, --native-res <0|1>, --window, --language.
-// Les réglages sont lus une fois au lancement : un changement s'applique au lancement suivant.
+// Les réglages sont lus une fois au lancement : un changement s'applique au lancement suivant. Sauf ceux que le menu en
+// jeu (menu.cpp, F1) change pendant la partie : fenêtre, vibrations, touches du clavier, boutons de la manette, netteté
+// du FSR, compteur d'images, taille du menu (settings_vivants) ; il écrit aussi les autres dans recomp.ini, pour le
+// lancement suivant (settings_enregistrer).
 #pragma once
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace hos {
 
@@ -48,10 +53,16 @@ struct Settings {
     // Contrôles du launcher) : scancodes, c'est-à-dire la position physique de la touche (0xE0xx : touche étendue, les
     // flèches par exemple) ; 0 = aucune touche. Valeurs par défaut : celles du jeu depuis la 1.0.0, par position
     // (W A S D sur un clavier QWERTY, Z Q S D sur un AZERTY). Même ordre que TOUCHES_CLES (launcher/lanceur.cpp).
+    // Puis SL et SR de chaque Joy-Con (K_LSL … K_RSR, aucune touche par défaut). Une touche peut demander des
+    // modificateurs (MODIF_CTRL, MODIF_SHIFT, MODIF_ALT, bits 16 à 18 ; « shift+0x11 » dans recomp.ini) : Maj+W et W peuvent
+    // faire deux actions, la combinaison la plus précise l'emporte (input.cpp, touches_actives).
     enum { K_A, K_B, K_X, K_Y, K_L, K_R, K_ZL, K_ZR, K_PLUS, K_MINUS, K_LSTICK, K_RSTICK, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-           K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT, K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT, K_NB };
+           K_LS_UP, K_LS_DOWN, K_LS_LEFT, K_LS_RIGHT, K_RS_UP, K_RS_DOWN, K_RS_LEFT, K_RS_RIGHT, K_LSL, K_LSR, K_RSL,
+           K_RSR, K_NB };
+    static constexpr unsigned MODIF_CTRL = 1u << 16, MODIF_SHIFT = 1u << 17, MODIF_ALT = 1u << 18,
+                              MODIF_MASK = MODIF_CTRL | MODIF_SHIFT | MODIF_ALT;
     unsigned keys[K_NB] = {0x2E, 0x2D, 0x2F, 0x2C, 0x10, 0x12, 0x13, 0x14, 0x32, 0x31, 0x21, 0x23,
-                           0xE048, 0xE050, 0xE04B, 0xE04D, 0x11, 0x1F, 0x1E, 0x20, 0x17, 0x25, 0x24, 0x26};
+                           0xE048, 0xE050, 0xE04B, 0xE04D, 0x11, 0x1F, 0x1E, 0x20, 0x17, 0x25, 0x24, 0x26, 0, 0, 0, 0};
     // Boutons de la manette (recomp.ini, clés pad_a… écrites par la page Contrôles du launcher, onglet Manette) : pour
     // chaque bouton de la Switch, dans l'ordre K_A … K_RIGHT, l'entrée de la manette qui le fait (input.cpp), repérée
     // par sa position comme SDL le fait : P_SUD est le bouton du bas (A d'une manette Xbox, ✕ d'une PlayStation, B
@@ -81,16 +92,86 @@ struct Settings {
     // temporaire des textures (memory.cpp, vides_balayer) ; le jeu les retrouve telles quelles s'il y revient. Faux
     // aussi sans texture_release ou zero_page_release (settings_init).
     bool cold_page_release = true;
+    // Transit des textures et mémoire vidéo (section [performance] de recomp.ini, 2026-11-20 ; avant : variables
+    // d'environnement seulement, qui passent toujours devant) :
+    int staging_arena_mb = -1;          // arène de transit préchauffée (vk_render.cpp) : -1 auto (512 Mo), 0 aucune, n Mo
+    int staging_pool_mb = 512;          // réserve des tampons de transit au-delà de 5 Go validables libres
+    bool vertex_buffers_vram = false;   // sommets et index lus en mémoire vidéo (essai ; ignoré sous Linux)
+    int vertex_buffers_vram_mb = 2048;  // plafond de mémoire vidéo de vertex_buffers_vram
+    int deswizzle_threads = 0;          // fils du désentrelacement des textures : 0 auto (moitié des processeurs, 8 au plus)
     // Optimisations du 2026-11-12 (jeux de descripteurs repris d'un dessin à l'autre, état dynamique gardé, étages de
     // textures sautés, caches d'enregistrement et d'appels indirects, attente active entre fils du jeu) : false les
     // coupe toutes d'un coup (comme la 1.0.3), à essayer si un défaut d'image ou un plantage apparaît.
     bool fast_rendering = true;
+    // Cadence régulière (2026-11-19, issue n° 41) : chaque image est montrée à l'instant de son vblank virtuel, comme
+    // dans la file d'affichage de la console, au lieu de l'être dès qu'elle est prête (nvn_gpu.cpp, Item::Present).
+    bool frame_pacing = true;
+    // Brouillard volumétrique du moteur (volumetric_fog, 2026-11-15) : false coupe render.volumetric_fog_enabled et sa
+    // variante portable (recomp_cvars, svc_fs.cpp). Son calcul (volumetric_fog_light.comp) prend 25 ms par image sur
+    // le Steam Deck, 82 % du GPU dans la cinématique du prologue ; coupé, celle-ci passe de 13-22 à 55-60 img/s.
+    bool volumetric_fog = true;
+    // Mode souris du jeu (hle_kbm.cpp) : la manette émulée devient une paire de Joy-Con 2 (svc_hid.cpp) et la souris
+    // du PC devient le capteur souris du Joy-Con 2 droit, que le jeu suit dans son mode souris. Le clavier pilote
+    // toujours la manette (keys) ; les boutons de la souris appuient sur des boutons de la manette (mouse_buttons).
+    bool mouse_keyboard = false;
+    int mouse_speed = 100;   // déplacements de la souris envoyés au jeu, en % (10 à 1000)
+    // action de la manette (indice K_A … K_RSR : bouton, direction d'un stick, SL ou SR ; -1 : aucune) de chaque entrée
+    // de la souris : boutons gauche, droit, milieu, arrière (X1), avant (X2), molette vers le haut et vers le bas (un
+    // appui bref par cran). Par défaut R et ZR, les deux boutons sous les doigts du Joy-Con 2 tenu en souris.
+    enum { M_GAUCHE, M_DROIT, M_MILIEU, M_ARRIERE, M_AVANT, M_MOLETTE_HAUT, M_MOLETTE_BAS, M_NB };
+    int8_t mouse_buttons[M_NB] = {K_R, K_ZR, K_RSTICK, -1, -1, -1, -1};
+    // touche qui rend le curseur de Windows (scancode et modificateurs, comme keys ; 0 : aucune) ; un clic dans l'image
+    // le reprend. F9 par défaut.
+    unsigned mouse_release = 0x43;
+    // Menu en jeu (menu.cpp) : compteur d'images par seconde dans le coin de l'image, et taille du menu (1 petit,
+    // 2 moyen, 3 grand : sur un téléviseur, de loin).
+    bool show_fps = false;
+    int menu_size = 2;
     std::string file;                // fichier de réglages utilisé
 };
+
+// Écriture de recomp.ini, la même dans le jeu (settings.cpp, settings_ecrire.cpp) et dans le launcher (lanceur.cpp, qui
+// a ses propres copies : TOUCHES_CLES, PAD_CLES, ENTREES_PAD, DLSS_MODES, FSR_MODES).
+// noms des actions dans les clés key_… et pad_… (ordre de Settings::keys ; les 16 premières sont les boutons, puis les
+// directions des sticks, puis SL et SR de chaque Joy-Con)
+inline const char* const kNomsActions[Settings::K_NB] = {
+    "a", "b", "x", "y", "l", "r", "zl", "zr", "plus", "minus", "lstick", "rstick", "up", "down", "left", "right",
+    "ls_up", "ls_down", "ls_left", "ls_right", "rs_up", "rs_down", "rs_left", "rs_right", "left_sl", "left_sr",
+    "right_sl", "right_sr"};
+// entrées des manettes (Settings::P_*), valeurs des clés pad_… ; même ordre que ENTREES_PAD (launcher/lanceur.cpp)
+inline const char* const PAD_ENTREES[Settings::P_NB] = {
+    "none", "south", "east", "west", "north", "back", "guide", "start", "leftstick", "rightstick", "leftshoulder",
+    "rightshoulder", "dpad_up", "dpad_down", "dpad_left", "dpad_right", "misc1", "right_paddle1", "left_paddle1",
+    "right_paddle2", "left_paddle2", "touchpad", "lefttrigger", "righttrigger"};
+// codes de langue de la console (nn::settings::LanguageCode), écriture canonique
+inline const char* const kLanguages[] = {"ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es", "es-419", "nl",
+                                         "pt", "pt-BR", "ru", "ko", "zh-Hans", "zh-Hant"};
+constexpr int kNbLanguages = (int)(sizeof kLanguages / sizeof kLanguages[0]);
+// valeurs des clés dlss et fsr, dans l'ordre de Settings::dlss et Settings::fsr
+inline const char* const kModesDlss[6] = {"off", "dlaa", "quality", "balanced", "performance", "ultra_performance"};
+inline const char* const kModesFsr[6] = {"off", "native", "quality", "balanced", "performance", "ultra_performance"};
 
 const Settings& settings();
 void settings_init(int argc, char** argv);   // à appeler tôt dans main(), après l'ouverture du journal
 // Code de langue rendu au jeu (nn::oe::GetDesiredLanguage) : réglage, ou langue de Windows si « auto »
 std::string language_code();
+// ---- menu en jeu (menu.cpp) ----
+// Les réglages en service, modifiables : le menu y écrit ceux qui s'appliquent tout de suite (des entiers et des
+// booléens lus à chaque usage par les autres fils ; jamais les chaînes gpu et language, lues au démarrage seulement).
+Settings& settings_vivants();
+// Lignes « clé = valeur » de recomp.ini pour ces réglages (settings_ecrire.cpp) : toutes celles que le menu et le
+// launcher changent, touches (key_…) et boutons (pad_…) compris.
+std::vector<std::pair<std::string, std::string>> settings_lignes(const Settings& s);
+// `contenu` (le texte de recomp.ini) avec ces clés : chaque ligne « clé = … » est remplacée, une clé absente est
+// ajoutée à la fin (touches et boutons sous leur section, comme le launcher) ; commentaires, ordre et fins de ligne
+// gardés.
+std::string ini_remplacer(const std::string& contenu, const std::vector<std::pair<std::string, std::string>>& cles);
+// Écrit ces clés dans le fichier de réglages utilisé (settings().file), d'un seul coup (fichier à côté, puis mis en
+// place). Faux si le fichier n'a pas pu être écrit (il reste alors tel qu'il était).
+bool settings_enregistrer(const std::vector<std::pair<std::string, std::string>>& cles);
+// Volume du jeu (0 à 100), réglage du launcher (lanceur.ini, RECOMP_VOLUME) : écrit dans le fichier du launcher quand
+// c'est lui qui a lancé le jeu (RECOMP_LANCEUR_INI). Faux sinon : le volume ne vaut alors que pour cette partie.
+bool settings_volume_enregistrer(int volume);
+
 
 }  // namespace hos

@@ -1177,16 +1177,19 @@ class Emitter:
                 # mot. Chaque traduction est une copie de gxl() dans le shader : traduire les mots un par un
                 # multipliait ces copies, et c'est leur nombre qui faisait la pression sur les registres (brouillard,
                 # dcf771efb55667e4, sur le Steam Deck : 240 → 144 VGPR, débit estimé ÷ 3,4).
+                # (Contribution d'Elenedeath, PR n° 40, comme gxln, cibles_brx et boucles_structurees.)
+                # L'adresse est ramenée à un multiple de 4, comme gld() le fait mot par mot : la référence de tampon
+                # GW est alignée sur 4, une adresse impaire y serait lue hors de ce que GLSL définit.
                 vite = [self.setr(self.rn(i.dst, k), f"GW(gd + {4 * k}ul).v") for k in range(cnt)]
                 zero = [self.setr(self.rn(i.dst, k), "0u") for k in range(cnt)]
-                return (f"{{ uint64_t gd = gxln({a}, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} "
+                return (f"{{ uint64_t gd = gxln(({a}) & ~3ul, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} "
                         f"else {{ {' '.join(zero)} }} }}")
             data = i.srcs[2]
             if t <= 3:
                 return f"gst{8 if t <= 1 else 16}({a}, {self.u(data)});"
             cnt = {4: 1, 5: 2, 6: 4, 7: 4}[t]
             vite = [f"GW(gd + {4 * k}ul).v = {self.u(self.rn(data, k))};" for k in range(cnt)]
-            return f"{{ uint64_t gd = gxln({a}, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} }}"
+            return f"{{ uint64_t gd = gxln(({a}) & ~3ul, {4 * cnt}ul); if (gd != 0ul) {{ {' '.join(vite)} }} }}"
         # ATOMG / RED : 32 bits (types 0 non signé, 1 signé), addition flottante (type 3)
         self.uses.add("gatomic")
         op = m["op"]

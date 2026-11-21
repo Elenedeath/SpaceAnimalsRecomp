@@ -11,6 +11,13 @@
 #include <string>
 #include <vector>
 
+// séparateur des chemins que le runtime compose (dossier de l'exécutable + nom)
+#ifdef _WIN32
+#define PSEP "\\"
+#else
+#define PSEP "/"
+#endif
+
 // runtime.cpp (hors de cpu.h pour ne pas invalider les objets générés)
 extern void (*rt_svc_handler)(CPUState* ctx, uint32_t imm, uint64_t pc);
 extern void (*rt_fatal_hook)(const char* msg, uint64_t pc);
@@ -124,6 +131,13 @@ void mem_vides_init();                                  // recomp.ini, zero_page
 // du jeu : ReadFile dans la mémoire du jeu (svc_fs.cpp), import d'une fenêtre dans Vulkan (vk_render.cpp).
 void mem_noyau_debut();
 void mem_noyau_fin();
+bool mem_noyau_essayer();   // garde prise seule (aucun ReadFile en cours dans la mémoire du jeu) ; faux : déjà tenue
+void mem_noyau_liberer();   // fin de mem_noyau_essayer
+// RECOMP_VB_VRAM (vk_render.cpp) : morceaux de la mémoire du jeu copiés en mémoire vidéo, protégés en écriture
+namespace vkr {
+bool vbw_faute(uint64_t addr);                     // écriture fautive : vrai si c'était un morceau suivi (reprendre)
+void vbw_ecriture(uint64_t addr, uint64_t size);   // écrite sans faute (noyau, GPU) ou remappée : copies périmées
+}  // namespace vkr
 struct MemNoyau {
     MemNoyau() { mem_noyau_debut(); }
     ~MemNoyau() { mem_noyau_fin(); }
@@ -207,6 +221,8 @@ std::string save_dir_path();   // svc_fs.cpp : dossier des sauvegardes du joueur
 void hle_os_init();   // hle_os.cpp : fibres nn::os
 void hle_audio_init();
 void hle_hid_init();     // svc_hid.cpp : vibrations (nn::hid::SendVibrationValue)
+void hle_kbm_init();     // hle_kbm.cpp : souris du PC → capteur souris du Joy-Con 2 droit (réglage mouse_keyboard)
+void kbm_release();      // hle_kbm.cpp : curseur de Windows rendu s'il est retenu (avant de terminer le processus)
 // crée un nn::os::SystemEventType invité (vrai événement noyau) et renvoie son objet noyau
 std::shared_ptr<KObject> hle_make_system_event(CPUState* ctx, uint64_t system_event);   // hle_audio.cpp : flux audio nn::audio
 // neutralise toutes les fonctions qu'importe main dans un espace de noms (préfixe mangled) :

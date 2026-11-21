@@ -291,7 +291,7 @@ def main():
     with open(os.path.join(out, "README.txt"), "w", encoding="utf-8-sig", newline="\r\n") as f:
         f.write(README_EN.format(version=a.version))
     r = os.path.join(out, "recomp")
-    for f in ("recomp.py", "build.py", "fullbuild.py", "link.py", "hooks.txt", "lots.txt", "VERSION"):
+    for f in ("recomp.py", "build.py", "plateforme.py", "fullbuild.py", "link.py", "hooks.txt", "lots.txt", "VERSION"):
         copier(os.path.join(RECOMP, f), os.path.join(r, f))
     copier_arbre(os.path.join(RECOMP, "a64"), os.path.join(r, "a64"), (".py",))
     copier_arbre(os.path.join(RECOMP, "runtime"), os.path.join(r, "runtime"), (".cpp", ".h", ".hpp", ".c", ".inl", ".comp",
